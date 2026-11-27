@@ -1,0 +1,988 @@
+"""Host-neutral model selection; contract: docs/model-selection.md."""
+from __future__ import annotations
+
+from collections.abc import Iterable
+from contextlib import closing, contextmanager, ExitStack
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+from fractions import Fraction
+import re
+import secrets
+import stat
+import sys
+
+from aegis_core.redaction import SECRET_REPLACEMENTS
+from aegis_core.storage import LockTimeoutError, file_generation, file_lock
+from aegis_core.storage_confined import ConfinedFileError, open_directory
+
+__all__ = ["MAX_LINE_BYTES", "MAX_INPUT_BYTES", "MAX_HISTORY_BYTES", "MAX_HISTORY_RECORDS",
+           "ModelSelectionError", "validate_bindings", "select_model", "select_and_append",
+           "append_decision", "read_decisions", "DecisionHistory", "DecisionReplay", "ProbeIdentityConflict"]
+
+MAX_LINE_BYTES = 4096
+MAX_INPUT_BYTES = 262144
+MAX_HISTORY_BYTES = 4 * 1024 * 1024
+MAX_HISTORY_RECORDS = 4096
+_MAX_PATH_SEPARATORS = 256
+_LOCK_TIMEOUT_SECONDS = 60.0  # cap-sized validation/publication, including a queued peer
+_HISTORY_LIMIT = "history_limit_exceeded: archive_or_rotate_decision_log"
+_CHAIN_ERROR = "invalid_history:decision_chain: restore_complete_decision_log"
+_PROBE_CONFLICT = "decision_outcome_conflict"
+_SERVED_FIELDS = ("host", "model", "level", "family")
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_INTENTS = ("light", "standard", "deep", "extended", "max", "ultra")
+_NATIVE_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_CLASSES = ("coding", "frontier", "scout", "mechanical")
+_ROLES = ("orchestrator", "decider", "implementer", "integrator", "reviewer")
+_TASK_ROLES = {
+    "T1": ("orchestrator", "decider"),
+    "T2": ("implementer", "integrator"),
+    "T3": ("implementer", "integrator"),
+    "T4": ("reviewer",), "T5": ("reviewer",), "T6": ("reviewer",),
+    "T7": ("implementer", "integrator"), "T8": ("reviewer",),
+    "T9": ("implementer", "integrator"), "T10": ("implementer", "integrator"),
+    "T11": ("implementer", "integrator"), "T12": ("implementer", "integrator"),
+    "T13": ("implementer", "integrator"), "T14": ("implementer", "integrator"),
+}
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_IDENTIFIER = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+_SUBJECT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+_FLEXIBLE = ("T7", "T9", "T10", "T11", "T12", "T14")
+_REVIEWS = ("T4", "T5", "T6", "T8")
+_STAGES = {"T4": ("primary",), "T5": ("primary",),
+           "T6": ("primary", "correctness", "security", "whole"), "T8": ("primary", "second")}
+_DIR_FD_SUPPORTED = (os.name == "posix" and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and
+                     hasattr(os, "fchmod") and hasattr(os, "getuid") and
+                     all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.rename, os.unlink)))
+_CHOICE_KEYS = {"host", "class", "model", "level", "family", "reason", "admission"}
+_RECORD_KEYS = {"schema", "decision_id", "team_id", "task_kind", "role_kind", "intent", "author_family",
+                "choice", "split_eligible", "target_shares", "counts_before", "outcome", "subject",
+                "admission", "review_stage", "family_order", "policy_id", "split_id", "previous_decision_id"}
+
+
+class ModelSelectionError(ValueError):
+    """Stable refusal code, without reflecting untrusted input in diagnostics."""
+
+
+def _require(condition, error):
+    if not condition:
+        raise ModelSelectionError(error)
+
+
+def _diagnostic_locator(value):
+    # Canonical input has at most 128 characters. Allow one whole marker per character.
+    for pattern, _ in SECRET_REPLACEMENTS:
+        value = pattern.sub("[REDACTED_TOKEN]", value)
+    return value[:128 * len("[REDACTED_TOKEN]")]
+
+
+def _admission_refusal(host, model_class, intent, role, band=None):
+    action = "probe the level or repair model-bindings.json"
+    if band is not None and intent not in (band["default"], band["ceiling"]):
+        action += " or choose an admitted level within the band"
+    return "binding_not_admitted: %s/%s intent %s for %s; %s" % (
+        *(_diagnostic_locator(v) for v in (host, model_class, intent, role)), action)
+
+
+def _token(value):
+    return type(value) is str and _TOKEN.fullmatch(value) is not None
+
+
+def _keys(value, keys, error):
+    _require(type(value) is dict and set(value) == set(keys), error)
+
+
+def _member(value, options):
+    return type(value) is str and value in options
+
+
+def _pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_key")
+        result[key] = value
+    return result
+
+
+def _constant(value):
+    raise ValueError("nonfinite_json")
+
+
+def _loads(raw, error):
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ModelSelectionError(error) from exc
+
+
+def _path_value(value, error):
+    _require(isinstance(value, (str, os.PathLike)), error)
+    raw = value if isinstance(value, str) else value.__fspath__()
+    _require(type(raw) is str and len(raw) <= MAX_INPUT_BYTES, error)
+    _require(sum(raw.count(separator) for separator in (os.sep, os.altsep) if separator) <=
+             _MAX_PATH_SEPARATORS, error)
+    return Path(raw)
+
+
+def _input(value, error):
+    if isinstance(value, (str, os.PathLike)):
+        try:
+            with _open_regular(_path_value(value, error), error, MAX_INPUT_BYTES) as stream:
+                raw = stream.read(MAX_INPUT_BYTES + 1)
+            _require(len(raw) <= MAX_INPUT_BYTES, error)
+        except ModelSelectionError:
+            raise
+        except (ValueError, OSError) as exc:
+            raise ModelSelectionError(error) from exc
+        value = _loads(raw, error)
+    _json_value(value, error, limit=MAX_INPUT_BYTES)
+    return value
+
+
+def validate_bindings(value, *, host_kinds=None, probe=False):
+    """Validate roles and host bindings; probe mode defers endpoint admission."""
+    return _validate_bindings(_input(value, "invalid_bindings"), host_kinds, probe)
+
+
+def _validate_bindings(data, host_kinds, probe):
+    error = "invalid_bindings"
+    if host_kinds is not None:
+        _require(type(host_kinds) in (list, tuple, set, frozenset) and len(host_kinds) <= 256 and
+                 all(_token(h) for h in host_kinds), error)
+    registry = None if host_kinds is None else set(host_kinds)
+    host_order = None if host_kinds is None else tuple(dict.fromkeys(
+        sorted(host_kinds) if type(host_kinds) in (set, frozenset) else host_kinds))
+    _keys(data, ("schema", "roles", "hosts"), error)
+    _require(data["schema"] == "aegis.model-bindings/v1", error)
+    _require(type(data["roles"]) is list and type(data["hosts"]) is list and data["hosts"], error)
+    roles, hosts, statuses, identities = {}, {}, {}, set()
+    for row in data["roles"]:
+        _keys(row, ("kind", "model_class", "band"), error)
+        kind, band = row["kind"], row["band"]
+        _require(_member(kind, _ROLES) and kind not in roles and row["model_class"] == "coding", error)
+        _keys(band, ("floor", "default", "ceiling"), error)
+        _require(all(_member(v, _INTENTS) for v in band.values()), error)
+        floor, default, ceiling = (_INTENTS.index(band[k]) for k in ("floor", "default", "ceiling"))
+        _require(floor <= default <= ceiling, error)
+        roles[kind] = row
+    _require(set(roles) == set(_ROLES), error)
+    for row in data["hosts"]:
+        required = {"host", "class", "model", "levels", "admission"}
+        _require(type(row) is dict and required <= set(row) and
+                 set(row) <= required | {"effort_encoding", "served_aliases", "host_status"}, error)
+        host, model_class = row["host"], row["class"]
+        _require(_token(host) and _member(model_class, _CLASSES) and
+                 type(row["model"]) is str and _IDENTIFIER.fullmatch(row["model"]) is not None, error)
+        status = row.get("host_status", "selectable")
+        _require(_member(status, ("selectable", "planned")) and
+                 (status == "planned" or registry is None or host in registry), error)
+        _require(statuses.setdefault(host, status) == status, error)
+        _require(_member(row.get("effort_encoding", "flag"), ("flag", "model_suffix")), error)
+        aliases = row.get("served_aliases", [])
+        _require(type(aliases) is list and len(aliases) <= 256 and
+                 all(type(alias) is str and _IDENTIFIER.fullmatch(alias) is not None for alias in aliases), error)
+        _require(len(set(aliases)) == len(aliases) and row["model"] not in aliases, error)
+        _require((host, model_class) not in hosts, error)
+        levels, admission = row["levels"], row["admission"]
+        _require(type(levels) is dict and bool(levels) and set(levels) <= set(_INTENTS), error)
+        _require(all(v is None or _member(v, _NATIVE_LEVELS) for v in levels.values()), error)
+        offered = [v for v in levels.values() if v is not None]
+        _require(len(set(offered)) == len(offered), error)
+        if row.get("effort_encoding", "flag") == "model_suffix":
+            _require(all(len(row["model"]) + 1 + len(v) <= 128 for v in offered), error)
+        _keys(admission, levels, error)
+        _require(all(_member(v, ("unprobed", "admitted", "rejected")) for v in admission.values()), error)
+        names = {row["model"], *aliases}
+        if row.get("effort_encoding", "flag") == "model_suffix":
+            names.update(row["model"] + "-" + level for level in offered)
+        keys = {(host, name) for name in names}
+        _require(not identities.intersection(keys), error)
+        identities.update(keys)
+        hosts[host, model_class] = row
+    if registry is None:
+        host_order = tuple(dict.fromkeys(h for h, _ in hosts))
+    _require(bool(host_order), error)
+    refusal = None
+    for role in roles.values():
+        for host in host_order:
+            if statuses.get(host) == "planned":
+                continue
+            binding = hosts.get((host, role["model_class"]))
+            _require(binding is not None, error)
+            for edge in ("default", "ceiling"):
+                intent = role["band"][edge]
+                _require(binding["levels"].get(intent) is not None, error)
+                if not probe and refusal is None and binding["admission"][intent] != "admitted":
+                    refusal = (host, role["model_class"], intent, role["kind"])
+    if refusal is not None:
+        raise ModelSelectionError(_admission_refusal(*refusal))
+    return roles, hosts
+
+
+def _shares(value, error):
+    _require(type(value) is dict and bool(value) and all(_token(k) for k in value),
+             error + ":target_shares_shape" if error == "invalid_policy" else error)
+    _require(all(type(v) in (int, float) and 0 <= v <= 1 and math.isfinite(v) for v in value.values()),
+             error + ":target_shares_values" if error == "invalid_policy" else error)
+    _require(sum(Fraction(str(v)) for v in value.values()) == 1,
+             error + ":target_shares_sum" if error == "invalid_policy" else error)
+
+
+def _policy(value, hosts):
+    error = "invalid_policy"
+    data = _input(value, error)
+    required = {"team_id", "manager_family", "team_family", "target_shares", "family_hosts",
+                "family_order", "flexible_tasks", "review_families"}
+    _require(type(data) is dict and required <= set(data) and set(data) <= required | {"task_intents"}, error + ":shape")
+    _require(_token(data["team_id"]), error + ":team_id")
+    shares, families = data["target_shares"], data["family_hosts"]
+    _shares(shares, error)
+    _keys(families, shares, error + ":family_hosts_keys")
+    _require(_member(data["manager_family"], families), error + ":manager_family")
+    _require(_member(data["team_family"], families), error + ":team_family")
+    order = data["family_order"]
+    _require(type(order) is list and len(order) == 2 and all(_member(f, families) for f in order) and
+             len(set(order)) == 2 and set(order) == set(families), error + ":family_order")
+    flexible = data["flexible_tasks"]
+    _require(type(flexible) is list and all(_member(t, _FLEXIBLE) for t in flexible) and
+             len(set(flexible)) == len(flexible), error + ":flexible_tasks")
+    reviews = data["review_families"]
+    _keys(reviews, _REVIEWS, error + ":review_families_keys")
+    for task, stages in reviews.items():
+        _require(type(stages) is dict and "primary" in stages and all(_member(s, _STAGES[task]) for s in stages),
+                 error + ":review_families:" + task + ":stages")
+        if task == "T8":
+            _require(stages["primary"] == "opposite" and stages.get("second", "author") == "author",
+                     error + ":t8_markers")
+        else:
+            _require(all(_member(f, families) for f in stages.values()),
+                     error + ":review_families:" + task + ":families")
+    _require({reviews["T4"]["primary"], reviews["T5"]["primary"]} == set(families), error + ":formal_primaries")
+    _require(set(reviews["T6"].values()) == set(families), error + ":t6_family_coverage")
+    seen = set()
+    for names in families.values():
+        _require(type(names) is list and bool(names) and all(_token(n) for n in names), error + ":family_hosts_values")
+        _require(len(set(names)) == len(names) and not seen.intersection(names), error + ":family_hosts_unique")
+        _require(all(any(h == name for h, _ in hosts) for name in names), error + ":family_hosts_registry")
+        seen.update(names)
+    overrides = data.get("task_intents", {})
+    _require(type(overrides) is dict, error + ":task_intents_shape")
+    for task, intents in overrides.items():
+        _require(_member(task, _TASK_ROLES) and type(intents) is dict and bool(intents), error + ":task_intents_task")
+        _require(set(intents) <= set(families) and all(_member(v, _INTENTS) for v in intents.values()),
+                 error + ":task_intents_values")
+    return data
+
+
+def _identity(record, *, checked=False):
+    if not checked:
+        _json_value(record, "invalid_history", limit=MAX_LINE_BYTES - 1)
+    payload = {k: v for k, v in record.items() if k not in ("outcome", "decision_id")}
+    return hashlib.sha256(_encoded(payload, MAX_LINE_BYTES - 1, "invalid_history", checked=True)).hexdigest()
+
+
+def _split_identity(shares, order):
+    return hashlib.sha256(_encoded({"target_shares": shares, "family_order": order},
+                                   MAX_LINE_BYTES - 1, "invalid_history")).hexdigest()
+
+
+def _split_snapshot(shares, order):
+    """Freeze validated scalar JSON forms, preserving 1 versus 1.0 and signed zero."""
+    return tuple((key, repr(value)) for key, value in sorted(shares.items())), tuple(order)
+
+
+def _json_value(value, error, depth=0, budget=None, limit=MAX_LINE_BYTES):
+    """Count canonical JSON bytes and bound work before hashing/encoding."""
+    if budget is None:
+        budget = [0, 0]
+    too_large = "decision_line_too_large" if limit <= MAX_LINE_BYTES else error
+    _require(depth <= 64, error)
+    budget[0] += 1
+    _require(budget[0] <= (1024 if limit <= MAX_LINE_BYTES else limit), too_large)
+    if value is None or type(value) is bool:
+        budget[1] += 5 if value is False else 4
+    elif type(value) is str:
+        _require(len(value) <= limit, too_large)
+        budget[1] += 2
+        for char in value:
+            code = ord(char)
+            budget[1] += (2 if char in '"\\\b\f\n\r\t' else
+                          (1 if 32 <= code < 127 else (6 if code <= 65535 else 12)))
+            _require(budget[1] <= limit, too_large)
+    elif type(value) is int:
+        _require(value.bit_length() <= 425, too_large)  # at most 128 decimal digits
+        budget[1] += len(str(value))  # conversion is bounded by the bit-length check
+    elif type(value) is float:
+        _require(math.isfinite(value), error)
+        budget[1] += len(repr(value))
+    elif type(value) in (list, dict):
+        _require(len(value) <= (256 if limit <= MAX_LINE_BYTES else limit), too_large)
+        budget[1] += 2 + max(0, len(value) - 1) + (len(value) if type(value) is dict else 0)
+        if type(value) is dict:
+            for key, item in value.items():
+                _require(type(key) is str, error)
+                _json_value(key, error, depth + 1, budget, limit)
+                _json_value(item, error, depth + 1, budget, limit)
+        else:
+            for item in value:
+                _json_value(item, error, depth + 1, budget, limit)
+    else:
+        raise ModelSelectionError(error)
+    _require(budget[1] <= limit, too_large)
+
+
+def _encoded(value, limit, error, *, checked=False):
+    if not checked:
+        _json_value(value, error, limit=limit)
+    try:
+        result = json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    except (ValueError, RecursionError) as exc:
+        raise ModelSelectionError(error) from exc
+    _require(len(result) <= limit, "decision_line_too_large" if limit <= MAX_LINE_BYTES else error)
+    return result.encode("ascii")
+
+
+def _record(record, error):
+    _json_value(record, error, limit=MAX_LINE_BYTES - 1)
+    _require(type(record) is dict, error)
+    extras = {"probe_id", "registry_id", "counts_registry_id"} & record.keys()
+    _keys(record, _RECORD_KEYS | extras | ({"counts_scope"} & record.keys()), error)
+    if "counts_scope" in record:
+        _require(record["counts_scope"] == "ordinary" and "counts_registry_id" not in record, error)
+    _require("registry_id" not in record or "probe_id" in record, error)
+    _require(all(type(record[key]) is str and _DIGEST.fullmatch(record[key])
+                 for key in extras | {"policy_id", "split_id"}), error)
+    previous = record["previous_decision_id"]
+    _require(type(previous) is str and (previous == "" or re.fullmatch(r"[0-9a-f]{64}", previous) is not None), error)
+    outcome = record["outcome"]
+    if type(outcome) is dict and "launch_status" in outcome:
+        _require(_member(outcome["launch_status"], ("launched", "not_launched")), "invalid_history:launch_status")
+    _require(record["schema"] == "aegis.model-decision/v1" and _token(record["team_id"]), error)
+    _require(type(record["subject"]) is str and _SUBJECT.fullmatch(record["subject"]) is not None, error)
+    task, role = record["task_kind"], record["role_kind"]
+    _require(_member(task, _TASK_ROLES) and _member(role, _TASK_ROLES[task]) and
+             _member(record["intent"], _INTENTS) and type(record["split_eligible"]) is bool, error)
+    choice = record["choice"]
+    _keys(choice, _CHOICE_KEYS, error)
+    _require(all(_token(v) for k, v in choice.items() if k != "model") and
+             type(choice["model"]) is str and _IDENTIFIER.fullmatch(choice["model"]) is not None and
+             choice["class"] in _CLASSES and choice["level"] in _NATIVE_LEVELS, error)
+    _require(record["admission"] == ("unprobed" if "registry_id" in record else "admitted") and
+             choice["admission"] == record["admission"], error)
+    _require("probe_id" in record or not DecisionReplay.mentions_probe(record), _PROBE_CONFLICT)
+    shares = record["target_shares"]
+    _shares(shares, error)
+    _require(choice["family"] in shares, error)
+    order = record["family_order"]
+    _require(type(order) is list and len(order) == 2 and all(_member(f, shares) for f in order) and
+             len(set(order)) == 2 and set(order) == set(shares), error)
+    counts = record["counts_before"]
+    _keys(counts, shares, error)
+    _require(all(type(v) is int and v >= 0 for v in counts.values()), error)
+    expected = ("manager_family",) if task == "T1" else (("lane_family",) if task == "T3" else (
+        ("review_policy",) if role == "reviewer" else (
+            ("family_split", "team_family") if task in _FLEXIBLE else ("team_family",))))
+    _require(choice["reason"] in expected and
+             record["split_eligible"] == (choice["reason"] == "family_split"), error)
+    stage = record["review_stage"]
+    _require(_member(stage, _STAGES[task]) if role == "reviewer" else stage is None, error)
+    author = record["author_family"]
+    _require(author is None or _member(author, shares), error)
+    _require((role != "reviewer" or author is not None) and (task != "T7" or author == choice["family"]), error)
+    if task == "T8":
+        _require(author is not None and ((stage == "primary" and author != choice["family"]) or
+                                        (stage == "second" and author == choice["family"])), error)
+    _require(record["decision_id"] == _identity(record, checked=True), error)
+    if record["split_eligible"]:
+        _require(choice["family"] == _split_family(shares, order, counts),
+                 "invalid_history:family_split: restore_complete_decision_log")
+
+
+def _split_family(shares, order, counts):
+    first, second = order
+    if shares[first] == 0:
+        return second
+    if shares[second] == 0:
+        return first
+    total = sum(counts.values())
+    return first if total == 0 or Fraction(counts[first], total) < Fraction(str(shares[first])) else second
+
+
+class ProbeIdentityConflict(ModelSelectionError):
+    """A well-formed marked report contradicts its staged identity."""
+
+
+class ProbeEvidence:
+    """Reconcile probe evidence and the launch markers in historical logs."""
+    def __init__(self):
+        self.stage = self.receipt = None
+        self.legacy, self.conflicts = False, set()
+
+    def add(self, record, *, first, writing):
+        outcome, revision = record["outcome"], record.get("registry_id")
+        _require(type(outcome) is dict, _PROBE_CONFLICT)
+        status = outcome.get("launch_status")
+        if first:
+            _require(outcome == {"launch_status": "not_launched"}, _PROBE_CONFLICT)
+            self.stage = {**record, "choice": dict(record["choice"])}
+            return "not_launched", None, None
+        if status == "launched":
+            _require(not writing and "counts_scope" not in record and revision is not None and
+                     outcome == {"launch_status": status, "registry_id": revision} and
+                     (self.receipt is not None or self.legacy or self.conflicts), _PROBE_CONFLICT)
+            return ("not_launched" if self.conflicts else status), None, None
+        if outcome == {"launch_status": "not_launched"}:
+            if writing:
+                return None, self.stage, None
+            # Earlier logs could write this reset. Retain its effect on their recorded counts.
+            return (None if "counts_scope" in record else "not_launched"), None, None
+        return self._observe(record, outcome, revision, writing)
+
+    def _observe(self, record, outcome, revision, writing):
+        served = outcome.get("served")
+        _require(type(served) is dict and len(served) == 5 and "fallback_reason" in served and
+                 all(_token(served.get(field)) for field in _SERVED_FIELDS if field != "model") and
+                 type(served.get("model")) is str and _IDENTIFIER.fullmatch(served["model"]), _PROBE_CONFLICT)
+        differs = any(served[field] != record["choice"][field] for field in _SERVED_FIELDS)
+        reason = served["fallback_reason"]
+        if "probe_readback" not in outcome:
+            _require(len(outcome) == 1 and (_token(reason) if differs else reason is None), _PROBE_CONFLICT)
+            return self._contradiction(record, None) if differs else (None, None, None)
+        proof = outcome["probe_readback"]
+        _require(len(outcome) == 2 and reason is None and type(proof) is dict and
+                 _token(proof.get("provenance")) and proof.get("registry_id") == revision, _PROBE_CONFLICT)
+        if proof.keys() in ({"provenance"}, {"provenance", "registry_id"}):
+            _require(not writing and not differs and self.receipt is None, _PROBE_CONFLICT)
+            self.legacy = True
+            return None, None, None
+        _require(len(proof) == 3 and revision is not None and
+                 proof.get("decision_id") == record["decision_id"], _PROBE_CONFLICT)
+        if differs or (self.receipt is not None and self.receipt["outcome"] != outcome):
+            refusal = ProbeIdentityConflict if differs else ModelSelectionError
+            return self._contradiction(record, refusal(_PROBE_CONFLICT))
+        _require(not writing or (not self.conflicts and not self.legacy), _PROBE_CONFLICT)
+        if self.conflicts or self.legacy:
+            return "not_launched", None, None
+        previous = self.receipt
+        if previous is None:
+            self.receipt = {**record, "outcome": {"served": dict(served), "probe_readback": dict(proof)}}
+        return None, previous, ModelSelectionError(_PROBE_CONFLICT) if writing else None
+
+    def _contradiction(self, record, refusal):
+        outcome = record["outcome"]
+        served = outcome["served"]
+        evidence = (*[served[field] for field in _SERVED_FIELDS], served["fallback_reason"],
+                    outcome.get("probe_readback", {}).get("provenance"))
+        previous = record if evidence in self.conflicts else None
+        self.conflicts.add(evidence)
+        return "not_launched", previous, refusal
+
+
+class DecisionReplay:
+    def __init__(self, team_id=None, split_id=None, shares=(), order=()):
+        self.tallies, self.scoped = {}, {}
+        self.splits = {split_id: _split_snapshot(shares, order)} if team_id is not None else {}
+        self.family_sets = {team_id: frozenset(shares)} if team_id is not None else {}
+        self.formal, self.policy_splits = {}, {}
+        self.heads, self.seen, self.probes = {}, {}, {}
+
+    @staticmethod
+    def mentions_probe(record):
+        outcome, choice = record.get("outcome"), record.get("choice")
+        return (not {"probe_id", "registry_id", "probe_readback"}.isdisjoint(record) or
+                record.get("admission") == "unprobed" or
+                (type(choice) is dict and choice.get("admission") == "unprobed") or
+                (type(outcome) is dict and any(key in outcome for key in ("probe_readback", "registry_id", "probe_id"))))
+
+    @staticmethod
+    def checked_size(record):
+        return len(_line(record))
+
+    def check_probe_audit(self, identity):
+        _require(not self.probes[identity].conflicts, _PROBE_CONFLICT)
+
+    def before(self, team, split, shares, revision=None):
+        if revision is None:
+            return self.tallies.get((team, split), dict.fromkeys(shares, 0))
+        ordinary = self.scoped.get((team, split, None), {})
+        probe = {} if revision == "ordinary" else self.scoped.get((team, split, revision), {})
+        return {family: ordinary.get(family, 0) + probe.get(family, 0) for family in shares}
+
+    def add(self, record, *, writing=False, probe_bindings=None, stage_validated=False):
+        identity, team = record["decision_id"], record["team_id"]
+        shares = record["target_shares"]
+        families = frozenset(shares)
+        _require(families == self.family_sets.setdefault(team, families), "invalid_history")
+        split_id = record["split_id"]
+        snapshot = _split_snapshot(shares, record["family_order"])
+        if split_id not in self.splits:
+            _require(split_id == _split_identity(shares, record["family_order"]), "invalid_history")
+            self.splits[split_id] = snapshot
+        _require(snapshot == self.splits[split_id], "invalid_history")
+        policy_key = (team, record["policy_id"])
+        _require(split_id == self.policy_splits.setdefault(policy_key, split_id), "invalid_history")
+        if record["task_kind"] in ("T4", "T5"):
+            stages = self.formal.setdefault(policy_key, {})
+            task, family = record["task_kind"], record["choice"]["family"]
+            _require(stages.setdefault(task, family) == family, "invalid_history")
+            _require(len(stages) != 2 or set(stages.values()) == families, "invalid_history")
+        key = (team, split_id)
+        first = identity not in self.seen
+        is_probe = "probe_id" in record
+        if first:
+            _require(not writing or not is_probe or stage_validated, _PROBE_CONFLICT)
+            error = "stale_decision" if writing else "invalid_history:counts_before: restore_complete_decision_log"
+            _require(record["previous_decision_id"] == self.heads.get(team, ""),
+                     "stale_decision" if writing else _CHAIN_ERROR)
+            revision, scope = record.get("registry_id"), record.get("counts_registry_id")
+            basis = record.get("counts_scope") or revision or scope
+            _require((revision is None or scope in (None, revision)) and
+                     record["counts_before"] == self.before(*key, shares, basis), error)
+            if writing:
+                _require(record["counts_before"] == self.before(*key, shares, "ordinary"), error)
+            self.heads[team] = identity
+        outcome = record["outcome"]
+        status = outcome.get("launch_status") if type(outcome) is dict else None
+        previous = refusal = proof = None
+        if is_probe:
+            if first:
+                self.probes[identity] = ProbeEvidence()
+            proof = self.probes[identity]
+            status, previous, refusal = proof.add(record, first=first, writing=writing)
+        elif probe_bindings is not None:
+            raise ModelSelectionError("not_probe_attempt")
+        was_active = self.seen.get(identity, False)
+        active = record["split_eligible"] if first else was_active
+        if status is not None:
+            active = record["split_eligible"] and status == "launched"
+        if active != was_active:
+            family, delta = record["choice"]["family"], 1 if active else -1
+            self.tallies.setdefault(key, dict.fromkeys(shares, 0))[family] += delta
+            if proof is None or (proof.receipt is not None and not proof.legacy):
+                self.scoped.setdefault((*key, record.get("registry_id")), dict.fromkeys(shares, 0))[family] += delta
+        self.seen[identity] = active
+        return previous, refusal
+
+
+def _counts(history, data, split_id, policy_id):
+    _require(isinstance(history, Iterable), "invalid_history")
+    replay = DecisionReplay(data["team_id"], split_id, data["target_shares"], data["family_order"])
+    size = 0
+    try:
+        rows = history._rows if type(history) is DecisionHistory else ((None, row) for row in history)
+        for count, (line, previous) in enumerate(rows, 1):
+            _require(count <= MAX_HISTORY_RECORDS, _HISTORY_LIMIT)
+            size += len(_line(previous) if line is None else line)
+            _require(size <= MAX_HISTORY_BYTES, _HISTORY_LIMIT)
+            replay.add(previous)
+            if previous["team_id"] == data["team_id"]:
+                _policy_record(previous, data, policy_id, split_id)
+    finally:
+        close = getattr(history, "close", None)
+        if callable(close):
+            close()
+    team, shares = data["team_id"], data["target_shares"]
+    counts = replay.before(team, split_id, shares, "ordinary")
+    return counts, replay.heads.get(team, ""), counts != replay.before(team, split_id, shares)
+
+
+def _family(data, task, counts, author, lane, stage):
+    if task == "T1":
+        return data["manager_family"], "manager_family"
+    if task == "T3":
+        _require(_member(lane, data["family_hosts"]), "invalid_lane_family")
+        return lane, "lane_family"
+    if task in _REVIEWS:
+        _require(_member(author, data["family_hosts"]), "invalid_author_family")
+        _require(_member(stage, data["review_families"][task]), "invalid_review_stage")
+        family = data["review_families"][task][stage]
+        if task == "T8":
+            family = next(f for f in data["family_order"] if f != author) if stage == "primary" else author
+        return family, "review_policy"
+    if task in data["flexible_tasks"]:
+        return _split_family(data["target_shares"], data["family_order"], counts), "family_split"
+    return data["team_family"], "team_family"
+
+
+def _policy_record(record, data, policy_id, split_id):
+    """Re-derive current-policy claims; older policies retain structural replay checks."""
+    if record["policy_id"] != policy_id:
+        return
+    _require(record["split_id"] == split_id and record["target_shares"] == data["target_shares"] and
+             record["family_order"] == data["family_order"], "invalid_history")
+    error = "invalid_history:policy_rules_changed: start a new team history"
+    try:
+        family, reason = _family(data, record["task_kind"], record["counts_before"],
+                                 record["author_family"], data["team_family"], record["review_stage"])
+    except ModelSelectionError as exc:
+        raise ModelSelectionError(error) from exc
+    _require(record["choice"]["reason"] == reason and record["split_eligible"] == (reason == "family_split") and
+             record["choice"]["family"] == family, error)
+    if "probe_id" in record and "counts_scope" in record:
+        _require(record["choice"]["host"] == data["family_hosts"][family][0], error)
+
+
+def _role_binding(role, hosts, host, intent, *, probe=False):
+    band, model_class = role["band"], role["model_class"]
+    _require(_member(intent, _INTENTS), "unknown_intent")
+    _require(_INTENTS.index(band["floor"]) <= _INTENTS.index(intent) <=
+             _INTENTS.index(band["ceiling"]), "intent_outside_role_band")
+    binding = hosts.get((host, model_class))
+    if (binding is None or binding.get("host_status", "selectable") == "planned" or
+            binding["levels"].get(intent) is None):
+        raise ModelSelectionError("binding_unavailable:" + _diagnostic_locator(host) + ":" + _diagnostic_locator(intent))
+    if binding["admission"][intent] not in (("admitted", "unprobed") if probe else ("admitted",)):
+        raise ModelSelectionError(_admission_refusal(host, model_class, intent, role["kind"], band))
+    model, level = binding["model"], binding["levels"][intent]
+    if binding.get("effort_encoding", "flag") == "model_suffix":
+        model += "-" + level
+    return {"host": host, "class": model_class, "model": model, "level": level}
+
+
+def _probe_registry(source, *, probe=True):
+    error = "invalid_bindings"
+    _require(type(source) is tuple and len(source) == 2 and source[1] is not None, error)
+    frozen = _encoded(_input(source[0], error), MAX_INPUT_BYTES, error, checked=True)
+    roles, hosts = _validate_bindings(_loads(frozen, error), source[1], probe)
+    return roles, hosts, hashlib.sha256(frozen).hexdigest()
+
+
+def select_model(bindings, policy, task_kind, role_kind, prior_decisions, *, host_kinds, subject=None, intent=None,
+                 author_family=None, lane_family=None, review_stage="primary", probe_attempt=False):
+    """Resolve a choice and record without publishing it. Probe choices start unqualified."""
+    _require(_member(task_kind, _TASK_ROLES), "unknown_task_kind")
+    _require(_member(role_kind, _ROLES), "unknown_role_kind")
+    _require(role_kind in _TASK_ROLES[task_kind], "task_role_mismatch")
+    _require(type(subject) is str and _SUBJECT.fullmatch(subject) is not None, "invalid_subject")
+    _require(type(probe_attempt) is bool, "invalid_probe_attempt")
+    registry = _probe_registry((bindings, host_kinds), probe=probe_attempt)
+    roles, hosts, revision = registry
+    data = _policy(policy, hosts)
+    shares = data["target_shares"]
+    _require(author_family is None or _member(author_family, shares), "invalid_author_family")
+    if role_kind in ("implementer", "integrator") and lane_family is not None:
+        _require(lane_family == data["team_family"], "invalid_request:lane_family")
+    _require(lane_family is None or _member(lane_family, shares), "invalid_lane_family")
+    _require(role_kind == "reviewer" or review_stage == "primary", "invalid_review_stage")
+    policy_id = hashlib.sha256(_encoded(data, MAX_INPUT_BYTES, "invalid_policy")).hexdigest()
+    split_id = _split_identity(shares, data["family_order"])
+    counts, previous_id, audit_differs = _counts(prior_decisions, data, split_id, policy_id)
+    family, reason = _family(data, task_kind, counts, author_family, lane_family, review_stage)
+    if task_kind == "T7":
+        _require(author_family is None or author_family == family, "invalid_request:author_family")
+        author_family = family
+    band = roles[role_kind]["band"]
+    chosen_intent = intent if intent is not None else data.get("task_intents", {}).get(
+        task_kind, {}).get(family, band["default"])
+    host = data["family_hosts"][family][0]
+    choice = {**_role_binding(roles[role_kind], hosts, host, chosen_intent, probe=probe_attempt),
+              "family": family, "reason": reason, "admission": "unprobed" if probe_attempt else "admitted"}
+    record = {"schema": "aegis.model-decision/v1", "team_id": data["team_id"],
+              "task_kind": task_kind, "role_kind": role_kind, "intent": chosen_intent,
+              "author_family": author_family, "choice": dict(choice),
+              "split_eligible": reason == "family_split", "target_shares": dict(shares),
+              "counts_before": counts, "outcome": None, "subject": subject, "admission": choice["admission"],
+              "review_stage": review_stage if role_kind == "reviewer" else None,
+              "family_order": list(data["family_order"]),
+              "policy_id": policy_id, "split_id": split_id, "previous_decision_id": previous_id}
+    if probe_attempt or audit_differs:
+        record["counts_scope"] = "ordinary"
+    if probe_attempt:
+        record.update(probe_id=secrets.token_hex(32), registry_id=revision, outcome={"launch_status": "not_launched"})
+    record["decision_id"] = _identity(record)
+    _record(record, "invalid_history")
+    return choice, record
+
+
+def _line(record):
+    _record(record, "invalid_history")
+    return _encoded(record, MAX_LINE_BYTES - 1, "invalid_history", checked=True) + b"\n"
+
+
+def _open_regular(path, error, cap):
+    _require(_DIR_FD_SUPPORTED, "anchored_io_unavailable")
+    _require(".." not in path.parts, error)
+    path = path.absolute()
+    descriptor = None
+    try:
+        with open_directory(os.open, path.parent, retain_ancestors=True,
+                            close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as cursor:
+            before = os.stat(path.name, dir_fd=cursor.fd, follow_symlinks=False)
+            _require(stat.S_ISREG(before.st_mode), error)
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                                 getattr(os, "O_CLOEXEC", 0), dir_fd=cursor.fd)
+            opened = os.fstat(descriptor)
+            visible = os.stat(path.name, dir_fd=cursor.fd, follow_symlinks=False)
+            _require(stat.S_ISREG(opened.st_mode) and opened.st_size <= cap and
+                     (before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino) ==
+                     (visible.st_dev, visible.st_ino), error)
+            cursor.check()
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = None
+        return stream
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _history_rows(stream, history=None):
+    _require(os.fstat(stream.fileno()).st_size <= MAX_HISTORY_BYTES, _HISTORY_LIMIT)
+    size = 0
+    replay = DecisionReplay() if history is None else history._replay
+    for count in range(1, MAX_HISTORY_RECORDS + 2):
+        line = stream.readline(MAX_LINE_BYTES + 1)
+        if not line:
+            return
+        size += len(line)
+        _require(size <= MAX_HISTORY_BYTES and count <= MAX_HISTORY_RECORDS, _HISTORY_LIMIT)
+        _require(len(line) <= MAX_LINE_BYTES and line.endswith(b"\n"), "invalid_history")
+        record = _loads(line, "invalid_history")
+        _require(line == _line(record), "invalid_history")
+        replay.add(record)
+        if history is not None:
+            history._snapshot.append(line)
+        yield line, record
+
+
+def _path_call(operation, *args, missing=False, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except (ValueError, OSError) as exc:
+        if isinstance(exc, (ModelSelectionError, LockTimeoutError)) or (missing and isinstance(exc, FileNotFoundError)):
+            raise
+        raise ModelSelectionError("unsafe_decision_path") from exc
+
+
+class DecisionHistory:
+    def __init__(self, path, directory=None):
+        self._snapshot, self._replay = [], DecisionReplay() if directory is not None else None
+        self._generation = None
+        self._rows = _read_rows(path, directory, snapshot=self if directory is not None else None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._rows)[1]
+
+    def close(self):
+        self._rows.close()
+
+
+def read_decisions(path):
+    """Return a bounded JSONL iterator under .lock. Consume or close the iterator."""
+    return DecisionHistory(path)
+
+
+def _read_rows(path, directory=None, *, snapshot=None):
+    if directory is not None:
+        try:
+            stream = _open_log(path.name, directory)
+        except FileNotFoundError:
+            return
+        with stream:
+            snapshot._generation = _log_generation(stream.fileno())
+            yield from _history_rows(stream, snapshot)
+        return
+    with _locked_log(path, read=True) as (target, directory):
+        if directory is not None:
+            try:
+                stream = _open_log(target.name, directory, allow_missing=False)
+            except FileNotFoundError:
+                # Preserve the empty-history result for ENOENT during stream creation.
+                return
+            with stream:
+                yield from _history_rows(stream)
+
+
+@contextmanager
+def _locked_log(path, *, read=False, probe_io=None):
+    try:
+        target = _path_call(_path_value, path, "unsafe_decision_path")
+        _require("\x00" not in str(target) and ".." not in target.parts, "unsafe_decision_path")
+        _require(not target.name.endswith(".lock"), "invalid_log_path")
+        target = _path_call(target.absolute)
+        with ExitStack() as stack:
+            directory = _path_call(_decision_directory, target)
+            stack.callback(os.close, directory)
+            # Check existence without pinning a generation before the shared lock.
+            if read:
+                try:
+                    _open_log(target.name, directory, metadata_only=True)
+                except FileNotFoundError:
+                    yield target, None
+                    return
+            _path_call(stack.enter_context, file_lock(target.with_name(target.name + ".lock"),
+                                                     timeout=_LOCK_TIMEOUT_SECONDS, dir_fd=directory))
+            yield target, directory
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ModelSelectionError) or probe_io is None or not probe_io():
+            raise
+        code = "probe_decision_lock_timeout" if isinstance(exc, LockTimeoutError) else "probe_decision_io_failed"
+        raise ModelSelectionError(code) from None
+
+
+def _decision_directory(path):
+    _require(_DIR_FD_SUPPORTED, "anchored_io_unavailable")
+    def private(info):
+        _require(info.st_uid == os.getuid() and not info.st_mode & 0o022, "unsafe_decision_directory")
+
+    try:
+        with open_directory(os.open, path.parent, policy=private, retain_ancestors=True, close_fd=os.close,
+                            stat_fd=os.fstat, stat_entry=os.stat) as held:
+            try:
+                info = os.stat(path.name, dir_fd=held.fd, follow_symlinks=False)
+                _require(stat.S_ISREG(info.st_mode), "unsafe_decision_path")
+            except FileNotFoundError:
+                pass
+            held.check()
+            return held.detach()
+    except ConfinedFileError as exc:
+        raise ModelSelectionError("unsafe_decision_path") from exc
+
+
+def _open_log(name, directory, *, metadata_only=False, allow_missing=True):
+    before = _path_call(os.stat, name, dir_fd=directory, follow_symlinks=False, missing=allow_missing)
+    _require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+             before.st_uid == os.getuid() and not before.st_mode & 0o022, "unsafe_decision_path")
+    if metadata_only:
+        return None
+    descriptor = _path_call(os.open, name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                            getattr(os, "O_CLOEXEC", 0), dir_fd=directory)
+    try:
+        _same_file(name, descriptor, directory)
+        opened = os.fstat(descriptor)
+        _require(stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and
+                 opened.st_uid == os.getuid() and not opened.st_mode & 0o022, "unsafe_decision_path")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _same_file(name, descriptor, directory):
+    visible = _path_call(os.stat, name, dir_fd=directory, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    _require(stat.S_ISREG(visible.st_mode) and visible.st_nlink == 1 and
+             (visible.st_dev, visible.st_ino) == (opened.st_dev, opened.st_ino), "unsafe_decision_path")
+
+
+def _write_all(descriptor, payload):
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("decision log write made no progress")
+        view = view[written:]
+
+
+def _log_generation(descriptor):
+    info = os.fstat(descriptor)
+    return (info.st_dev, info.st_ino, *file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+
+
+def _check_log_generation(name, directory, expected):
+    try:
+        with _open_log(name, directory) as stream:
+            _require(_log_generation(stream.fileno()) == expected, "stale_decision")
+    except FileNotFoundError:
+        _require(expected is None, "stale_decision")
+
+
+def _publish(path, payload, directory, history):
+    snapshot = history._snapshot
+    _require(sum(map(len, snapshot)) + len(payload) <= MAX_HISTORY_BYTES and
+             len(snapshot) < MAX_HISTORY_RECORDS, _HISTORY_LIMIT)
+    try:
+        with _open_log(path.name, directory) as source:
+            _require(_log_generation(source.fileno()) == history._generation, "stale_decision")
+    except FileNotFoundError:
+        _require(history._generation is None, "stale_decision")
+    descriptor, temporary = None, None
+    try:
+        candidate = ".model-select-" + secrets.token_hex(16)
+        descriptor = _path_call(os.open, candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW |
+                                getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=directory)
+        temporary = candidate
+        _same_file(temporary, descriptor, directory)
+        for line in snapshot:
+            _write_all(descriptor, line)
+        _write_all(descriptor, payload)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        _same_file(temporary, descriptor, directory)
+        _check_log_generation(path.name, directory, history._generation)
+        _path_call(os.rename, temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+        os.fsync(directory)
+    finally:
+        primary = sys.exc_info()[1]
+        failure, cleanup = None, []
+        if descriptor is not None:
+            cleanup.append((os.close, (descriptor,), {}))
+        if temporary is not None:
+            cleanup.append((_path_call, (os.unlink, temporary), {"dir_fd": directory}))
+        for operation, args, kwargs in cleanup:
+            try:
+                operation(*args, **kwargs)
+            except (OSError, ModelSelectionError) as exc:
+                failure = failure or exc
+        if failure is not None:
+            if primary is not None:
+                raise primary from failure
+            raise failure
+
+
+def append_decision(path, record, *, known_decision=None, prepare=None, probe_bindings=None):
+    """Append ordinary decisions and evidence for known probe attempts under the log lock."""
+    if known_decision is None:
+        payload = _line(record)
+        record = _loads(payload, "invalid_history")
+    else:
+        _require(type(known_decision) is str and _DIGEST.fullmatch(known_decision), "invalid_decision_id")
+        _require(callable(prepare), "invalid_history")
+    original = record if known_decision is None else None
+    with _locked_log(path, read=known_decision is not None,
+                     probe_io=lambda: probe_bindings is not None or "probe_id" in (original or {})) as (target, directory):
+        _require(directory is not None, "unknown_decision_id")
+        with closing(DecisionHistory(target, directory)) as history:
+            for row in history:
+                if original is None and row["decision_id"] == known_decision:
+                    original = row
+        if known_decision is not None:
+            _require(original is not None, "unknown_decision_id")
+            record = prepare(original)
+            _require(type(record) is dict and record.get("decision_id") == known_decision, "invalid_history")
+            payload = _line(record)
+            record = _loads(payload, "invalid_history")
+        previous, refusal = history._replay.add(record, writing=True, probe_bindings=probe_bindings)
+        if previous is not None:
+            _check_log_generation(target.name, directory, history._generation)
+            os.fsync(directory)
+        else:
+            _publish(target, payload, directory, history)
+        if refusal is not None:
+            raise refusal
+        if previous is not None:
+            return previous
+    return record if known_decision is not None else None
+
+
+def select_and_append(path, bindings, policy, task_kind, role_kind, *, host_kinds, subject=None, intent=None,
+                      author_family=None, lane_family=None, review_stage="primary", probe_attempt=False):
+    """Select and publish under one anchored lock. Probe attempts start unlaunched."""
+    _require(type(probe_attempt) is bool, "invalid_probe_attempt")
+    with _locked_log(path, probe_io=lambda: probe_attempt) as (target, directory):
+        with closing(DecisionHistory(target, directory)) as history:
+            choice, record = select_model(bindings, policy, task_kind, role_kind, history,
+                                          host_kinds=host_kinds, subject=subject, intent=intent,
+                                          author_family=author_family, lane_family=lane_family,
+                                          review_stage=review_stage, probe_attempt=probe_attempt)
+        if probe_attempt:
+            history._replay.add(record, writing=True, stage_validated=True)
+        _publish(target, _line(record), directory, history)
+        return choice, record

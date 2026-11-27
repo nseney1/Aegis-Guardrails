@@ -64,7 +64,7 @@ _PLAIN_QUOTED_MATCH = re.compile(_PLAIN_QUOTED)
 class JSLexError(ASTDriverError):
     def __init__(self, reason, line, offset):
         self.reason, self.line, self.offset = reason, line, offset
-        super().__init__(f'{reason} at line {line}, offset {offset}')
+        super().__init__(f'{reason} at line {line}, offset {offset}', limit_bytes=MAX_SOURCE_BYTES if reason == 'too_large' else None)
 
 
 class Token(NamedTuple):
@@ -79,6 +79,8 @@ class Token(NamedTuple):
 
 # The public NamedTuple is unchanged; avoid its Python __new__ wrapper per token.
 _TOKEN_NEW = tuple.__new__
+# (name, blocks compact declaration): generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
+_FRAME_DEPTHS = (('generator_frames', True), ('strict_frames', True), ('arrow_markers', True), ('for_heads', True), ('type_literals', False))
 
 
 class Lexer(JSXScanner, TypePositions):
@@ -102,8 +104,10 @@ class Lexer(JSXScanner, TypePositions):
         # (end of the `(` run, `)` count or -1) of the last failed transparent-group attempt.
         self.group_skip = (-1, -1)
         self.generator_pending, self.body_generator, self.class_kind, self.annotation_at = None, False, None, -1
-        # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
-        self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads, self.type_literals = set(), set(), set(), set(), set()
+        depths_by_name = {name: set() for name, _ in _FRAME_DEPTHS}
+        self.__dict__.update(depths_by_name)
+        self.frame_depths = tuple(depths_by_name.values())
+        self.declaration_depths = tuple(depths_by_name[name] for name, blocks in _FRAME_DEPTHS if blocks)
         # Switch bodies, switch heads still open, and (depth, token index) of the `)` that closed the last head.
         self.switch_frames, self.switch_heads, self.switch_close = set(), set(), None
 
@@ -127,7 +131,7 @@ class Lexer(JSXScanner, TypePositions):
     def run(self):
         source = self.source
         size = len(source)
-        if len(source.encode('utf-8')) > MAX_SOURCE_BYTES:
+        if size > MAX_SOURCE_BYTES or len(source.encode('utf-8')) > MAX_SOURCE_BYTES:
             self.error('too_large')
         while self.i < size:
             if self.mode == 'code':
@@ -235,8 +239,8 @@ class Lexer(JSXScanner, TypePositions):
                     self.expr, self.statement, self.previous = True, False, '('
                 elif value == ')' and frames and frames[-1][1] == 'expression':
                     frames.pop()
-                    if self.arrow_markers:
-                        self.arrow_markers.discard(len(frames) + 1)
+                    if any(self.frame_depths):
+                        self.close_context('expression')
                     self.i = end
                     tokens.append(_TOKEN_NEW(Token, ('punct', ')', self.line, begin, end, 'expression', None)))
                     self.expr, self.statement, self.previous = False, False, ')'
@@ -372,8 +376,7 @@ class Lexer(JSXScanner, TypePositions):
         if (not self.statement or self.body is not None or self.function is not None or self.control
                 or self.class_fields or self.module_clause or self.decorator_prefix or self.declaration_prefix
                 or self.class_pending or self.type_angles or self.label_pending or self.case_pending
-                or self.generator_frames or self.strict_frames or self.arrow_markers or self.for_heads
-                or self.previous in ('.', '?.', ':') or name in _SYNTAX_WORDS
+                or any(self.declaration_depths) or self.previous in ('.', '?.', ':') or name in _SYNTAX_WORDS
                 or self.frames and self.frames[-1][1] not in ('block', 'function_decl', 'function_expr', 'function_arrow')):
             return False
         self.tokens.extend((
@@ -839,7 +842,7 @@ class Lexer(JSXScanner, TypePositions):
             if not self.frames or self.frames[-1][0] != ch:
                 self.error('syntax:unbalanced_delimiter')
             _, role, resume = self.frames.pop()
-            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals or self.switch_frames or self.switch_heads:
+            if role.startswith('parameters_') or any(self.frame_depths) or self.switch_frames or self.switch_heads:
                 self.close_context(role)
             if role in ('class_decl', 'class_expr'):
                 del self.class_fields[len(self.frames) + 1]
@@ -923,11 +926,8 @@ class Lexer(JSXScanner, TypePositions):
         depth = len(self.frames) + 1
         if role.startswith('parameters_'):
             self.body_generator = depth in self.generator_frames
-        self.generator_frames.discard(depth)
-        self.strict_frames.discard(depth)
-        self.for_heads.discard(depth)
-        self.arrow_markers.discard(depth)
-        self.type_literals.discard(depth)
+        for depths in self.frame_depths:
+            depths.discard(depth)
         self.switch_frames.discard(depth)
         if role == 'control' and depth in self.switch_heads:
             self.switch_heads.discard(depth)

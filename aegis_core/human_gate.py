@@ -17,12 +17,13 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
-from aegis_core import primitives
+from aegis_core import primitives, workflow_jobs
 from aegis_core import codeowners as _codeowners
-from aegis_core import ghcli, gitsafe, governance, pathlookup
+from aegis_core import approval_shape as _approval_shape, ghcli, gitsafe, governance, pathlookup
 from aegis_core.errors import AegisError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
+from aegis_core.workflow_jobs import aegis_check_jobs
 
 __all__ = [
     "ALLOWED_SIGNERS",
@@ -44,6 +45,7 @@ __all__ = [
     "find_review_approval",
     "is_branch_name",
     "find_test_exemption",
+    "exemption_finder",
     "governance_tree_hash",
     "insight_text_hash",
     "signed_empty_commit",
@@ -75,30 +77,16 @@ _STATEMENTS = {
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
 _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULTILINE)
-_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
-_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
 _EXEMPT_TEST_LINE = re.compile(
-    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*?)[ \t]*$",
+    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
-_JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
-_JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \t]*(?:#.*)?$""")
-_JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
-_AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
-# The whole of a script that fails exactly when aegis fails, in any built-in shell: no operator, quote or expansion.
-# `-I` (isolated mode, which keeps the checkout off sys.path so the installed wheel runs) is the one
-# interpreter flag accepted; it cannot change the exit status.
-_DIRECT_CHECK = re.compile(r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
-_KEY = re.compile(r"""["']?([\w-]+)["']?[ \t]*:(?:[ \t]+(.*))?""")
-_ALWAYS = re.compile(r"""(["']?)(?:\$\{\{[ \t]*always\(\)[ \t]*\}\}|always\(\))\1""")
-_SHELLS = ("bash", "sh", "pwsh", "powershell", "cmd", "python")
 _PATH_FILTER_WHY = ("the Aegis workflow filters pull requests by path (paths: or paths-ignore: under "
                     "on.pull_request), so it does not run on every pull request")
-_UNREAD_WHY = ("is not laid out as this check reads a workflow (job keys four spaces in, steps as a list of "
-               "key: value lines, no YAML merge key or repeated key)")
 _PR_EVENT = re.compile(r"""["']?\bpull_request(?:_target)?["']?[ \t]*:[ \t]*""")
 _PATHS_KEY = re.compile(r"""(?:^|[\s{,])["']?paths(?:-ignore)?["']?[ \t]*:""")
-_MAX_WORKFLOW_LINES = 5000
 
 
 class HumanGateError(AegisError):
@@ -570,7 +558,7 @@ def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[
     for path in sorted(workflows):
         text = blobs[workflows[path]].decode("utf-8", "replace")
         filtered = _PATH_FILTER_WHY if _filters_pull_requests_by_path(text) else None
-        for name, why in _aegis_job_verdicts(text).items():
+        for name, why in workflow_jobs.aegis_job_verdicts(text).items():
             jobs[name] = jobs.get(name) or why or filtered
     return jobs
 
@@ -578,7 +566,7 @@ def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[
 def _filters_pull_requests_by_path(text: str) -> bool:
     """``paths:`` or ``paths-ignore:`` under ``on.pull_request(_target)``, in block or flow style."""
     lines = ["" if ln.lstrip().startswith("#") else re.sub(r"[ \t]+#.*$", "", ln)
-             for ln in text.splitlines()[:_MAX_WORKFLOW_LINES]]
+             for ln in text.splitlines()[:workflow_jobs.MAX_WORKFLOW_LINES]]
     start = next((i for i, ln in enumerate(lines) if re.match(r"""^["']?on["']?[ \t]*:""", ln)), None)
     if start is None:
         return False
@@ -728,6 +716,8 @@ def _read_message(top: Path, oid: str) -> Union[str, Approval]:
     message = _commit_message(top, oid)
     if message is None:
         return _no("unresolved", f"cannot read commit {oid}", oid)
+    if limit := _approval_shape.bounds_refusal(message):
+        return _no(*limit, oid)
     if _ACCEPT_LINE.search(message):
         return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
     return message
@@ -780,8 +770,8 @@ def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name:
         values = rx.findall(message)
         if not values:
             return _no("no_trailer", f"no {name} trailer", oid)
-        if len(values) > 1:
-            return _no("multiple_trailers", f"more than one {name} trailer", oid)
+        if refusal := _approval_shape.refusal(message, rx, name):
+            return _no(*refusal, oid)
         if values[0].lower() != expected.lower():
             return _no("hash_mismatch", mismatch_msg, oid)
         return _verify_commit_sig(top, oid, base, ok_msg)
@@ -836,8 +826,8 @@ def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base
         reasons = [r.strip() for t, r in entries if t.lower() == fix_oid.lower()]
         if not reasons:
             return _no("commit_mismatch", f"Aegis-Exempt-Test does not name fix commit {fix_oid[:12]}", oid)
-        if len(reasons) > 1:
-            return _no("multiple_trailers", "more than one Aegis-Exempt-Test trailer for this commit", oid)
+        if refusal := _approval_shape.refusal(message, _EXEMPT_TEST_LINE, "Aegis-Exempt-Test"):
+            return _no(*refusal, oid)
         return _verify_commit_sig(top, oid, base, f"good test exemption for {fix_oid[:12]}: {reasons[0]}")
     except gitsafe.GitError as exc:
         return _no("unresolved", str(exc), str(approval_commit))
@@ -910,7 +900,7 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
         return None
     for record in res.stdout.split(b"\0"):
         oid, _, message = record.decode("utf-8", "replace").lstrip("\n").partition("\n")
-        if not _FULL_OID.fullmatch(oid) or not _APPROVE_LINE.search(message):
+        if not _FULL_OID.fullmatch(oid) or _approval_shape.bounds_refusal(message) or not _APPROVE_LINE.search(message):
             continue
         verdict = _verify_candidate(top, oid, base_target, _APPROVE_LINE, "Aegis-Approve", digest,
                                     _APPROVE_MISMATCH, _APPROVE_OK)
@@ -997,27 +987,35 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
 
 
 @gitsafe.scrubbed()
-def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
-    """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
-    trailer names it (so a refusal can say why); else None."""
+def exemption_finder(root: Any, head: str, base_ref: str) -> Callable[[str], Optional[Approval]]:
+    """Index once, newest first: lookups return the first valid exemption, else first rejection, else None.
+    Size objects first; discovery GitError propagates so callers can latch terminal failure."""
     top = _top(root)
     scan = _commits_in(top, head, base_ref)
-    fix_oid = gitsafe.resolve_commit(top, fix_commit)
-    if scan is None or not fix_oid:
-        return None
-    rejected: Optional[Approval] = None
-    for oid in scan[2]:
-        if oid == fix_oid:  # a commit cannot carry its own full oid
-            continue
-        verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
-        if verdict.valid:
-            return verdict
-        # unresolved and accept_reserved come before the trailer is read: keep them only for a commit naming the fix
-        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch") and any(
-            t.lower() == fix_oid.lower() for t, _why in _EXEMPT_TEST_LINE.findall(_commit_message(top, oid) or "")
-        ):
-            rejected = verdict
-    return rejected
+    candidates: Dict[str, List[str]] = {}
+    if scan is not None:
+        for oid, raw in gitsafe.iter_objects(top, scan[2], kind="commit"):
+            message = raw.decode("utf-8", "replace").partition("\n\n")[2]
+            for target in dict.fromkeys(t.lower() for t, _why in (
+                    () if _approval_shape.bounds_refusal(message) else _EXEMPT_TEST_LINE.findall(message)) if t.lower() != oid):
+                candidates.setdefault(target, []).append(oid)
+            del raw, message
+    @gitsafe.scrubbed()
+    def find(fix_commit: str) -> Optional[Approval]:
+        fix_oid = gitsafe.resolve_commit(top, fix_commit)
+        rejected: Optional[Approval] = None
+        for oid in candidates.get(fix_oid or "", []):
+            verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
+            if verdict.valid:
+                return verdict
+            if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch"):
+                rejected = verdict
+        return rejected
+    return find
+
+
+def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
+    return exemption_finder(root, head, base_ref)(fix_commit)
 
 
 def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:
@@ -1060,142 +1058,6 @@ def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -
     if not commit:
         raise HumanGateError("the signed commit was made but HEAD cannot be read")
     return commit
-
-
-def aegis_check_jobs(text: str) -> List[str]:
-    """The check names (literal ``name:``, else the job id) of the jobs in one workflow file that count as
-    the required Aegis check. A templated name or a matrix gives no fixed check name, so that job is left out."""
-    return [name for name, why in _aegis_job_verdicts(text).items() if why is None]
-
-
-def _value(text: Optional[str]) -> str:
-    return re.sub(r"(?:^|[ \t]+)#.*$", "", text or "").strip()
-
-
-def _step_line(step: Dict[str, Any], indent: int, body: str) -> None:
-    step["col"] = indent if step["col"] is None else step["col"]
-    if indent == step["col"]:
-        found = _KEY.fullmatch(body)
-        if not found or found.group(1) in step["vals"]:
-            step["bad"] = True
-            return
-        step["key"], value = found.group(1), found.group(2) or ""
-        step["vals"][step["key"]] = value
-        if step["key"] == "run":
-            step["literal"] = bool(re.fullmatch(r"\|[-+]?", _value(value)))
-            step["script"] = [] if step["literal"] else [_value(value)] if value[:1] not in ("", "|", ">") else None
-            step["runs"] = bool(_AEGIS_CHECK_CI.search(value))
-    elif indent < step["col"]:
-        step["bad"] = True
-    elif step["key"] == "run":
-        step["runs"] = step["runs"] or bool(_AEGIS_CHECK_CI.search(body))
-        step["script"] = step["script"] + [_value(body)] if step["literal"] else None
-    elif step["key"] in ("if", "continue-on-error", "shell"):
-        step["vals"][step["key"]] += " ..."
-
-
-def _skip_why(vals: Mapping[str, str]) -> Optional[str]:
-    cond, coe = (_value(vals[k]) if k in vals else None for k in ("if", "continue-on-error"))
-    if cond is not None and not _ALWAYS.fullmatch(cond):
-        return f"has a condition (if: {cond}) and may be skipped, which GitHub reports as a passing check"
-    return "sets continue-on-error, so it passes even when aegis check fails" if coe not in (None, "false") else None
-
-
-def _step_why(step: Mapping[str, Any], default_shell: Optional[str]) -> Optional[str]:
-    """Why a step that mentions ``aegis check --ci`` may not fail its job; None when it does."""
-    shell = _value(step["vals"]["shell"]) if "shell" in step["vals"] else default_shell
-    script, skips = step["script"] or [], _skip_why(step["vals"])
-    if step["bad"]:
-        return _UNREAD_WHY
-    if skips:
-        return "runs aegis check --ci in a step that " + skips
-    if shell not in (None, *_SHELLS):
-        return f"runs aegis check --ci under a custom shell ({shell}), so whether its failure fails the job is not visible"
-    if len(script) != 1 or not _DIRECT_CHECK.fullmatch(script[0]) or "--ci" not in script[0].split():
-        return ("does not run aegis check --ci as the whole of a step's run: with plain arguments (it is echoed, quoted, "
-                "commented out, combined with other commands or followed by || true), so its failure may not fail the job")
-    return None
-
-
-def _aegis_job_verdicts(text: str) -> Dict[str, Optional[str]]:
-    """{check name: None when the job counts as the required Aegis check, else why not}, for the jobs of one
-    workflow file that run ``aegis check --ci`` under a literal name, outside a matrix. GitHub reports a job
-    skipped by a condition as a passing required check, so a job counts only when nothing can skip it and an
-    Aegis step can fail it; a layout this line reader cannot follow does not count."""
-    jobs: Dict[str, Dict[str, Any]] = {}
-    job: Optional[Dict[str, Any]] = None
-    step: Optional[Dict[str, Any]] = None
-    section, key, seq, wf_shell = "", "", -1, None
-    lines = text.splitlines()
-    for line in [*lines[:_MAX_WORKFLOW_LINES], "end:"]:
-        body = line.strip()
-        if not body or body.startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if step is not None and indent > seq:
-            _step_line(step, indent, body)
-            continue
-        step, item = None, re.match(r"-(?:[ \t]+|$)", body)
-        if indent == 0:
-            section, _colon, inline = body.partition(":")
-            section, job = section.strip("\"' "), None
-            if section == "defaults":  # an inline mapping is not read, so a shell it may name counts as custom
-                wf_shell = _value(inline) or wf_shell
-        elif section == "defaults":
-            found = _KEY.fullmatch(body)
-            wf_shell = _value(found.group(2)) if found and found.group(1) == "shell" else wf_shell
-        elif section != "jobs":
-            continue
-        elif indent <= 2:
-            found = _JOB_ID.match(line)
-            fresh = {"name": found.group(1) if found else "", "vals": {}, "steps": [], "shell": None,
-                     "bad": False, "matrix": False}
-            job, key = (jobs.setdefault(found.group(1), fresh) if found else None), ""
-            if job is not None and job is not fresh:
-                job["bad"] = True
-        elif job is None:
-            continue
-        elif key == "steps" and item and indent >= 4 and seq in (-1, indent):
-            seq, rest = indent, body[item.end():]
-            step = {"vals": {}, "key": "", "col": indent + item.end() if rest else None, "script": None,
-                    "literal": False, "runs": False, "bad": False}
-            job["steps"].append(step)
-            if rest:
-                _step_line(step, indent + item.end(), rest)
-        elif indent == 4:
-            found, named, seq = _KEY.fullmatch(body), _JOB_NAME.match(line), -1
-            key = found.group(1) if found else ""
-            # a name key _JOB_NAME cannot read would leave the check named after the job id here, not on GitHub
-            job["bad"] = job["bad"] or not found or key in job["vals"] or (key == "name" and not named)
-            job["vals"][key] = found.group(2) or "" if found else ""
-            if key == "defaults":
-                job["shell"] = _value(job["vals"][key]) or job["shell"]
-            if named:
-                job["name"] = next((g for g in named.groups() if g), "") or job["name"]
-            job["matrix"] = job["matrix"] or bool(_JOB_MATRIX.match(line))
-        elif indent < 4 or key == "steps":
-            job["bad"] = True
-        elif key in ("if", "continue-on-error"):
-            job["vals"][key] += " ..."
-        else:
-            found = _KEY.fullmatch(body)
-            if key == "defaults" and found and found.group(1) == "shell":
-                job["shell"] = _value(found.group(2))
-            job["matrix"] = job["matrix"] or bool(_JOB_MATRIX.match(line))
-    verdicts: Dict[str, Optional[str]] = {}
-    for job in jobs.values():
-        name, vals = job["name"], job["vals"]
-        whys = [_step_why(s, job["shell"] or wf_shell) for s in job["steps"] if s["runs"]]
-        if not whys or job["matrix"] or "${{" in name:
-            continue
-        if job["bad"] or len(lines) > _MAX_WORKFLOW_LINES:
-            why: Optional[str] = _UNREAD_WHY
-        elif "needs" in vals and "if" not in vals:
-            why = "needs other jobs without if: always(), so a failed or skipped job it needs skips it"
-        else:
-            why = _skip_why(vals) or (None if None in whys else whys[0])
-        verdicts[name] = verdicts.get(name) or (f"the Aegis job {name} {why}" if why else None)
-    return verdicts
 
 
 def signers_setup() -> List[str]:

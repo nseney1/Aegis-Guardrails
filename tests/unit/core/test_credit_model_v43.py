@@ -568,7 +568,7 @@ def test_a_tip_stored_under_another_replay_format_is_not_resumed_from(tmp_path: 
     repo = _small_history(tmp_path)
     first = fitness.replay_detector_history_report(repo.root)
     assert first.tip == repo.head()
-    monkeypatch.setattr(fitness, "REPLAY_FORMAT", getattr(fitness, "REPLAY_FORMAT", 1) + 1, raising=False)
+    monkeypatch.setattr(fitness, "REPLAY_FORMAT", fitness.REPLAY_FORMAT + 1)
     again = fitness.replay_detector_history_report(repo.root, since=_state(first), persist=False)
     assert again.rules != first.rules
     assert _units(again.detections) == _from_scratch(repo.root) != {}

@@ -19,6 +19,7 @@ from typing import Any, Optional
 from aegis_core.ast.drivers.python import read_python_source
 from aegis_core.ast.schema import NormalizedAST
 from aegis_core.match import is_test_path
+from aegis_core.workspace.layout import LEGACY_SOMA_DIRNAME as _RETIRED_DIRNAME
 from . import ToolEvidence
 
 __all__ = ["check"]
@@ -307,8 +308,8 @@ def _resolve_searchable_extensions(
 
 _COMMON_IGNORE_DIRS: frozenset[str] = frozenset({
     "__pycache__", "node_modules", ".venv", "venv", "dist", "build",
-    "target", ".cargo", "bin", "obj", ".git", ".soma", ".tox",
-    "tests", "test",
+    "target", ".cargo", "bin", "obj", ".git", ".tox",
+    "tests", "test", _RETIRED_DIRNAME,
 })
 
 

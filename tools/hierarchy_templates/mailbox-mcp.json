@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "aegis_mailbox": {
+      "command": "/absolute/source-pinned-python",
+      "args": [
+        "-I",
+        "-B",
+        "/absolute/prototype/tools/hierarchy_mailbox.py",
+        "--root", "/absolute/aegis-guides/mailbox",
+        "serve",
+        "--endpoint", "a/lane/review",
+        "--host", "REPLACE_WITH_HOST",
+        "--session", "REPLACE_WITH_BOUND_SESSION",
+        "--generation", "1"
+      ]
+    }
+  }
+}

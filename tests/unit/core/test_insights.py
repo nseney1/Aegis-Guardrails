@@ -1,25 +1,41 @@
 """Unit tests for aegis_core.insights edge cases, security boundaries, and clustering."""
 from __future__ import annotations
 
+import argparse
 import ast
+import errno
+import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
+import shutil
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
+import unicodedata
 
 import pytest
 
+from tests.conftest import symlink_or_skip
+from tests.helpers_reviewed_sources import (
+    census_guard, check_census_rows, run_census_fixture,
+    GITFILE_MAX_BYTES, git as _git, git_environment as _git_environment, reviewed_python_paths,
+    run_isolated_test as _run_isolated,
+)
+
 from aegis_core import insights as core_insights
+import aegis_core.insights.review as insight_review
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import real_path
+from aegis_core.gitsafe_policy import LOCAL_ENV
 from aegis_core.insights import (
     KEY_SIZE,
     add_insight,
     capture_suggestion,
     create_link_key,
     dirty_paths,
-    has_correction_cue,
     host_capture_status,
     insight_workspace_id,
     insights_path,
@@ -28,23 +44,967 @@ from aegis_core.insights import (
     read_link_key,
     record_decision,
     record_hook_prompt,
-    redact_insight_text,
     review_insights,
     session_hs,
     write_proposal,
 )
 
+REPO = Path(real_path(__file__)).parents[3]
+# Reviewed parse-cost ratchet with headroom for ordinary tracked source additions.
+# Raising this ceiling requires review; failures list every parsed path.
+INSIGHTS_PARSE_CEILING = 80
+
+
+_ROUND8_INSIGHT_FIELDS = {
+    "v": "identity", "ts": "identity", "event": "identity", "id": "identity",
+    "level": "identity", "text": "text", "paths": "path", "psrc": "identity",
+    "host": "text", "hs": "identity", "source": "identity", "kind": "text",
+    "approval_code": "identity", "revs": "identity", "corroborated_by": "identity",
+    "paths_dropped": "identity", "cue": "identity", "inv": "identity",
+    "decision": "identity", "insight_ids": "identity", "reason": "text", "rule_id": "identity",
+}
+
+
+def test_round8_writer_field_inventory_contract():
+    from dataclasses import field, fields, make_dataclass
+    import inspect
+
+    from aegis_core.insights import capture, review
+    from aegis_core.proposals import model, store
+
+    assert dict(capture.INSIGHT_FIELD_POLICIES) == _ROUND8_INSIGHT_FIELDS
+    assert set(model.PROPOSAL_FIELD_POLICIES) == {item.name for item in fields(model.Proposal)} | {"count"}
+    assert set(model.PROPOSAL_FIELD_POLICIES.values()) <= {"identity", "path", "text"}
+    source = ast.parse(inspect.getsource(store._validate_row))
+    required = next(node.value for node in source.body[0].body if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "required" for target in node.targets))
+    allowed = next(node.value for node in source.body[0].body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "allowed" for target in node.targets))
+    assert set(model.PROPOSAL_DECISION_FIELD_POLICIES) == ast.literal_eval(required) | ast.literal_eval(allowed.right)
+    writers, literal_fields = set(), set()
+    for module in (capture, review):
+        tree = ast.parse(inspect.getsource(module))
+        for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+            nodes = list(ast.walk(function))
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "_append_user_insights" for node in nodes):
+                writers.add(function.name)
+                assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                           and node.func.id == "clean_insight_row" for node in nodes), function.name
+            if function.name in {"_build_insight_row", "record_hook_prompt", "record_decision"}:
+                for node in nodes:
+                    if isinstance(node, ast.Dict):
+                        literal_fields.update(key.value for key in node.keys
+                                              if isinstance(key, ast.Constant) and isinstance(key.value, str))
+                    if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+                        if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                            literal_fields.add(node.slice.value)
+    assert writers == {"add_insight", "capture_suggestion", "record_hook_prompt", "record_decision"}
+    assert literal_fields <= set(capture.INSIGHT_FIELD_POLICIES)
+    expanded = make_dataclass("UnclassifiedProposal", [("unclassified", str, field(default="opaque"))],
+                              bases=(model.Proposal,), frozen=True)
+    with pytest.raises(model.ProposalError) as refusal:
+        expanded(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    assert refusal.value.code == "invalid"
+
+
+@pytest.mark.parametrize("name,policy", _ROUND8_INSIGHT_FIELDS.items())
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_insight_field_has_a_secret_safe_policy(tmp_path, name, policy, control):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    value = "AK" + "IA" + control + "B" * 16
+    supplied = ([value] if name in {"paths", "insight_ids"} else
+                {value: "0" * 16} if name == "revs" else value)
+    if policy == "text":
+        shown = capture.clean_insight_row({name: supplied}, workspace=workspace)
+        assert "BBBB" not in shown[name] and "[REDACTED" in shown[name]
+    elif policy == "path":
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            capture.clean_insight_row({name: supplied}, workspace=workspace)
+    else:
+        with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+            capture.clean_insight_row({name: supplied}, workspace=workspace)
+        assert refusal.value.code == "invalid"
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_public_writers_refuse_identities_paths_and_redact_hosts(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    _put_rule(workspace, "trap-safe")
+    secret = "AK" + "IA" + control + "B" * 16
+    for argument in ({"insight_ids": [secret]}, {"insight_ids": ["ins-" + "a" * 12], "rule_id": secret}):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            record_decision(workspace, decision="confirm", home=home, **argument)
+    for write in (add_insight, capture_suggestion):
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            write(workspace, "Ordinary note.", paths=[secret], home=home)
+
+    def write(index):
+        captured = capture_suggestion(workspace, "Ordinary capture.", paths=["app.py"],
+                                      host=secret, home=home)
+        beat = record_hook_prompt(secret, {"prompt": "ordinary", "session_id": "session"},
+                                  workspace=workspace, home=home)
+        prompt = record_hook_prompt(secret, {"prompt": "Never repeat that mistake.", "session_id": "session"},
+                                    workspace=workspace, home=home)
+        assert all("BBBB" not in row["host"] for row in (captured, beat, prompt))
+        row = add_insight(workspace, "Ordinary correction.", paths=["app.py"], home=home)
+        decision = record_decision(workspace, decision="confirm", insight_ids=[row["id"]], home=home)
+        assert decision["insight_ids"] == [row["id"]]
+
+    write(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(write, range(3)))
+    stored = read_insight_rows(workspace, home=home)
+    assert {row["event"] for row in stored} >= {"insight", "heartbeat", "decision", "inventory"}
+    assert all("BBBB" not in json.dumps(row) for row in stored)
+
+
+def test_round8_unknown_writer_field_refuses_before_append_then_recovers(tmp_path, monkeypatch):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    original = capture._build_insight_row
+
+    def extended(*args, **kwargs):
+        return dict(original(*args, **kwargs), unclassified="AK" + "IA" + "B" * 16)
+
+    monkeypatch.setattr("aegis_core.insights.capture._build_insight_row", extended)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home) == []
+    monkeypatch.setattr("aegis_core.insights.capture._build_insight_row", original)
+    row = add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home)[0]["id"] == row["id"]
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_proposal_field_refuses_or_masks_credentials(control):
+    from dataclasses import fields
+    from aegis_core.proposals import model
+
+    secret = "AK" + "IA" + control + "B" * 16
+    base = dict(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    for item in fields(model.Proposal):
+        if not item.init:
+            continue  # Derived legacy flag, not an input field.
+        value = (secret,) if isinstance(item.default, tuple) else secret
+        try:
+            proposal = model.Proposal(**dict(base, **{item.name: value}))
+        except model.ProposalError as refusal:
+            assert refusal.code in {"invalid", "ancestry"}, item.name
+            assert "BBBB" not in str(refusal)
+        else:
+            assert "BBBB" not in proposal.to_bytes().decode("utf-8"), item.name
+
+
+def test_round8_field_policies_bound_input_before_copy_and_recover(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    row = {"v": 1, "ts": "2026-11-18T18:00:00Z", "event": "insight", "id": "ins-" + "a" * 12,
+           "level": "cli", "text": "Ordinary note.", "paths": ["app.py"], "psrc": "explicit",
+           "host": "cli", "hs": "0" * 32, "source": "cli", "kind": "correctness",
+           "approval_code": "unverifiable", "revs": {"trap-safe": "0" * 16},
+           "corroborated_by": "ins-" + "b" * 12, "paths_dropped": 0, "cue": False,
+           "inv": "0" * 16, "decision": "confirm", "insight_ids": ["ins-" + "a" * 12],
+           "reason": "Ordinary reason.", "rule_id": "trap-safe"}
+    assert set(row) == set(capture.INSIGHT_FIELD_POLICIES)
+    for bad in (None, {"unclassified": "opaque"}, {"text": 3}, {"text": "bad\ud800"},
+                {"insight_ids": None}):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            capture.clean_insight_row(bad, workspace=workspace)
+    with pytest.raises(RedactionRefusal, match="^too_large$"):
+        capture.clean_insight_row({"paths": ["app.py"] * (capture.MAX_INSIGHT_ITEMS + 1)}, workspace=object())
+    with pytest.raises(RedactionRefusal, match="^too_large$"):
+        capture.clean_insight_row({"insight_ids": ["ins-" + "a" * 12] * (capture.MAX_INSIGHT_ITEMS + 1)}, workspace=object())
+    for bad_path in ("bad\ud800", "../AK" + "IA" + "B" * 16):
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            capture.clean_insight_row({"paths": [bad_path]}, workspace=workspace)
+
+    def clean(_index):
+        assert capture.clean_insight_row(row, workspace=workspace) == row
+        return capture.clean_insight_row(row, workspace=workspace)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [row] * 6
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_proposal_decision_field_refuses_credentials_then_recovers(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store
+
+    store = make_store(tmp_path)
+    proposal = model.Proposal(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    store.write(proposal)
+    row = store.decide([proposal.id], decision="noise", operation_id="op-safe")
+    path, = (store.root / ".aegis/proposals/decisions").glob("*.json")
+    original = path.read_bytes()
+    secret = "AK" + "IA" + control + "B" * 16
+    for name in model.PROPOSAL_DECISION_FIELD_POLICIES:
+        value = ([secret] if name in {"proposal_ids", "evidence_ids", "insight_ids"} else
+                 {secret: 1} if name == "revisions" else secret)
+        changed = dict(row, **{name: value})
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        for _ in range(2):
+            with pytest.raises(model.ProposalError) as refusal:
+                store.state(proposal.id)
+            assert refusal.value.code == "decision", name
+            assert "BBBB" not in str(refusal.value)
+        path.write_bytes(original)
+        assert store.state(proposal.id) == "rejected"
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _index: store.state(proposal.id), range(6))) == ["rejected"] * 6
+
+
+def test_round8_inventory_bounds_refuse_before_copy_then_recover(tmp_path, monkeypatch):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    _put_rule(workspace, "trap-one")
+    _put_rule(workspace, "trap-two")
+    maximum = capture.MAX_INSIGHT_ITEMS
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", 1)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^too_large$"):
+            add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home) == []
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", maximum)
+    payload = {"prompt": "stop repeating this change", "session_id": "safe-session"}
+    record_hook_prompt("cli", payload, workspace=workspace, home=home)
+    before = read_insight_rows(workspace, home=home)
+    assert any(row.get("event") == "inventory" and len(row["revs"]) == 2 for row in before)
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", 1)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^too_large$"):
+            record_hook_prompt("cli", payload, workspace=workspace, home=home)
+    assert read_insight_rows(workspace, home=home) == before
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", maximum)
+    assert record_hook_prompt("cli", payload, workspace=workspace, home=home)
+
+
+# One closed field policy and one decision enumeration. The six-value literal, the
+# field-policy dict and the 4096 bound are defined in records.py; capture and review import them.
+_CLOSED_DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
+
+
+def _insight_package():
+    return REPO / "aegis_core" / "insights"
+
+
+def _insight_source_files(root):
+    """Package sources by the closed module list. Path.glob is a live-tree census."""
+    names = ("__init__.py", *(f"{name}.py" for name in INSIGHT_MODULES))
+    return [root / name for name in names if (root / name).is_file()]
+
+
+def _decision_enumeration_sites(root):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Tuple) or len(node.elts) != len(_CLOSED_DECISIONS):
+                continue
+            if all(isinstance(elt, ast.Constant) and elt.value == expected
+                   for elt, expected in zip(node.elts, _CLOSED_DECISIONS)):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _module_dict_assignments(root, name):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, ast.AnnAssign) else [])
+            value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+            if isinstance(value, ast.Dict) and any(isinstance(target, ast.Name) and target.id == name
+                                                   for target in targets):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _module_constant_assignments(root, name):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and any(
+                    isinstance(target, ast.Name) and target.id == name for target in node.targets):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _policy_ids(count):
+    if count == 0:
+        return []
+    return ["ins-" + "a" * 12] * count
+
+
+def test_the_decision_enumeration_and_field_policy_have_one_owner():
+    """The insight writers share records.DECISIONS and records.INSIGHT_FIELD_POLICIES."""
+    root = _insight_package()
+    assert [site.split(":")[0] for site in _decision_enumeration_sites(root)] == ["records.py"]
+    assert [site.split(":")[0] for site in _module_dict_assignments(root, "INSIGHT_FIELD_POLICIES")] == ["records.py"]
+    assert [site.split(":")[0] for site in _module_constant_assignments(root, "MAX_INSIGHT_ITEMS")] == ["records.py"]
+    from aegis_core.insights import capture, review
+    from aegis_core.insights import records
+
+    assert records.DECISIONS == _CLOSED_DECISIONS
+    assert review.DECISIONS is records.DECISIONS
+    assert capture._IDENTITY_ENUMS["decision"] is records.DECISIONS
+    assert capture.INSIGHT_FIELD_POLICIES is records.INSIGHT_FIELD_POLICIES
+    assert capture.MAX_INSIGHT_ITEMS == records.MAX_INSIGHT_ITEMS == 4096
+    assert set(review._RULING_DECISIONS) <= set(records.DECISIONS)
+    assert set(records.__all__) >= {"DECISIONS", "INSIGHT_FIELD_POLICIES", "MAX_INSIGHT_ITEMS"}
+    for name in ("capture.py", "review.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"), filename=name)
+        imported = [node.module for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom) and node.module == "aegis_core.insights.records"]
+        assert imported == ["aegis_core.insights.records"], name
+
+
+def _insight_review_decision_action(parser):
+    """The wired ``aegis rule insight review --decision`` action and its parser."""
+    node = parser
+    for name in ("rule", "insight", "review"):
+        subparsers = [action for action in node._actions if isinstance(action, argparse._SubParsersAction)]
+        assert len(subparsers) == 1, name
+        node = subparsers[0].choices[name]
+    found = [action for action in node._actions if action.dest == "decision" and "--decision" in action.option_strings]
+    assert len(found) == 1
+    return found[0], node
+
+
+def _decision_enumeration_literals(path, expected):
+    """Collections of string constants that repeat the six insight decisions."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            continue
+        values = []
+        for element in node.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+                values = None
+                break
+            values.append(element.value)
+        if values is not None and len(values) == len(expected) and set(values) == set(expected):
+            found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def test_rule_cli_insight_review_decision_set_equals_the_owner():
+    """The review parser's accepted --decision set is records.DECISIONS, not a second copy.
+
+    Help renders that same tuple. A value outside it, including a multi-line one, is a usage
+    refusal (exit 2) and does not stick: the same parser then accepts every owner decision.
+    Concurrent readers see the one owner tuple.
+    """
+    import io
+    import threading
+    from contextlib import redirect_stderr
+
+    from aegis_cli.cli import _build_parser
+    from aegis_core.insights import records
+
+    parser = _build_parser(prog="aegis")
+    action, review = _insight_review_decision_action(parser)
+    assert action.choices is records.DECISIONS
+    assert tuple(action.choices) == _CLOSED_DECISIONS
+    assert _decision_enumeration_literals(REPO / "aegis_cli" / "rule.py", records.DECISIONS) == []
+    assert ("{%s}" % ",".join(records.DECISIONS)) in review.format_help()
+
+    def refuse(value):
+        with redirect_stderr(io.StringIO()):
+            with pytest.raises(SystemExit) as caught:
+                parser.parse_args(["rule", "insight", "review", "--decision", value])
+        assert caught.value.code == 2
+
+    refuse("unknown")
+    refuse("propose\nreject")
+    refuse("PROPOSE")
+    for decision in records.DECISIONS:
+        namespace = parser.parse_args(["rule", "insight", "review", "--decision", decision])
+        assert namespace.decision == decision
+
+    seen = []
+    barrier = threading.Barrier(2)
+
+    def read():
+        barrier.wait()
+        seen.append(action.choices)
+
+    threads = [threading.Thread(target=read), threading.Thread(target=read)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert [item is records.DECISIONS for item in seen] == [True, True]
+
+
+def test_record_decision_validates_the_id_list_once(tmp_path, monkeypatch):
+    """Success and refusal each apply the id policy once; a refusal does not append."""
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    seen = []
+    real = insight_review.clean_insight_row
+
+    def counting(row, *, workspace):
+        if "insight_ids" in row:
+            seen.append((tuple(row), len(row["insight_ids"])))
+        return real(row, workspace=workspace)
+
+    monkeypatch.setattr(insight_review, "clean_insight_row", counting)
+    ids = _policy_ids(4096)
+    row = record_decision(workspace, decision="confirm", insight_ids=ids, home=home)
+    assert len(seen) == 1
+    assert "event" in seen[0][0] and seen[0][1] == 4096
+    assert row["insight_ids"] == ids and row["insight_ids"] is not ids
+    assert read_insight_rows(workspace, home=home) == [row]
+    record_decision(workspace, decision="noise", insight_ids=ids, home=home)
+    assert len(seen) == 2
+    before = read_insight_rows(workspace, home=home)
+    seen.clear()
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="reject", insight_ids=["not-an-id"], home=home)
+    assert refusal.value.code == "invalid"
+    assert "not-an-id" not in str(refusal.value)
+    assert len(seen) == 1 and "event" in seen[0][0]
+    assert read_insight_rows(workspace, home=home) == before
+
+
+@pytest.mark.parametrize("writer", ["capture", "review"])
+@pytest.mark.parametrize("count", [0, 1, 4096, 4097])
+@pytest.mark.parametrize("decision", [*_CLOSED_DECISIONS, "unknown"])
+def test_insight_writers_share_the_closed_policy(tmp_path, writer, count, decision):
+    """Each writer accepts the six decisions through the 4096 bound and refuses the rest."""
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    ids = _policy_ids(count)
+    known = decision in _CLOSED_DECISIONS
+    if writer == "capture":
+        payload = {"decision": decision, "insight_ids": ids}
+        if not known:
+            with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+                capture.clean_insight_row(payload, workspace=workspace)
+            assert refusal.value.code == "invalid"
+            assert decision not in str(refusal.value)
+        elif count > 4096:
+            with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+                capture.clean_insight_row(payload, workspace=workspace)
+            assert refusal.value.code == "too_large"
+            assert str(refusal.value) == "too_large"
+        else:
+            cleaned = capture.clean_insight_row(payload, workspace=workspace)
+            assert cleaned == {"decision": decision, "insight_ids": list(ids)}
+            assert cleaned["insight_ids"] is not ids
+            assert capture.clean_insight_row(cleaned, workspace=workspace) == cleaned
+        assert read_insight_rows(workspace, home=home) == []
+        return
+    if not known:
+        with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert refusal.value.code == "invalid"
+        assert str(refusal.value) == "invalid"
+        assert decision not in str(refusal.value)
+    elif count == 0:
+        with pytest.raises(ValueError, match="^" + decision + " needs at least one insight id$"):
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+    elif count > 4096:
+        with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert refusal.value.code == "too_large"
+        assert str(refusal.value) == "too_large"
+    else:
+        row = record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert row["event"] == "decision" and row["decision"] == decision
+        assert row["insight_ids"] == list(ids) and row["insight_ids"] is not ids
+        assert capture.clean_insight_row(row, workspace=workspace) == row
+        assert read_insight_rows(workspace, home=home) == [row]
+        return
+    assert read_insight_rows(workspace, home=home) == []
+
+
+def test_record_decision_refusal_leaves_storage_then_retry_and_concurrent_writes(tmp_path):
+    """A refusal writes nothing; a later accept and concurrent accepts all land whole."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+        record_decision(workspace, decision="confirm", insight_ids=_policy_ids(4097), home=home)
+    assert refusal.value.code == "too_large"
+    with pytest.raises(ValueError, match="^noise needs at least one insight id$"):
+        record_decision(workspace, decision="noise", insight_ids=[], home=home)
+    with pytest.raises(ValueError, match="^propose needs at least one insight id$"):
+        record_decision(workspace, decision="propose", insight_ids=[" "] * 4096, home=home)
+    with pytest.raises(ValueError, match="^reject needs at least one insight id$"):
+        record_decision(workspace, decision="reject", insight_ids=("  ", "\t"), home=home)
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="confirm\npropose", insight_ids=_policy_ids(1), home=home)
+    assert refusal.value.code == "invalid"
+    assert "propose" not in str(refusal.value)
+    secret = "not-an-id\nsecret"
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="snooze", insight_ids=[secret], home=home)
+    assert refusal.value.code == "invalid"
+    assert "secret" not in str(refusal.value)
+    assert read_insight_rows(workspace, home=home) == []
+
+    first = record_decision(workspace, decision="confirm", insight_ids=("ins-" + "b" * 12,), home=home)
+    assert first["insight_ids"] == ["ins-" + "b" * 12]
+
+    def accept(index):
+        decision = _CLOSED_DECISIONS[index % len(_CLOSED_DECISIONS)]
+        return record_decision(workspace, decision=decision, insight_ids=["ins-" + format(index, "012x")], home=home)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        accepted = list(pool.map(accept, range(6)))
+
+    def refuse(index):
+        try:
+            record_decision(workspace, decision="unknown", insight_ids=_policy_ids(1), home=home)
+        except RedactionRefusal as exc:
+            return exc.code
+        return "wrote"
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        refused = list(pool.map(refuse, range(4)))
+    assert refused == ["invalid"] * 4
+    stored = read_insight_rows(workspace, home=home)
+    assert stored[0] == first
+    assert {tuple(row["insight_ids"]) for row in stored} == {tuple(first["insight_ids"]), *(
+        tuple(row["insight_ids"]) for row in accepted)}
+    assert len(stored) == 7
+    assert {row["decision"] for row in stored} == set(_CLOSED_DECISIONS)
+
+
+def _round8h_control_source(split, tail, placement=None, preceding=""):
+    prefix = "abcdefghijklm" * 5
+    controls = {"cr": "\r", "nel": "\x85", "vt": "\v", "ff": "\f", "esc-parameters": "\x1b[1:2m",
+                "esc-intermediates": "\x1b[1:2 !p", "c1-parameters": "\x9b1:2m", "c1-intermediates": "\x9b1:2 !p",
+                "esc-spaced": "\x1b[ m", "c1-spaced": "\x9b m"}
+    if split.startswith("correctness-"):
+        prefix = "a" * 70
+        token = prefix + controls[split[len("correctness-"):]] + "z"
+        continuation = "K1M2N3P4" + "Q5R6S7T8U9abcd"
+        head = preceding + "Never repeat this: " + token
+        removed = controls[tail] * 5000
+        return head + removed + continuation, head + controls[tail] + continuation, prefix + "z" + continuation
+    if split == "mixed":
+        pieces = [prefix[index:index + 13] for index in range(0, len(prefix), 13)]
+        token = pieces[0] + "\r" + pieces[1] + "\x85" + pieces[2] + "\x1b[1:2 !p" + pieces[3] + "\x9b31m" + pieces[4] + "\rA"
+    elif split == "repeated":
+        cycle = ("\r", "\x85", "\v", "\f", "\x1b[31m", "\x9b1:2 !p")
+        token = "".join(char + cycle[index % len(cycle)] for index, char in enumerate(prefix)) + "A"
+    else:
+        token = prefix + controls[split] + "A"
+    continuation = "k7Qm9pL2xV4n" + "R8wY3tB6cD1fH0aZ"
+    if tail in ("vt", "ff"):
+        head = preceding + "Never repeat this: " + token
+        gap = 4097 if placement is None else 4097 + placement - len(head)
+        source, short = head + controls[tail] * gap + continuation, head + controls[tail] + continuation
+    else:
+        source, short, _raw = _round8g_control_source(tail, placement, preceding=preceding, token=token)
+    return source, short, prefix + "A" + continuation
+
+
+def _round8h_control_pairs():
+    splits = ("cr", "nel", "vt", "ff", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates", "mixed", "repeated")
+    tails = ("cr", "nel", "vt", "ff", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates")
+    edges = (None, -1, 0, 1)
+    return [pytest.param(split, tail, edges[(left + right) % len(edges)], id=split + "-" + tail)
+            for left, split in enumerate(splits) for right, tail in enumerate(tails)] + [
+                pytest.param("correctness-" + split, tail, None, id="correctness-" + split + "-" + tail)
+                for split in ("cr", "nel", "vt", "ff", "esc-spaced", "c1-spaced") for tail in ("cr", "nel", "esc-spaced")]
+
+
+@pytest.mark.parametrize("split,tail,placement", _round8h_control_pairs())
+def test_round8h_every_insight_writer_withholds_across_earlier_deleted_splits(tmp_path, split, tail, placement):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    source, short, secret = _round8h_control_source(split, tail, placement)
+    expected = "Never repeat this: ..."
+    member = add_insight(workspace, "Ordinary member.", paths=[], home=home)
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+
+    def persist(_index):
+        rows = [add_insight(workspace, source, kind=source, paths=[], home=home),
+                capture_suggestion(workspace, source, paths=[], host=source, home=home),
+                record_hook_prompt(source, {"prompt": source, "session_id": "safe-session"}, workspace=workspace, home=home),
+                record_hook_prompt(source, {"prompt": "Ordinary prompt.", "session_id": "heartbeat-session"}, workspace=workspace, home=home),
+                record_decision(workspace, decision="confirm", insight_ids=[member["id"]], kind=source, reason=source, home=home)]
+        assert rows[3]["event"] == "heartbeat" and "text" not in rows[3]
+        for row, fields in zip(rows, (("text", "kind"), ("text", "host"), ("text", "host"), ("host",), ("kind", "reason"))):
+            for field in fields:
+                assert row[field] == expected
+                assert not any(fragment in row[field] for fragment in fragments)
+
+    for _ in range(2):
+        persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(field, "") for fragment in fragments)
+    if not split.startswith("correctness-"):
+        from aegis_core.proposals.model import clean_text
+        cleaned = clean_text(short, 300)
+        assert "[REDACTED_HIENT]" in cleaned
+        assert not any(fragment in cleaned for fragment in fragments)
+
+
+def _round8g_control_source(control, placement=None, preceding="", token=None, case="security"):
+    prefix = {"security": "abcdefghijklm" * 5, "correctness-letters": "abcdefghij" * 6 + "abcde",
+              "correctness-symbols": "A=" * 8}[case] if token is None else token
+    continuation = ("K1M2N3P4" + "Q5R6S7T8U9" if case == "correctness-letters" else
+                    "k7Qm9pL2xV4n" + "R8wY3tB6cD1fH0aZ")
+    lead = "Never repeat this: " if case == "security" else "First safe note. "
+    head = preceding + lead + prefix
+    gap = 4097 if placement is None else 4097 + placement - len(head)
+    if control in ("cr", "nel", "nul", "ignored-c1"):
+        removed = {"cr": "\r", "nel": "\x85", "nul": "\x00", "ignored-c1": "\x86"}[control] * gap
+        short = removed[:1]
+    else:
+        intro = "\x1b[" if control.startswith("esc") else "\x9b"
+        parameter = "1" if control.endswith("parameters") else " "
+        if placement is None:
+            gap = len(intro) + 5001
+        removed = intro + parameter * (gap - len(intro) - 1) + "m"
+        short = intro + parameter + "m"
+    return head + removed + continuation, head + short + continuation, prefix + continuation
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "nul", "ignored-c1", "esc-parameters", "esc-intermediates",
+                                     "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("placement", [None, -1, 0, 1], ids=["review", "before", "at", "after"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_all_insight_writers_withhold_raw_token_without_detector_threshold(tmp_path, control, placement, case):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    source, _short, secret = _round8g_control_source(control, placement, case=case)
+    expected = ("Never repeat this:" if case == "security" else "First safe note.") + " ..."
+    hook_source = source if case == "security" else "Never " + source
+    member = add_insight(workspace, "Ordinary member.", paths=[], home=home)
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+
+    def persist(_index):
+        rows = [add_insight(workspace, source, kind=source, paths=[], home=home),
+                capture_suggestion(workspace, source, paths=[], host=source, home=home),
+                record_hook_prompt(source, {"prompt": hook_source, "session_id": "safe-session"}, workspace=workspace, home=home),
+                record_decision(workspace, decision="confirm", insight_ids=[member["id"]], kind=source, reason=source, home=home)]
+        for index, (row, fields) in enumerate(zip(rows, (("text", "kind"), ("text", "host"), ("text", "host"), ("kind", "reason")))):
+            for field in fields:
+                wanted = "Never " + expected if case != "security" and index == 2 and field == "text" else expected
+                assert row[field] == wanted
+                assert not any(fragment in row[field] for fragment in fragments)
+
+    for _ in range(2):
+        persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(field, "") for fragment in fragments)
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("field", ["kind", "hypothesis", "prediction", "do", "labels", "guidance"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_proposal_text_writers_refuse_overbound_then_mask_and_retry(tmp_path, control, field, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store, snapshot
+
+    source, short, secret = _round8g_control_source(control, case=case)
+    base = dict(id="round8g-safe", source="one", kind="correctness", candidate_key="one:safe")
+    wrap = lambda text: (text,) if field in ("labels", "guidance") else text
+    code = "invalid" if field == "kind" and control == "cr" else "too_large"
+    for _ in range(2):
+        with pytest.raises(model.ProposalError) as caught:
+            model.Proposal(**dict(base, **{field: wrap(source)}))
+        assert caught.value.code == code
+        assert secret[:4] not in str(caught.value)
+    if field == "kind" and control == "cr":
+        with pytest.raises(model.ProposalError) as caught:
+            model.Proposal(**dict(base, **{field: wrap(short)}))
+        assert caught.value.code == "invalid"  # Single-line kind refuses CR before cleaning.
+        short = "Ordinary kind."
+    proposal = model.Proposal(**dict(base, **{field: wrap(short)}))
+    if not (field == "kind" and control == "cr"):
+        cleaned = {"kind": proposal.kind, "hypothesis": proposal.hypothesis,
+                   "prediction": proposal.prediction, "do": proposal.do,
+                   "labels": proposal.labels, "guidance": proposal.guidance}[field]
+        assert all("[REDACTED_HIENT]" in value for value in (cleaned if isinstance(cleaned, tuple) else (cleaned,)))
+    assert all(secret[index:index + 4] not in proposal.to_bytes().decode("utf-8") for index in range(len(secret) - 3))
+    store = make_store(tmp_path)
+    saved = store.write(proposal)
+    before = snapshot(store.root)
+    for _ in range(2):
+        assert store.write(proposal).digest == saved.digest
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: store.write(proposal).digest, range(3))) == [saved.digest] * 3
+    assert snapshot(store.root) == before
+    assert store.read(proposal.id).digest == saved.digest
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_proposal_decision_reason_refuses_before_write_and_recovers(tmp_path, control, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store, snapshot
+
+    store = make_store(tmp_path)
+    proposal = model.Proposal(id="round8g-safe", source="one", kind="correctness", candidate_key="one:safe")
+    store.write(proposal)
+    source, short, secret = _round8g_control_source(control, case=case)
+    before = snapshot(store.root)
+    for _ in range(2):
+        with pytest.raises(model.ProposalError) as caught:
+            store.decide([proposal.id], decision="noise", operation_id="op-safe", reason=source)
+        assert caught.value.code == "too_large"
+        assert snapshot(store.root) == before
+
+    def decide(_index):
+        row = store.decide([proposal.id], decision="noise", operation_id="op-safe", reason=short)
+        assert "[REDACTED_HIENT]" in row["reason"]
+        assert all(secret[index:index + 4] not in row["reason"] for index in range(len(secret) - 3))
+        return row
+
+    expected = decide(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(decide, range(3))) == [expected] * 3
+    assert decide(0) == expected
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("field", ["kind", "summary_bullets"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_insight_proposal_writer_refuses_long_fields_and_recovers(tmp_path, control, field, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals.model import ProposalError, parse_proposal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    member = add_insight(workspace, "Ordinary distinct correction.", kind="correctness", paths=["app.py"], home=home)
+    source, short, secret = _round8g_control_source(control, case=case)
+    wrap = lambda text: (text,) if field == "summary_bullets" else text
+    options = dict(proposal_id="round8g-safe", insight_ids=[member["id"]], home=home)
+    for _ in range(2):
+        with pytest.raises(ProposalError) as caught:
+            write_proposal(workspace, **options, **{field: wrap(source)})
+        assert caught.value.code == ("invalid" if field == "kind" and control == "cr" else "too_large")
+        assert not (workspace / ".aegis/proposals/round8g-safe.md").exists()
+    if field == "kind" and control == "cr":
+        short = "Ordinary kind."
+
+    def publish(_index):
+        target = write_proposal(workspace, **options, **{field: wrap(short)})
+        text = target.read_text(encoding="utf-8")
+        parsed = parse_proposal(target.read_bytes(), "round8g-safe")
+        free_text = (parsed.kind, parsed.hypothesis, parsed.prediction, parsed.do, *parsed.labels, *parsed.guidance)
+        assert all(secret[index:index + 4] not in value for value in free_text for index in range(len(secret) - 3))
+        if not (field == "kind" and control == "cr"):
+            assert "[REDACTED_HIENT]" in (parsed.kind if field == "kind" else parsed.guidance[-1])
+        return text
+
+    expected = publish(0)
+    assert publish(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(publish, range(3))) == [expected] * 3
+
+
+def _round8e_interrupted_text(value, secret, control, placement):
+    split = min(16, max(1, len(secret) // 2))
+    offset = value.index(secret) + split
+    head, tail = "Never repeat this: " + value[:offset], value[offset:]
+    gap = 4097 + placement - len(head)
+    removed = "\x1b[" + " " * (gap - 3) + "m" if control == "csi" else control * gap
+    return head + removed + tail
+
+
+def _round8e_detector_families():
+    from tests.unit.cli.test_check_ci_push import REDACTION_FAMILY_PROBES
+
+    return REDACTION_FAMILY_PROBES
+
+
+@pytest.mark.parametrize("family,value,secret,marker", _round8e_detector_families())
+@pytest.mark.parametrize("control", ["\r", "\x85", "csi"], ids=["cr", "nel", "csi"])
+@pytest.mark.parametrize("placement", [-1, 0, 1], ids=["before", "at", "after"])
+def test_round8e_public_writer_bounds_never_persist_credential_fragments(
+        tmp_path, family, value, secret, marker, control, placement):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = _round8e_interrupted_text(value, secret, control, placement)
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = []
+    for _ in range(2):
+        fields.extend((
+            add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+            capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+            record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home)["text"],
+            add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            reason=source, home=home)["reason"],
+            capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"],
+                               host=source, home=home)["host"],
+        ))
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+    for shown in fields:
+        assert shown.startswith("Never repeat this:")
+        assert not any(fragment in shown for fragment in fragments), (family, control, placement)
+    for row in read_insight_rows(workspace, home=home):
+        for name in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(name, "") for fragment in fragments), (family, name)
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[" + " " * 30000 + "m"],
+                         ids=["cr", "nel", "csi"])
+def test_round8e_inconclusive_writer_fields_retry_and_parallel_calls(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    secret = "k7Qm9pL2xV4nR8wY3tB6cD1fH0aZ"
+    removed = control if len(control) > 1 else control * 50000
+    source = "Never repeat this: " + secret[:16] + removed + secret[16:]
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+
+    def persist(_index):
+        rows = [
+            add_insight(workspace, source, kind=source, paths=["app.py"], home=home),
+            capture_suggestion(workspace, source, paths=["app.py"], host=source, home=home),
+            record_hook_prompt(source, {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home),
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            kind=source, reason=source, home=home),
+        ]
+        for row in rows:
+            for field in ("text", "kind", "reason", "host"):
+                assert all(secret[index:index + 4] not in row.get(field, "")
+                           for index in range(len(secret) - 3))
+
+    persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    rows = read_insight_rows(workspace, home=home)
+    assert {row["event"] for row in rows} >= {"insight", "decision", "heartbeat", "inventory"}
+    assert all(secret[:4] not in json.dumps(row) for row in rows)
+
+
+@pytest.mark.parametrize("intro", ["\x1b[", "\x9b"], ids=["esc", "c1"])
+@pytest.mark.parametrize("control", ["\r", "\x85"], ids=["cr", "nel"])
+@pytest.mark.parametrize("secret", ["0123456789012345k7Qm9pL2xV4nR8wY3tB6", "0123456789012345@example.test"],
+                         ids=["entropy", "privacy"])
+def test_round8e_unfinished_header_payload_is_withheld_on_every_writer(tmp_path, intro, control, secret):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = "Never repeat this: " + intro + secret[:16] + control * 50000 + secret[16:]
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = []
+    for _ in range(2):
+        fields.extend((
+            add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+            capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+            record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home)["text"],
+            add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            reason=source, home=home)["reason"],
+            capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"], host=source, home=home)["host"],
+        ))
+    # ROUND-8h: genuine whitespace before the header preserves this benign cue.
+    assert fields == ["Never repeat this: ..."] * 12
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert secret[:4] not in row.get(field, "")
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x00", "\n", "\t", "\x1b[31m", "\x9b31m",
+                                     "\x1b[" + "1;" * 5000 + "m", "\x9b" + " " * 5000 + "m"],
+                         ids=["cr", "nel", "nul", "lf", "tab", "esc", "c1", "parameters", "intermediates"])
+def test_round8e_conservative_tail_rule_applies_to_every_public_writer(tmp_path, control):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = "Never repeat this: " + control + " ordinary" * 1000
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = (
+        add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+        capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+        record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                           workspace=workspace, home=home)["text"],
+        add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+        record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                        reason=source, home=home)["reason"],
+        capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"], host=source, home=home)["host"],
+    )
+    prefix = "Never repeat this:"
+    assert all(shown.startswith(prefix) for shown in fields)
+    if len(control) < 10:
+        assert all(" ordinary" in shown for shown in fields)
+    else:
+        # ROUND-8h: header intermediates are removed; preceding space remains.
+        assert fields == ("Never repeat this: ...",) * 6
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            if row.get(field, "").startswith("Never"):
+                assert row[field].startswith(prefix)
+
 
 def _make_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@example.com"], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.name", "T"], check=True)
+    _git(path, "init", "-q")
     (path / ".aegis" / "rules" / "traps").mkdir(parents=True, exist_ok=True)
     (path / ".aegis" / ".gitignore").write_text("state/\n", encoding="utf-8")
     (path / "app.py").write_text("a = 1\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"], check=True)
+    _git(path, "add", "-f", ".")
+    _git(path, "commit", "-q", "-m", "init")
     return path
 
 
@@ -65,6 +1025,36 @@ def test_link_key_refuses_symlinks_and_corrupt_sizes(tmp_path: Path):
     with pytest.raises(ValueError, match="corrupt"):
         create_link_key(home)
     assert read_link_key(home) is None
+
+
+def test_read_link_key_closes_descriptor_when_fdopen_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core.insights import keys
+
+    home = tmp_path / "home"
+    create_link_key(home)
+    descriptors = []
+
+    def fail_fdopen(fd, mode):
+        assert mode == "rb"
+        descriptors.append(fd)
+        raise OSError("fdopen failed")
+
+    local_os = SimpleNamespace(**vars(os))
+    local_os.fdopen = fail_fdopen
+    monkeypatch.setattr(keys, "os", local_os)
+
+    try:
+        assert read_link_key(home) is None
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(descriptors[0])
+        assert exc_info.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
 
 
 def test_session_hs_rejects_invalid_inputs(tmp_path: Path):
@@ -172,11 +1162,6 @@ def test_tfidf_neighbours_and_dirty_paths(tmp_path: Path, monkeypatch: pytest.Mo
     (only,) = _neighbours_of(review_insights(repo, home=home), same)  # no shared term: not a neighbour
     assert only["id"] == near and only["similarity"] > 0.3
     assert _neighbours_of(review_insights(repo, home=home), other) == []
-
-
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
-                   cwd=str(cwd), check=True, capture_output=True)
 
 
 def _stat_dirty(path: Path) -> None:
@@ -393,11 +1378,112 @@ def test_an_ungoverned_repository_under_home_keeps_the_cwds_own_id(hook_home: Pa
     # A walk-up that went past the git top would reach ~/.aegis, the user plane every user has.
     proj = hook_home / "proj"
     proj.mkdir()
-    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    _git(proj, "init", "-q")
     (proj / "sub").mkdir()
     record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(proj / "sub")}, home=hook_home)
     assert insight_workspace_id(proj / "sub") != insight_workspace_id(hook_home)
     assert _insight_texts(proj / "sub", hook_home) == ["No, wrong file"]
+
+
+@pytest.mark.parametrize("marker", ["directory", "gitfile"])
+def test_insight_workspace_id_at_ceiling_ignores_enclosing_repository(tmp_path: Path, monkeypatch, marker):
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(checkout, "init", "-q")
+    if marker == "gitfile":
+        metadata = tmp_path / "checkout.git"
+        (checkout / ".git").rename(metadata)
+        (checkout / ".git").write_text("gitdir: " + str(metadata) + "\n", encoding="utf-8")
+    start = checkout / "basetemp"
+    start.mkdir()
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    assert insight_workspace_id(start) != standalone
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+
+    assert insight_workspace_id(start) == standalone
+
+
+@pytest.mark.parametrize("boundary", ["start", "inside-ceiling", "above-ceiling"])
+def test_insight_workspace_id_honours_explicit_git_layout(tmp_path: Path, monkeypatch, boundary):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    ceiling = tmp_path / "ceiling"
+    top = ceiling / "worktree"
+    start = top / "sub"
+    start.mkdir(parents=True)
+    reported_top = {"start": start, "inside-ceiling": top, "above-ceiling": tmp_path}[boundary]
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reported_top))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
+    relative = start.resolve().relative_to(reported_top.resolve()).as_posix()
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00{relative}"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+def test_single_explicit_git_layout_above_ceiling_keeps_boundary_and_identity(
+    tmp_path: Path, monkeypatch, layout_variable
+):
+    from aegis_core.workspace.binding import git_boundary
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "core.worktree", str(repository.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else repository
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00basetemp"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert git_boundary(start) == repository.resolve()
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+@pytest.mark.parametrize("git_answer", ["off-path", "query-failure", "unresolvable"])
+def test_unusable_explicit_git_layout_does_not_supply_insights_identity(
+    tmp_path: Path, monkeypatch, layout_variable, git_answer
+):
+    from aegis_core import gitsafe
+    from aegis_core.insights import keys
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    off_path = tmp_path / "off-path"
+    off_path.mkdir()
+    _git(repository, "config", "core.worktree", str(off_path.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else off_path
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    assert gitsafe.toplevel(start) == off_path.resolve()
+    if git_answer != "off-path":
+        class UnresolvablePath(type(Path())):
+            def resolve(self, *args, **kwargs):
+                raise OSError("Git top cannot be resolved")
+
+        reported = UnresolvablePath(off_path) if git_answer == "unresolvable" else None
+        git_api = SimpleNamespace(**vars(gitsafe))
+        git_api.toplevel = lambda cwd: reported
+        monkeypatch.setattr(keys, "gitsafe", git_api)
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == standalone
 
 
 def test_claude_project_dir_wins_over_the_payload_cwd(tmp_path: Path, hook_home: Path, monkeypatch):
@@ -686,41 +1772,545 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
     assert [r["event"] for r in rows] == ["insight"] and "hs" not in rows[0]
 
 
-def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
-    """Every Name and Attribute identifier used in the Python files under ``roots``, except
-    ``module_file`` itself (a package's ``__init__.py``: the whole package) and the nodes in ``skip``."""
-    import ast
+_REVIEWED_PYTHON_PATHS = reviewed_python_paths(REPO)
 
+
+def test_insights_census_stream_reads_each_source_only_when_consumed(tmp_path):
+    reads = []
+
+    class ObservedPath(type(tmp_path)):
+        def read_text(self, *args, **kwargs):
+            reads.append(self.name)
+            return super().read_text(*args, **kwargs)
+
+    first, second = tmp_path / "first.py", tmp_path / "second.py"
+    first.write_text("insights.first\n", encoding="utf-8")
+    second.write_text("insights.old\n", encoding="utf-8")
+    for attempt in range(2):
+        reads.clear()
+        rows = _python_sources(ObservedPath(tmp_path), (first.name, second.name))
+        assert reads == []
+        assert next(rows) == (first, "insights.first\n")
+        assert reads == [first.name]
+        second.write_text(f"insights.current_{attempt}\n", encoding="utf-8")
+        assert next(rows) == (second, f"insights.current_{attempt}\n")
+        with pytest.raises(StopIteration):
+            next(rows)
+    second.unlink()
+    for _ in range(2):
+        rows = _python_sources(tmp_path, (first.name, second.name))
+        assert next(rows) == (first, "insights.first\n")
+        with pytest.raises(FileNotFoundError) as failure:
+            next(rows)
+        assert failure.value.filename == str(second)
+    second.write_text("insights.restored\n", encoding="utf-8")
+    assert _defined_names_referenced_outside(
+        tmp_path / "insights.py", _python_sources(tmp_path, (first.name, second.name)), set(),
+    ) == {"insights", "first", "restored"}
+
+
+def test_insights_census_stream_parses_before_requesting_the_next_row(tmp_path):
+    def rows():
+        yield tmp_path / "caller.py", "insights syntax (\n"
+        raise AssertionError("census requested another row before parsing")
+
+    for _ in range(2):
+        with pytest.raises(SyntaxError) as failure:
+            _defined_names_referenced_outside(tmp_path / "insights.py", rows(), set())
+        assert failure.value.filename == str(tmp_path / "caller.py")
+
+
+def test_insights_census_streams_are_independent_across_interleaved_attempts(tmp_path):
+    paths = ("first.py", "second.py")
+    for name in paths:
+        (tmp_path / name).write_text("insights.original\n", encoding="utf-8")
+    first = _python_sources(tmp_path, paths)
+    second = _python_sources(tmp_path, paths)
+    assert next(first) == next(second) == (tmp_path / paths[0], "insights.original\n")
+    (tmp_path / paths[1]).write_text("insights syntax (\n", encoding="utf-8")
+    with pytest.raises(SyntaxError) as failure:
+        _defined_names_referenced_outside(tmp_path / "insights.py", first, set())
+    assert failure.value.filename == str(tmp_path / paths[1])
+    (tmp_path / paths[1]).write_text("insights.recovered\n", encoding="utf-8")
+    assert _defined_names_referenced_outside(tmp_path / "insights.py", second, set()) == {
+        "insights", "recovered",
+    }
+    assert _defined_names_referenced_outside(tmp_path / "insights.py", _python_sources(tmp_path, paths), set()) == {
+        "insights", "original", "recovered",
+    }
+
+
+def _python_sources(root: Path = REPO, paths=None):
+    # Freeze membership, not contents: edited or missing reviewed files still fail.
+    root = type(root)(real_path(root))
+    return ((root / name, (root / name).read_text(encoding="utf-8"))
+            for name in (_REVIEWED_PYTHON_PATHS if paths is None else paths))
+
+
+def _defined_names_referenced_outside(module_file: Path, sources, skip) -> set:
+    """Identifiers in sources mentioning insights before or after NFKC,
+    except ``module_file`` (a package's ``__init__.py``: the whole package) and nodes in ``skip``."""
     inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
-    for root in roots:
-        for path in root.rglob("*.py"):
-            if path.resolve() == inside or inside in path.resolve().parents:
+    for path, text in check_census_rows(sources):
+        if path.resolve() == inside or inside in path.resolve().parents:
+            continue
+        # Python normalizes identifiers with NFKC before exposing them in the AST.
+        if "insights" not in text and (text.isascii() or "insights" not in unicodedata.normalize("NFKC", text)):
+            continue
+        tree = ast.parse(text, filename=str(path))
+        skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
+                   for n in ast.walk(top)}
+        for node in ast.walk(tree):
+            if id(node) in skipped:
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
-                       for n in ast.walk(top)}
-            for node in ast.walk(tree):
-                if id(node) in skipped:
-                    continue
-                if isinstance(node, ast.Name):
-                    seen.add(node.id)
-                elif isinstance(node, ast.Attribute):
-                    seen.add(node.attr)
-                elif isinstance(node, ast.alias):
-                    seen.add(node.name.split(".")[-1])
-                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
-                    seen.add(node.value)  # monkeypatch.setattr(insights, "NAME", ...)
+            if isinstance(node, ast.Name):
+                seen.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                seen.add(node.attr)
+            elif isinstance(node, ast.alias):
+                seen.add(node.name.split(".")[-1])
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                seen.add(node.value)  # monkeypatch.setattr(insights, "NAME", ...)
     return seen
 
 
-def test_every_name_in_insights_all_is_used_outside_the_module():
-    repo = Path(__file__).resolve().parents[3]
-    roots = [repo / name for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests")]
-    used = _defined_names_referenced_outside(Path(core_insights.__file__), roots,
-                                             {"test_every_name_in_insights_all_is_used_outside_the_module"})
+@pytest.mark.parametrize("irrelevant", [
+    "coincidental_name = 1\n", "invalid syntax (\n", "# \u2500\ninvalid syntax (\n", "# \u00e9\ninvalid syntax (\n",
+])
+def test_insights_name_scan_skips_sources_without_the_needle(tmp_path: Path, irrelevant: str):
+    package = tmp_path / "insights"
+    package.mkdir()
+    module_file = package / "__init__.py"
+    module_file.write_text("# insights: invalid syntax (\n", encoding="utf-8")
+    (package / "internal.py").write_text("insights internal syntax (\n", encoding="utf-8")
+    (tmp_path / "irrelevant.py").write_text(irrelevant, encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        'from aegis_core.insights import used_alias\n'
+        'insights.used_attribute(used_name, "patched_name")\n'
+        'def excluded_test():\n    ignored_name()\n', encoding="utf-8",
+    )
+
+    sources = _python_sources(tmp_path, ("insights/__init__.py", "insights/internal.py", "irrelevant.py", "caller.py"))
+    seen = _defined_names_referenced_outside(module_file, sources, {"excluded_test"})
+
+    assert {"used_alias", "used_attribute", "used_name", "patched_name"} <= seen
+    assert "coincidental_name" not in seen
+    assert "ignored_name" not in seen
+
+
+def test_insights_name_scan_counts_nfkc_normalized_consumers(tmp_path: Path):
+    source = "from aegis_core.\uff49nsights import capture_suggestion\n"
+    assert "insights" not in source
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    seen = _defined_names_referenced_outside(tmp_path / "insights.py", _python_sources(tmp_path, ("caller.py",)), set())
+    assert "capture_suggestion" in seen
+
+
+@pytest.mark.parametrize("source", ["insights syntax (\n", "# \uff49nsights\ninvalid syntax (\n"])
+def test_insights_name_scan_still_rejects_malformed_candidates(tmp_path: Path, source: str):
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    with pytest.raises(SyntaxError):
+        _defined_names_referenced_outside(tmp_path / "insights.py", _python_sources(tmp_path, ("caller.py",)), set())
+
+
+@census_guard(REPO, module_file=__file__, absolute_labels=True)
+def test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch: pytest.MonkeyPatch, sources=None):
+    real_parse = ast.parse
+    parse_count = 0
+    parsed = []
+
+    def counted_parse(text, filename):
+        nonlocal parse_count
+        parse_count += 1
+        parsed.append(filename)
+        return real_parse(text, filename=filename)
+
+    counted_ast = SimpleNamespace(**vars(ast))
+    counted_ast.parse = counted_parse
+    monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
+    used = _defined_names_referenced_outside(
+        Path(core_insights.__file__), _python_sources() if sources is None else sources,
+        {"test_every_name_in_insights_all_is_used_outside_the_module"},
+    )
     assert sorted(set(core_insights.__all__) - used) == []
     assert all(hasattr(core_insights, name) for name in core_insights.__all__)
+    assert 0 < parse_count <= INSIGHTS_PARSE_CEILING, (
+        f"insights parse census: {parse_count} files; reviewed ceiling {INSIGHTS_PARSE_CEILING}. "
+        "Review source additions before raising the ceiling. Parsed files:\n" + "\n".join(parsed)
+    )
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "gitfile-index"])
+def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, indexed: bool):
+    """Freeze membership, but reread changed or missing reviewed sources on every attempt."""
+    module = tmp_path / "tests" / "unit" / "core" / "test_insights.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    reviewed = tmp_path / "aegis_core" / "reviewed source.py"
+    reviewed.parent.mkdir()
+    reviewed.write_text("insights.reviewed_name\n", encoding="utf-8")
+    ignored = tmp_path / "tools"
+    ignored.mkdir()
+    (ignored / "outside_census.py").write_text("insights syntax (\n", encoding="utf-8")
+    cache = reviewed.parent / "__pycache__"
+    cache.mkdir()
+    (cache / "cached.py").write_text("insights syntax (\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-f", ".")
+    assert b"aegis_core/__pycache__/cached.py" in _git(tmp_path, "ls-files", "-z").stdout.split(b"\0")
+    if not indexed:
+        (tmp_path / ".git").rename(tmp_path / "metadata")
+        (tmp_path / ".git").write_text("gitdir: metadata\n", encoding="utf-8")
+    for index in range(81):
+        (tmp_path / "tests" / f"untracked_{index}.py").write_text(
+            "insights.unreviewed_name\n", encoding="utf-8")
+    scope = runpy.run_path(str(module))
+    scan = scope["_python_sources"]
+    references = scope["_defined_names_referenced_outside"]
+    initial = tuple(scan())
+    assert reviewed in {path for path, _ in initial}
+    assert not any("untracked_" in path.name for path, _ in initial)
+    assert not any("outside_census" in path.name or "__pycache__" in path.parts for path, _ in initial)
+    assert references(module, initial, set()) == {"insights", "reviewed_name"}
+    during_scan = tmp_path / "tests" / "created_during_scan.py"
+
+    class InterleavedPath(type(tmp_path)):
+        def read_text(self, *args, **kwargs):
+            during_scan.write_text("insights.late_name\n", encoding="utf-8")
+            return super().read_text(*args, **kwargs)
+
+    assert tuple(scan(InterleavedPath(tmp_path))) == initial
+    assert during_scan.is_file()
+    for directory in (reviewed.parent, tmp_path / "tests"):
+        late = directory / "late.py"
+        for source in ("insights.late_name\n", "insights syntax (\n"):
+            late.write_text(source, encoding="utf-8")
+            assert tuple(scan()) == initial
+        late.unlink()
+        assert tuple(scan()) == initial
+    reviewed.write_text("insights.changed_name\n", encoding="utf-8")
+    assert references(module, scan(), set()) == {"insights", "changed_name"}
+    reviewed.write_text("insights syntax (\n", encoding="utf-8")
+    for _ in range(2):
+        with pytest.raises(SyntaxError) as failure:
+            references(module, scan(), set())
+        assert failure.value.filename == str(reviewed)
+    reviewed.unlink()
+    for _ in range(2):
+        with pytest.raises(FileNotFoundError) as failure:
+            tuple(scan())
+        assert failure.value.filename == str(reviewed)
+    reviewed.write_text("insights.restored_name\n", encoding="utf-8")
+    assert references(module, scan(), set()) == {"insights", "restored_name"}
+
+
+@pytest.fixture(scope="module")
+def insights_import_path():
+    """Use the parent import layout for the census scenarios."""
+    return list(sys.path)
+
+
+@pytest.fixture(scope="module", params=["parent", "competing-tests"])
+def insights_bootstrap_import_path(request, tmp_path_factory):
+    paths = list(sys.path)
+    if request.param == "competing-tests":
+        root = tmp_path_factory.mktemp("competing-tests")
+        package = root / "tests"
+        package.mkdir()
+        (package / "__init__.py").write_text("# Installed tests package without repository modules.\n", encoding="utf-8")
+        paths.insert(0, str(root))
+    return paths
+
+
+def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_bootstrap_import_path):
+    program = (
+        "from pathlib import Path\n"
+        "import tests\n"
+        "assert Path(tests.__path__[0]) == Path(sys.argv[2])\n"
+        "assert 'tests.conftest' not in sys.modules\n"
+        "assert 'tests.unit.core.test_insights' not in sys.modules\n"
+        "from tests.unit.core import test_insights\n"
+        "assert Path(test_insights.__file__).resolve() == Path(sys.argv[3])\n"
+    )
+    result = _run_isolated(program, REPO / "tests", Path(__file__).resolve(), import_path=insights_bootstrap_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("marker", [
+    "file", "incomplete", "corrupt-index", "dangling", "missing-head", "corrupt-head",
+    "gitfile-missing", "gitfile-not-directory", "gitfile-empty", "gitfile-multiline",
+    "gitfile-nul", "gitfile-oversized",
+])
+def test_insights_census_refuses_an_unreadable_index(tmp_path: Path, marker: str, insights_import_path):
+    _git(tmp_path, "init", "-q")
+    checkout = tmp_path / "checkout"
+    module = checkout / "tests" / "unit" / "core" / "test_insights.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    metadata = checkout / ".git"
+    if marker == "file":
+        metadata.write_text("not a git directory\n", encoding="utf-8")
+    elif marker == "incomplete":
+        metadata.mkdir()
+    elif marker == "dangling":
+        symlink_or_skip(checkout / "missing.git", metadata, target_is_directory=True)
+    elif marker.startswith("gitfile-"):
+        target = tmp_path / ".git"
+        if marker == "gitfile-missing":
+            target = checkout / "missing.git"
+        elif marker == "gitfile-not-directory":
+            target = checkout / "ordinary-file"
+            target.write_text("not a directory\n", encoding="utf-8")
+        pointer = b"gitdir: " + os.fsencode(target)
+        contents = {
+            "gitfile-empty": b"gitdir: \n",
+            "gitfile-multiline": pointer + b"\njunk\n",
+            "gitfile-nul": pointer + b"\0ignored\n",
+        }
+        metadata.write_bytes(pointer + b"\n" * GITFILE_MAX_BYTES if marker == "gitfile-oversized"
+                             else contents.get(marker, pointer + b"\n"))
+    else:
+        _git(checkout, "init", "-q")
+        if marker == "corrupt-index":
+            (metadata / "index").write_bytes(b"corrupt index\n")
+        elif marker == "missing-head":
+            (metadata / "HEAD").unlink()
+        else:
+            (metadata / "HEAD").write_text("corrupt head\n", encoding="utf-8")
+    env = _git_environment()
+    env.pop("GIT_CEILING_DIRECTORIES", None)
+    program = (
+        "import runpy, subprocess\n"
+        "for attempt in range(2):\n"
+        "    try:\n"
+        "        runpy.run_path(sys.argv[2])\n"
+        "    except subprocess.CalledProcessError as failure:\n"
+        "        assert failure.returncode == 128, failure.returncode\n"
+        "    else:\n"
+        "        raise AssertionError('broken Git marker was not refused')\n"
+    )
+    result = _run_isolated(program, module, env=env, import_path=insights_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("layout,relative,ending", [
+    ("linked", False, "\n"), ("linked", True, "\r\n"),
+    ("linked", True, "\n\n"),
+    ("submodule", False, ""), ("submodule", True, "\n"),
+], ids=["linked-absolute-lf", "linked-relative-crlf", "linked-relative-trailing-lf-run",
+        "submodule-absolute-eof", "submodule-relative-lf"])
+def test_insights_census_accepts_gitfiles(tmp_path: Path, layout: str, relative: bool, ending: str,
+                                        insights_import_path):
+    origin = _make_repo(tmp_path / "origin")
+    module = origin / "tests" / "unit" / "core" / "test_insights.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    consumer = origin / "aegis_core" / "consumer.py"
+    consumer.parent.mkdir()
+    consumer.write_text("insights.gitfile_consumer\n", encoding="utf-8")
+    _git(origin, "add", "-f", ".")
+    _git(origin, "commit", "-q", "-m", "census fixture")
+    if layout == "linked":
+        checkout = tmp_path / "linked checkout"
+        _git(origin, "worktree", "add", "-q", "-b", "linked", str(checkout))
+    else:
+        container = _make_repo(tmp_path / "container")
+        _git(container, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "sub checkout")
+        checkout = container / "sub checkout"
+    marker = checkout / ".git"
+    assert marker.is_file()
+    pointer = marker.read_text(encoding="utf-8").removeprefix("gitdir: ").rstrip("\r\n")
+    git_dir = (checkout / pointer).resolve()
+    assert git_dir.is_dir()
+    pointer = os.path.relpath(git_dir, checkout) if relative else str(git_dir)
+    marker.write_bytes(os.fsencode("gitdir: " + pointer + ending))
+    module = checkout / "tests" / "unit" / "core" / "test_insights.py"
+    program = (
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "module = Path(sys.argv[2])\n"
+        "scope = runpy.run_path(str(module))\n"
+        "for attempt in range(2):\n"
+        "    sources = tuple(scope['_python_sources']())\n"
+        "    assert {path.relative_to(scope['REPO']).as_posix() for path, _ in sources} == "
+        "{'aegis_core/consumer.py', 'tests/unit/core/test_insights.py'}\n"
+        "    seen = scope['_defined_names_referenced_outside'](module, sources, set())\n"
+        "    assert seen == {'insights', 'gitfile_consumer'}, seen\n"
+        "    result = scope['_git'](scope['REPO'], 'ls-files', '--cached')\n"
+        "    assert result.args[1] == '--git-dir=' + sys.argv[3], result.args\n"
+        "    assert result.args[2] == '--work-tree=' + str(scope['REPO']), result.args\n"
+    )
+    result = _run_isolated(program, module, git_dir, import_path=insights_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("stage", ["open", "read"])
+def test_insights_gitfile_read_failure_is_refused(tmp_path: Path, stage: str):
+    repo = _make_repo(tmp_path / "repo")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text("gitdir: " + str(repo / ".git") + "\n", encoding="utf-8")
+    opened = []
+
+    class UnreadableFile:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def read(self, size):
+            assert 0 < size <= GITFILE_MAX_BYTES + 1
+            raise OSError(errno.EIO, "unreadable Git marker")
+
+    class UnreadablePath(type(tmp_path)):
+        def open(self, *args, **kwargs):
+            if self.name == ".git":
+                if stage == "open":
+                    raise PermissionError(errno.EACCES, "unreadable Git marker")
+                stream = super().open(*args, **kwargs)
+                opened.append(stream)
+                return UnreadableFile(stream)
+            return super().open(*args, **kwargs)
+
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            _git(UnreadablePath(checkout), "ls-files", "--cached")
+        assert failure.value.returncode == 128
+        assert failure.value.stderr == b"invalid Git marker\n"
+        assert all(stream.closed for stream in opened)
+
+
+def test_insights_git_environment_drops_all_inherited_git_controls():
+    inherited = {key: "hostile" for name in (*LOCAL_ENV, "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH")
+                 for key in (name, name.lower())}
+    inherited.update({"PATH": "kept", "GIT_CONFIG_NOSYSTEM": "0", "GIT_TERMINAL_PROMPT": "1"})
+    before = dict(inherited)
+    env = _git_environment(inherited)
+    assert inherited == before
+    assert env == {"PATH": "kept", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+
+
+def test_insights_git_fixtures_ignore_ambient_configuration(tmp_path: Path, insights_import_path):
+    ignored = tmp_path / "ignore"
+    ignored.write_text("__pycache__/\napp.py\n", encoding="utf-8")
+    config = tmp_path / "hostile.gitconfig"
+    config.write_text("[core]\n\tautocrlf = true\n\tsafecrlf = true\n\texcludesFile = "
+                      + ignored.as_posix() + "\n", encoding="utf-8")
+    env = _git_environment()
+    env.update({"GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_SYSTEM": str(config), "GIT_CONFIG_NOSYSTEM": "0",
+                "PYTHONSAFEPATH": "1"})
+    program = (
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "scope = runpy.run_path(sys.argv[2])\n"
+        "for attempt in range(2):\n"
+        "    root = Path(sys.argv[3]) / str(attempt)\n"
+        "    repo = scope['_make_repo'](root / 'repo')\n"
+        "    assert b'app.py' in scope['_git'](repo, 'ls-files').stdout.splitlines()\n"
+        "    scope['test_insights_census_ignores_files_created_after_collection'](root / 'census', True)\n"
+    )
+    result = _run_isolated(program, Path(__file__), tmp_path / "attempts", env=env, import_path=insights_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("count", [1, 42, 80])
+def test_insights_census_accepts_additions_within_reviewed_ceiling(tmp_path, count):
+    text = "from aegis_core.insights import " + ", ".join(core_insights.__all__) + "\n"
+    sources = [(f"tests/reviewed_{index}.py", text) for index in range(count)]
+    result = run_census_fixture(tmp_path, "test_insights.py", sources)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_insights_census_ceiling_failure_lists_every_parsed_file(tmp_path):
+    text = "from aegis_core.insights import " + ", ".join(core_insights.__all__) + "\n"
+    sources = [(f"tests/reviewed_{index}.py", text) for index in range(81)]
+    result = run_census_fixture(tmp_path, "test_insights.py", sources)
+    assert result.returncode != 0
+    message = result.stderr.decode()
+    assert "insights parse census: 81 files; reviewed ceiling 80." in message
+    assert all(str(tmp_path / path) in message for path, _ in sources)
+
+
+def test_insights_census_ceiling_is_independent_of_working_directory(insights_import_path, tmp_path):
+    program = (
+        "from pathlib import Path\n"
+        "from tests.unit.core import test_insights as module\n"
+        "for count in (1, 42, 80):\n"
+        "    module.test_insights_census_accepts_additions_within_reviewed_ceiling(Path(sys.argv[2]) / str(count), count)\n"
+        "module.test_insights_census_ceiling_failure_lists_every_parsed_file(Path(sys.argv[2]) / 'over')\n"
+    )
+    result = _run_isolated(program, tmp_path, cwd=REPO / "aegis_core" / "insights", import_path=insights_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+def _tree_snapshot(root: Path) -> dict:
+    return {path.relative_to(root).as_posix(): path.read_bytes() if path.is_file() else None
+            for path in root.rglob("*")}
+
+
+@pytest.fixture(scope="module")
+def insights_selector_checkout(tmp_path_factory):
+    """Own index containing a consumer absent from an earlier external index."""
+    tmp_path = tmp_path_factory.mktemp("insights-selector")
+    checkout = tmp_path / "checkout"
+    module = checkout / "tests" / "unit" / "core" / "test_insights.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    package = checkout / "aegis_core"
+    package.mkdir()
+    (package / "reviewed.py").write_text("# insights\n", encoding="utf-8")
+    _git(checkout, "init", "-q")
+    _git(checkout, "add", "-f", ".")
+    external_index = tmp_path / "external-index"
+    shutil.copyfile(checkout / ".git" / "index", external_index)
+    (package / "consumer.py").write_text("insights.selector_consumer\n", encoding="utf-8")
+    _git(checkout, "add", "-f", "aegis_core/consumer.py")
+    external = tmp_path / "external"
+    external.mkdir()
+    _git(external, "init", "-q")
+    _git(external, "config", "core.bare", "true")
+    return module, external_index, external, external_index.read_bytes(), _tree_snapshot(external / ".git")
+
+
+@pytest.mark.parametrize("selector", ["GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "combined", "all-local"])
+@pytest.mark.parametrize("operation", ["census", "fixture"])
+def test_insights_census_and_fixture_ignore_inherited_git_selectors(
+        tmp_path: Path, insights_selector_checkout, selector: str, operation: str, insights_import_path):
+    module, external_index, external, index_before, external_before = insights_selector_checkout
+    env = _git_environment()
+    if selector == "all-local":
+        env.update({key: "invalid-inherited-selector" for key in LOCAL_ENV})
+    redirects = {"GIT_INDEX_FILE": str(external_index), "GIT_DIR": str(external / ".git"), "GIT_WORK_TREE": str(external),
+                 "GIT_COMMON_DIR": str(external / ".git")}
+    if selector != "all-local":
+        env.update(redirects if selector == "combined" else {selector: redirects[selector]})
+    env["PYTHONSAFEPATH"] = "1"
+    assert external_index.read_bytes() == index_before
+    assert _tree_snapshot(external / ".git") == external_before
+    program = (
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "module = Path(sys.argv[2])\n"
+        "scope = runpy.run_path(str(module))\n"
+        "for attempt in range(2):\n"
+        "    common = scope['_git'](scope['REPO'], 'rev-parse', '--git-common-dir').stdout.decode().strip()\n"
+        "    assert Path(common).resolve() == (scope['REPO'] / '.git').resolve(), 'Git common directory leaked'\n"
+        "    if sys.argv[4] == 'census':\n"
+        "        seen = scope['_defined_names_referenced_outside'](module, scope['_python_sources'](), set())\n"
+        "        assert 'selector_consumer' in seen\n"
+        "    else:\n"
+        "        scope['test_insights_census_ignores_files_created_after_collection'](Path(sys.argv[3]) / str(attempt), True)\n"
+    )
+    result = _run_isolated(program, module, tmp_path / "attempts", operation, env=env, import_path=insights_import_path)
+    assert external_index.read_bytes() == index_before, "fixture changed the caller's external index"
+    assert _tree_snapshot(external / ".git") == external_before, "fixture changed the external Git directory"
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
 
 
 def test_dead_insight_names_are_gone():
@@ -929,9 +2519,8 @@ def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: 
     assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}
 
 
-# ── R-structure-32: insights is a package of four modules with the module's surface ──
+# ── R-structure-32: insights package modules and the module's surface ──
 
-REPO = Path(__file__).resolve().parents[3]
 # aegis_core.insights.__all__ on the w14 merge commit (e7e61536), when insights was one module. One
 # string: listed names would count as uses in test_every_name_in_insights_all_is_used_outside_the_module.
 W14_ALL = tuple("""
@@ -948,7 +2537,7 @@ W14_DEFINED = tuple("""
     RECURRENCE_ALARM_COUNT REJECTION_RESURFACE_COUNT
 """.split())
 # Each module may import only the ones before it; none imports the package itself.
-INSIGHT_MODULES = ("keys", "capture", "review", "recurrence")
+INSIGHT_MODULES = ("keys", "records", "capture", "review", "recurrence")
 
 
 def unresolved_exports(module) -> list:
@@ -976,9 +2565,10 @@ def test_an_export_the_module_does_not_bind_is_named(tmp_path: Path):
 
 
 def test_insights_is_a_package_of_four_modules():
-    pkg = REPO / "aegis_core" / "insights"
     assert not (REPO / "aegis_core" / "insights.py").exists()
-    assert sorted(p.name for p in pkg.glob("*.py")) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
+    names = [Path(name).name for name in reviewed_python_paths(REPO)
+             if Path(name).parent.as_posix() == "aegis_core/insights"]
+    assert sorted(names) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
     assert hasattr(core_insights, "__path__")
 
 
@@ -1036,9 +2626,10 @@ def _module_tricks(source: str) -> list:
 
 
 def test_the_package_is_layered_and_its_init_is_plain():
-    """Given the package, When its modules are parsed, Then keys imports no sibling, capture only
-    keys, review only those two and recurrence only those three, none imports the package; the
-    __init__ has an __all__, and no file serves names lazily or swaps a module object."""
+    """Given the package, When its modules are parsed, Then keys and records import no sibling,
+    capture only keys and records, review only those three and recurrence only earlier modules,
+    none imports the package; the __init__ has an __all__, and no file serves names lazily or
+    swaps a module object."""
     pkg = REPO / "aegis_core" / "insights"
     sources = {name: (pkg / f"{name}.py").read_text(encoding="utf-8") for name in INSIGHT_MODULES}
     assert layering_violations(sources) == []
@@ -1077,7 +2668,18 @@ S0 = {
     "cue": _S0_IMPORT | {"aegis_core.config", "aegis_core.verification", "aegis_core.verification.scanners",
                          "aegis_core.verification.test_runner"},
 }
-NEW_MODULES = frozenset({"aegis_core.redaction", *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
+# The storage split accompanies storage at all three hook stages.
+NEW_MODULES = frozenset({
+    "aegis_core.pathlookup_gitcache",
+    "aegis_core.redaction", "aegis_core.storage_shared",
+    # Reviewed PROPOSAL-CLEAN-DELETED-VIEW round 3c: coordinator importtime measured
+    # 3.6-6.4 ms of regex compilation moved from redaction.py into this leaf.
+    "aegis_core.redaction_patterns",
+                         "aegis_core.gitsafe_run",
+                         "aegis_core.gitsafe_policy",
+                         *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES),
+    "aegis_core.team_supervisor_start",
+    })
 REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
                          "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})
 _HOOK_PATH = r"""
@@ -1103,9 +2705,12 @@ sys.stdout.write(json.dumps(found))
 
 
 def _child_env(home: Path) -> dict:
-    return {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
+    env = {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
             "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
+    if "GIT_CEILING_DIRECTORIES" in os.environ:
+        env["GIT_CEILING_DIRECTORIES"] = os.environ["GIT_CEILING_DIRECTORIES"]
+    return env
 
 
 def unexpected_modules(loaded, before) -> list:
@@ -1129,6 +2734,62 @@ def test_the_hook_path_loads_no_module_it_did_not_load_before(tmp_path: Path, hb
 def test_a_heavy_module_on_the_hook_path_is_named():
     loaded = S0["prompt"] | {"aegis_core.insights.capture", "aegis_core.human_gate"}
     assert unexpected_modules(loaded, S0["prompt"]) == ["aegis_core.human_gate"]
+
+
+def test_round8b_empty_path_cues_keep_the_fresh_hook_import_set(tmp_path: Path, hb_home: Path):
+    workspace = tmp_path / "ws"
+    (workspace / ".aegis").mkdir(parents=True)
+    program = r"""
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from aegis_core import insights
+from aegis_core.errors import PathTraversalError
+from aegis_core.insights.capture import clean_insight_row
+
+workspace, home = Path(sys.argv[2]), Path(sys.argv[3])
+module = "aegis_core.workspace.confinement"
+def loaded():
+    return sorted(name for name in sys.modules if name.startswith("aegis_"))
+
+found = {"import": loaded()}
+insights.record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "safe"},
+                            workspace=workspace, home=home)
+found["prompt"] = loaded()
+def cue(_index):
+    row = insights.record_hook_prompt("claude-code", {"prompt": "No, stop repeating the same edit.", "session_id": "safe"},
+                                      workspace=workspace, home=home)
+    assert row["event"] == "insight" and row["paths"] == []
+for attempt in range(2):
+    cue(attempt)
+    found["cue" + str(attempt)] = loaded()
+with ThreadPoolExecutor(max_workers=3) as pool:
+    list(pool.map(cue, range(6)))
+found["parallel"] = loaded()
+assert clean_insight_row({}, workspace=object()) == {}
+assert clean_insight_row({"paths": []}, workspace=workspace) == {"paths": []}
+assert clean_insight_row({"paths": ()}, workspace=workspace) == {"paths": []}
+found["empty"] = loaded()
+for attempt in range(2):
+    try:
+        clean_insight_row({"paths": ["../outside"]}, workspace=workspace)
+    except PathTraversalError as refusal:
+        assert str(refusal) == "invalid insight path"
+    else:
+        raise AssertionError("nonempty paths bypassed confinement")
+assert clean_insight_row({"paths": ["app.py"]}, workspace=workspace) == {"paths": ["app.py"]}
+found["nonempty"] = loaded()
+sys.stdout.write(json.dumps(found))
+"""
+    result = _run_isolated(program, workspace, hb_home, env=_child_env(hb_home))
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    found = json.loads(result.stdout)
+    confinement = "aegis_core.workspace.confinement"
+    assert all(confinement not in found[step] for step in ("import", "prompt", "cue0", "cue1", "parallel", "empty"))
+    assert {step: sorted(set(found[step]) - set(found["prompt"]))
+            for step in ("cue0", "cue1", "parallel", "empty")} == {
+                step: [] for step in ("cue0", "cue1", "parallel", "empty")}
+    assert confinement in found["nonempty"]
 
 
 _APPEND = r"""
@@ -1170,3 +2831,50 @@ def test_two_processes_appending_at_once_leave_100_whole_rows(tmp_path: Path, hb
     read = read_jsonl(path)
     assert (len(read.rows), read.skipped_lines, read.torn_tail) == (100, [], False)
     assert {r["event"] for r in read.rows} == {"heartbeat"} and len({r["hs"] for r in read.rows}) == 100
+
+
+_HOLD = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.storage import file_lock
+
+with file_lock(Path(sys.argv[2])):
+    sys.stdout.reconfigure(newline=sys.argv[4])
+    sys.stdout.write("held\n")
+    sys.stdout.flush()
+    time.sleep(float(sys.argv[3]))
+"""
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_a_prompt_waits_out_a_lock_held_past_5s_and_keeps_its_row(tmp_path: Path, hb_home: Path, newline):
+    """Sad path, deterministic stand-in for the two-process race above (which once lost a row to
+    a 5 s LockTimeoutError under suite load): Given another process holding the insight log's
+    lock for 6 s, longer than file_lock's generic 5 s, When a prompt is recorded, Then it waits
+    for the lock instead of raising, and its heartbeat is appended whole."""
+    import time
+
+    from aegis_core.storage import read_jsonl
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    create_link_key(hb_home)
+    prompt = {"prompt": "Please run the tests.", "cwd": str(ws)}
+    record_hook_prompt("claude-code", {**prompt, "session_id": "s-0"}, workspace=ws, excerpts=False, home=hb_home)
+    path = insights_path(ws, home=hb_home)
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(REPO), str(path.with_suffix(".lock")), "6", newline],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=_child_env(hb_home), cwd=str(ws))
+    try:
+        assert holder.stdout.readline() in (b"held\n", b"held\r\n"), holder.stderr.read().decode("utf-8", "replace")
+        started = time.monotonic()
+        record_hook_prompt("claude-code", {**prompt, "session_id": "s-1"}, workspace=ws, excerpts=False, home=hb_home)
+        assert time.monotonic() - started > 5.0  # it really waited past the generic budget
+    finally:
+        _, err = holder.communicate(timeout=60)
+    assert holder.returncode == 0, err.decode("utf-8", "replace")
+    read = read_jsonl(path)
+    assert (len(read.rows), read.skipped_lines, read.torn_tail) == (2, [], False)
+    assert [r["event"] for r in read.rows] == ["heartbeat", "heartbeat"]

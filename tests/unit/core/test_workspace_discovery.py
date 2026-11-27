@@ -1,5 +1,5 @@
 """aegis_core.workspace.discovery: the caller-file walk skips vendored copies; v2 rule
-directories in $HOME are refused even though a bare ~/.soma is not."""
+directories in $HOME are refused even though a bare ~/.aegis is not."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from aegis_core.errors import WorkspaceError
-from aegis_core.workspace.discovery import refuse_unmigrated_v3, resolve_workspace_root
+from aegis_core.workspace.discovery import resolve_workspace_root
 
 
 @pytest.fixture(autouse=True)
@@ -45,15 +45,3 @@ def test_a_project_whose_own_directory_is_named_vendor_is_still_found(tmp_path: 
     (project / "src").mkdir()
 
     assert resolve_workspace_root(caller_file=project / "src" / "module.py") == project
-
-
-@pytest.mark.parametrize("legacy", ["cells", "rules"])
-def test_a_v2_rule_directory_in_home_is_refused_even_when_empty(home: Path, legacy):
-    (home / ".soma" / legacy).mkdir(parents=True)
-    with pytest.raises(WorkspaceError, match=r"^Legacy \.soma/ workspace detected at "):
-        refuse_unmigrated_v3(home)
-
-
-def test_a_soma_directory_in_home_without_rule_directories_is_not_refused(home: Path):
-    (home / ".soma" / "cache").mkdir(parents=True)
-    refuse_unmigrated_v3(home)

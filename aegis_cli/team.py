@@ -1,13 +1,13 @@
 """aegis team — lane leases for parallel agents (v4.1 spec §1, ADR 0005 AD-7).
 
 The dispatcher runs these; there is no MCP tool for them. ``claim``, ``renew`` and
-``transfer`` print the lane's new lease oid alone on stdout, so a script can pass it to
-the next ``--expect``. With ``--json`` stdout carries one document with ``source``,
-``aegis_version``, ``checked_at`` (UTC) and ``scope``, refusals and errors included.
-
-Exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
-git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
-that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
+``transfer`` print the lane's new lease oid alone on stdout for the next ``--expect``.
+``--json`` carries ``source``, ``aegis_version``, ``checked_at`` (UTC) and ``scope``.
+Host capacity exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
+Lease refusals exit 1 with ``CLAIM_REFUSALS`` text, the core reason set. Git failure exits 1.
+Exit 2 is usage (invalid lane, glob, ttl, label, ``--expect``, or a base that names no commit).
+``list`` and ``metrics`` change nothing. ``model`` emits JSON, exits 2, and launches no host.
+Renew refuses ``lease_branch_missing`` or ``liveness_unknown``. GC may warn ``expired_with_worktree``.
 """
 from __future__ import annotations
 
@@ -15,34 +15,275 @@ import argparse
 import json
 import sys
 import time
+from copy import copy
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core import primitives
-from aegis_cli import sanitize_display
+from aegis_cli import sanitize_display, team_queue as queue_cli
+from aegis_cli import team_isolation as isolation_cli
+from aegis_cli import team_qualify as qualify_cli
+from aegis_cli import team_lease_output as lease_output
+from aegis_cli import team_mail as mail_cli, team_board as board_cli
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core.primitives import utc_stamp
+from aegis_core.redaction import redact_command_secrets
+from aegis_core.team_profile import display_profile as display_profile
 
 __all__ = ["TeamCommand", "run_team"]
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
-ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
+ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "status", "metrics")
+CLAIM_REFUSALS = {reason: reason + ":" for reason in (
+    "absent", "expired", "legacy_paths", "overlap", "stale", "taken", "unreadable")}
+
+MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds")
+MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
+
+
+def _model_output_safe(value):
+    """Refuse any changed field; successful operational values stay lossless."""
+    from aegis_core.redaction import redact_command_secrets
+
+    if isinstance(value, dict):
+        return all(_model_output_safe(key) and _model_output_safe(item) for key, item in value.items())
+    if isinstance(value, list):
+        return all(_model_output_safe(item) for item in value)
+    if isinstance(value, str):
+        return value == sanitize_display(redact_command_secrets(sanitize_display(value, max_len=None)), max_len=512)
+    return True
+
+
+def model_argument_refusal(arguments):
+    """Validate shape, types and bounds before workspace or path operations."""
+    from aegis_core.model_select import MAX_INPUT_BYTES
+
+    if (type(arguments) is not dict or
+            not set(MODEL_REQUIRED) <= arguments.keys() or
+            any(key not in MODEL_REQUIRED + MODEL_OPTIONAL for key in arguments)):
+        return {"error": "invalid_model_arguments"}
+    args = dict(arguments)
+    for key in MODEL_REQUIRED + MODEL_OPTIONAL:
+        if key in ("host_kinds", "record") or key not in args:
+            continue
+        value = args[key]
+        if (value is None and key in MODEL_OPTIONAL):
+            continue
+        if type(value) is not str or len(value) > MAX_INPUT_BYTES:
+            return {"error": "invalid_model_arguments"}
+    hosts = args["host_kinds"]
+    if (type(hosts) is not list or not 1 <= len(hosts) <= 256 or
+            any(type(host) is not str or len(host) > 128 for host in hosts) or
+            type(args.get("record", False)) is not bool):
+        return {"error": "invalid_model_arguments"}
+    return None
+
+
+def model_result(arguments, root=None):
+    """CLI/MCP adapter over the public selector; no adapter-owned file opens."""
+    from aegis_core import model_select
+    from aegis_core.config import env_workspace
+    from aegis_core.storage import LockTimeoutError
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.workspace import confine_path
+    from aegis_core.workspace.base import Workspace
+    from aegis_core.workspace.binding import resolve_cli_root
+    from aegis_core.workspace.layout import has_rules_dir
+
+    refusal = model_argument_refusal(arguments)
+    if refusal is not None:
+        return refusal
+    args = dict(arguments)
+    hosts = args["host_kinds"]
+    try:
+        if isinstance(root, Workspace):
+            root = root.root
+        if root is not None:
+            if not isinstance(root, (str, Path)):
+                return {"error": "model_workspace_unavailable"}
+            root = str(root)
+            if len(root) > model_select.MAX_INPUT_BYTES or root.count("/") + root.count("\\") > 256:
+                return {"error": "model_workspace_unavailable"}
+        workspace = Workspace(root=resolve_cli_root(explicit=root, pin=env_workspace()))
+        if not has_rules_dir(workspace.root):
+            return {"error": "model_workspace_unavailable"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_workspace_unavailable"}
+    try:
+        # Bound raw path text before pathlib allocation. The core owns no-follow
+        # descriptor walks, file byte caps and strict JSON validation.
+        for key in ("bindings", "policy", "history"):
+            value = args[key]
+            if value.count("/") + value.count("\\") > 256:
+                return {"error": "invalid_model_arguments"}
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                return {"error": "invalid_model_arguments"}
+            confine_path(value, workspace)
+            # Keep the original spelling so the core no-follow walk still rejects
+            # symlinks introduced before or after the confinement check.
+            args[key] = str(workspace.root / path)
+        requested = {key: args[key] for key in MODEL_REQUIRED + MODEL_OPTIONAL
+                     if key in args and key not in ("bindings", "policy", "history", "record")}
+        if not _model_output_safe(requested):
+            return {"error": "model_output_needs_redaction"}
+        options = {key: args[key] for key in ("subject", "intent", "author_family", "lane_family", "review_stage")
+                   if key in args and args[key] is not None}
+        if args.get("record", False):
+            choice, record = model_select.select_and_append(
+                args["history"], args["bindings"], args["policy"], args["task_kind"], args["role_kind"],
+                host_kinds=hosts, **options)
+        else:
+            history = model_select.read_decisions(args["history"])
+            try:
+                choice, record = model_select.select_model(
+                    args["bindings"], args["policy"], args["task_kind"], args["role_kind"], history,
+                    host_kinds=hosts, **options)
+            finally:
+                history.close()
+        result = {"choice": choice, "record": record}
+        return result if _model_output_safe(result) else {"error": "model_output_needs_redaction"}
+    except PathTraversalError:
+        return {"error": "invalid_model_arguments"}
+    except model_select.ModelSelectionError as exc:
+        error = str(exc)
+        return {"error": error if _model_output_safe(error) else "model_output_needs_redaction"}
+    except LockTimeoutError:
+        return {"error": "model_lock_timeout"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_io_unavailable"}
+
+
+class ModelArgumentError(ValueError):
+    """Parser signal without the parser's input-reflecting diagnostic."""
+
+
+class ModelHostKinds(argparse.Action):
+    """Bound repeated registry values before growing their retained list."""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        previous = getattr(namespace, self.dest, None) or []
+        if len(previous) >= 256 or len(value) > 128:
+            raise ModelArgumentError()
+        setattr(namespace, self.dest, previous + [value])
+
+
+class ModelErrorPolicy:
+    """Own the complete raw model invocation and publish one structured result."""
+
+    parser_error = ModelArgumentError
+
+    def __init__(self, fallback=None, *, model_invocation=False):
+        self.fallback = fallback
+        self.payload = None
+        self.queue_payload = None
+        self.model_ready = False
+        self.model_invocation = model_invocation
+        self.model_errors = self.model_invocation
+        self.qualify_parsing = None
+
+    def run(self, operation):
+        if not self.model_invocation:
+            return operation()
+        try:
+            code = operation()
+        except (SystemExit, ModelArgumentError):
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                raise
+            code = self.output({"error": "invalid_model_arguments"})
+        except (KeyboardInterrupt, Exception):
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                raise
+            code = self.operation_error()
+        if self.qualify_parsing is not None and self.qualify_parsing.entered:
+            return code
+        if self.queue_payload is not None:
+            _emit(self.queue_payload)
+            return code
+        payload = self.payload
+        if (payload is None or
+                (code == EXIT_OK and (not self.model_ready or "error" in payload)) or
+                (code != EXIT_OK and "error" not in payload)):
+            payload, code = {"error": "invalid_model_arguments"}, EXIT_USAGE
+        _emit(payload)
+        return EXIT_OK if code == EXIT_OK else EXIT_USAGE
+
+    def queue_output(self, payload):
+        self.queue_payload = payload
+        return payload["exit_code"]
+
+    def output(self, payload):
+        if self.model_invocation:
+            self.payload = payload
+        else:
+            _emit(payload)
+        return EXIT_USAGE if "error" in payload else EXIT_OK
+
+    def select_parser(self, model_errors):
+        self.model_errors = self.model_invocation or model_errors
+
+    def __call__(self):
+        if self.model_errors or self.fallback is None:
+            raise ModelArgumentError()
+        self.fallback()
+
+    def removed_pointer(self, argv, lookup):
+        if self.model_invocation:
+            return None
+        return self.fallback.removed_pointer(argv, lookup) if self.fallback is not None else None
+
+    def parse(self, parser, argv):
+        from aegis_core.model_select import MAX_INPUT_BYTES
+
+        try:
+            args = self.fallback.parse(parser, argv) if self.fallback is not None else parser.parse_args(argv)
+            if isinstance(args, int):
+                return args
+            if args.command == "team" and getattr(args, "team_action", None) == "queue":
+                self.model_invocation = False
+                self.model_errors = False
+                args._queue_output_policy = self
+                return args
+            is_model = args.command == "team" and getattr(args, "team_action", None) == "model"
+            if self.model_invocation and not is_model:
+                raise ModelArgumentError()
+            if not is_model:
+                return args
+            values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
+            raw = args.workspace
+            if (model_argument_refusal(values) is not None or
+                    (raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256))):
+                parser.refuse_scoped_usage()
+                raise ModelArgumentError()
+            # main attaches the workspace through the shared upward resolver;
+            # model_result then checks that the resolved root is initialized.
+            self.model_ready = True
+            if self.model_invocation:
+                args._model_error_policy = self
+            return args
+        except ModelArgumentError:
+            return self.output({"error": "invalid_model_arguments"})
+
+    def workspace_error(self, args, error):
+        if not self.model_invocation and (args.command != "team" or getattr(args, "team_action", None) != "model"):
+            return self.fallback.workspace_error(args, error) if self.fallback is not None else None
+        return self.output({"error": "model_workspace_unavailable"})
+
+    def operation_error(self):
+        return self.output({"error": "model_io_unavailable"})
 
 
 def _team_payload(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
-    return primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now)
+    return {**primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now),
+            "schema": f"aegis.team.{action}/v1"}
 
 
 def _emit(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2))
-
-
-def _warn(warnings: List[str]) -> None:
-    for line in warnings:
-        print(f"Warning: {sanitize_display(line, max_len=None)}", file=sys.stderr)
 
 
 def _view(root: Path, now: int, oid: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -73,7 +314,8 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
 
 # ── Lease changes ────────────────────────────────────────────────────────────
 
-def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange) -> int:
+def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange, *, pending=False):
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_OK)
     if args.json:
         payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
         payload.update({
@@ -84,11 +326,11 @@ def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseC
             "caller": change.caller,
             "warnings": list(change.warnings),
         })
-        _emit(payload)
-        return EXIT_OK
-    _warn(list(change.warnings))
-    print(change.oid if change.oid is not None else f"released {change.lane}")
-    return EXIT_OK
+        response.json(payload)
+    else:
+        response.warn(change.warnings)
+        response.line(change.oid if change.oid is not None else f"released {change.lane}")
+    return response if pending else response.publish()
 
 
 def _claim(args: argparse.Namespace, root: Path, now: int) -> int:
@@ -97,8 +339,15 @@ def _claim(args: argparse.Namespace, root: Path, now: int) -> int:
     return _changed(args, root, now, change)
 
 
-def _renew(args: argparse.Namespace, root: Path, now: int) -> int:
-    return _changed(args, root, now, team.renew(root, args.lane, args.expect, ttl_s=args.ttl, now=now))
+def _renew(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingResponse:
+    try:
+        evidence = team.lease_branch_evidence(root, lane=args.lane, expect=args.expect, ttl_s=args.ttl)
+    except gitsafe.GitError:
+        return _liveness_refused(args, root, now, "liveness_unknown", pending=True)
+    if not all(evidence.values()):
+        return _liveness_refused(args, root, now, "lease_branch_missing", pending=True)
+    team.verify_lease_repository(root)
+    return _changed(args, root, now, team.renew(root, args.lane, args.expect, ttl_s=args.ttl, now=now), pending=True)
 
 
 def _transfer(args: argparse.Namespace, root: Path, now: int) -> int:
@@ -110,9 +359,17 @@ def _release(args: argparse.Namespace, root: Path, now: int) -> int:
     return _changed(args, root, now, team.release(root, args.lane, args.expect))
 
 
-def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
+def _gc(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingResponse:
+    try:
+        evidence = team.lease_branch_evidence(root, now=now, worktrees=True)
+    except gitsafe.GitError:
+        return _liveness_refused(args, root, now, "liveness_unknown", pending=True)
+    team.verify_lease_repository(root)
     result = team.gc(root, now=now)
+    rows = [{"lane": sanitize_display(redact_command_secrets(sanitize_display(c.lane, max_len=None)), max_len=63),
+             "reason": "expired_with_worktree"} for c in result.collected if evidence.get(c.previous)]
     warnings = [line for change in result.collected for line in change.warnings]
+    response = lease_output.PendingResponse(EXIT_OK)
     if args.json:
         payload = _team_payload("gc", root, now, refs=team.LANES_REF)
         payload.update({
@@ -120,17 +377,19 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
             "kept": [{"lane": lane, "reason": reason} for lane, reason in result.kept],
             "warnings": warnings,
+            "lane_warnings": rows,
         })
-        _emit(payload)
-        return EXIT_OK
-    _warn(warnings)
+        response.json(payload)
+        return response
+    response.warn(warnings)
+    response.warn([f"{row['lane']}: {row['reason']}" for row in rows])
     for change in result.collected:
-        print(f"collected {change.lane}")
+        response.line(f"collected {change.lane}")
     if not result.collected:
-        print("nothing to collect")
+        response.line("nothing to collect")
     for lane, reason in result.kept:
-        print(f"kept {sanitize_display(lane, max_len=None)}: {reason}", file=sys.stderr)
-    return EXIT_OK
+        response.line(f"kept {sanitize_display(lane, max_len=None)}: {reason}", "stderr")
+    return response
 
 
 # ── Reading ──────────────────────────────────────────────────────────────────
@@ -153,6 +412,22 @@ def _list(args: argparse.Namespace, root: Path, now: int) -> int:
         print(f"  {sanitize_display(bad['lane'], max_len=None)}  unreadable  oid {bad['oid']}: {sanitize_display(bad['error'], max_len=None)}")
     print(team.LEASE_NOTE)
     return EXIT_OK
+
+
+def _status(args: argparse.Namespace, root: Path, now: int) -> int:
+    from aegis_cli.formatters.text import render_team_status
+    from aegis_core.team_status import status
+
+    found = status(root, now, base=args.base, check=args.check)
+    payload = _team_payload("status", root, now, refs=team.LANES_REF,
+                            base=found.pop("base"), base_commit=found.pop("base_commit"))
+    payload.update(note=team.LEASE_NOTE, **found)
+    if args.json:
+        _emit(payload)
+    else:
+        for line in render_team_status(payload):
+            print(sanitize_display(line, max_len=None))
+    return EXIT_REFUSED if found["checks_passed"] is False else EXIT_OK
 
 
 def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
@@ -182,18 +457,145 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     return EXIT_OK
 
 
-_HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
+_HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], Any]] = {
     "claim": _claim,
     "renew": _renew,
     "transfer": _transfer,
     "release": _release,
     "gc": _gc,
     "list": _list,
+    "status": _status,
     "metrics": _metrics,
 }
 
 
+def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
+    """Configuration has its own envelope; lease payloads remain unchanged."""
+    from aegis_core import team_profile
+
+    noun = args.team_action
+    verb = getattr(args, "config_action", None) if noun == "config" else getattr(args, "hosts_action", None)
+    if noun == "hosts" and verb not in ("status", "check", "usage"):
+        verb = None
+    command = noun + (" " + verb if verb else "")
+    schema = "aegis.team." + command.replace(" ", ".") + "/v1"
+    payload = primitives.envelope("aegis team " + command, {"workspace": str(root)}, now=now)
+    payload.update(schema=schema, schema_family="aegis.team." + noun + "/v1",
+                   governance=team_profile.governance_status())
+    code = EXIT_OK
+    try:
+        if noun == "config" and verb is None:
+            payload.update(status="refused", reason="a config verb is required", layer="flags", file="<command-line>",
+                           next_action="Run aegis team config show|presets|init --help.")
+            code = EXIT_USAGE
+        elif verb == "presets":
+            payload.update(status="done", presets=list(team_profile.PRESET_DATA["presets"]),
+                           host_kinds=team_profile.PRESET_DATA["hosts"],
+                           next_action="Run aegis team config init --preset NAME --json.")
+        elif verb == "init":
+            document = team_profile.initialize(root, args.preset, host=args.host, force=args.force)
+            payload.update(status="done", profile=team_profile.resolve(repo=document)["profile"],
+                           next_action="Review the profile diff and use aegis approve; hosted aegis-governance gates approval before merge. Run aegis team doctor --json.")
+        else:
+            resolved = team_profile.load(root)
+            if noun == "hosts":
+                code = _hosts_result(args, resolved, payload)
+            elif noun == "doctor":
+                found = team_profile.doctor(resolved, root=root)
+                _doctor_capacity(resolved, found)
+                payload.update(found)
+                if found["healthy"]:
+                    payload.update(status="done", next_action="Review the resolved profile with aegis team config show --json.")
+                else:
+                    current = resolved["profile"]["preset"]
+                    binding = next((item for item in found["runnable_bindings"] if item["preset"] == current), None)
+                    missing = sorted({host["cli"] for host in found["hosts"] if not host["found"]})
+                    action = "Install the missing declared CLI: " + ", ".join(missing) + "; rerun aegis team doctor --json."
+                    if binding is not None and resolved.get("repository_profile_exists") is False:
+                        command = "aegis team config init --preset " + current
+                        if binding["host"] is not None:
+                            command += " --host " + binding["host"]
+                        action += " An available binding of the current preset is " + command + "; review any repository change through aegis approve before merge."
+                    payload.update(status="refused", reason="a declared host CLI is missing from PATH",
+                                   layer="repo", file=str(root.joinpath(*team_profile.REPO_PATH)),
+                                   next_action=action)
+                    code = EXIT_REFUSED
+            else:
+                payload.update(status="done", **resolved,
+                               next_action="Run aegis team doctor --json before starting a run.")
+    except team_profile.ProfileError as exc:
+        payload.update(status="refused", reason=str(exc), layer=exc.layer, file=exc.file,
+                       next_action="Correct the indicated file or command-line layer, then retry. Run aegis team config presets --json for preset and host choices; repository policy changes need aegis approve before merge.")
+        code = exc.exit_code
+    except (OSError, ValueError, RuntimeError):
+        payload.update(status="refused", reason="profile operation unavailable", layer="filesystem",
+                       file=str(root.joinpath(*team_profile.REPO_PATH)),
+                       next_action="Check the trusted workspace and home directories and retry on a platform with anchored file operations.")
+        code = EXIT_REFUSED
+    payload = display_profile(payload, capacity=True)
+    if args.json:
+        _emit(payload)
+    elif payload["status"] == "refused":
+        print("refused: " + payload["reason"] + "\nnext_action: " + payload["next_action"], file=sys.stderr)
+    else:
+        # Preserve provenance and actionable instructions in the human view too.
+        print(json.dumps(payload, indent=2))
+    return code
+
+
+def _doctor_capacity(resolved, found):
+    """Compose health and capacity views without a profile/service cycle."""
+    from aegis_core.team_hosts import HostCapacity
+
+    capacity = {row["host"]: row for row in HostCapacity(resolved).status()}
+    found["hosts"] = [{**host, **{key: value for key, value in capacity[host["name"]].items() if key != "host"}}
+                      for host in found["hosts"]]
+    found["write_scope"] = _capacity_write_scope(found["hosts"])
+
+
+def _capacity_write_scope(rows):
+    return list(dict.fromkeys(scope for row in rows for decision in row["decisions"]
+                              for scope in decision.get("write_scope", [])))
+
+
+def _hosts_result(args, resolved, payload):
+    """Thin host view; all policy and advice live in the shared service."""
+    from aegis_core import team_hosts, team_profile
+
+    verb = args.hosts_action
+    host, kind = args.host, args.kind
+    if (verb not in ("status", "check", "usage") or
+            (verb == "check" and (host is None or kind is None)) or
+            (verb != "check" and (host is not None or kind is not None))):
+        raise team_profile.ProfileError("use hosts status|usage or hosts check HOST KIND", layer="flags",
+                                        file="<command-line>", exit_code=2)
+    service = team_hosts.HostCapacity(resolved)
+    payload.update(status="done", exit_codes=team_hosts.EXIT_CODES,
+                   write_scope=resolved["write_scope"],
+                   next_action="Run aegis team hosts status --json to choose a declared host and kind, then aegis team hosts check HOST KIND --json.")
+    if verb == "check":
+        result = service.check(host, kind)
+        payload.update(result)
+        return result["exit_code"]
+    payload["hosts"] = service.status() if verb == "status" else service.usage()
+    if verb == "status":
+        payload["write_scope"] = _capacity_write_scope(payload["hosts"])
+    return EXIT_OK
+
+
 # ── Failures ─────────────────────────────────────────────────────────────────
+
+def _liveness_refused(args: argparse.Namespace, root: Path, now: int, reason: str, *, pending=False):
+    action = team.lease_next_action(reason)
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_REFUSED)
+    if args.json:
+        payload = _team_payload(args.team_action, root, now)
+        payload.update({"status": "refused", "reason": reason, "message": reason, "next_action": action})
+        response.json(payload)
+    else:
+        response.line(reason + ("\n" + action if action else ""), "stderr")
+    return response if pending else response.publish()
+
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
     if args.json:
@@ -205,30 +607,64 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
     return code
 
 
-def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
-    lease = _view(root, now, exc.current)
+def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused, *, pending=False):
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_REFUSED)
+    fixed = CLAIM_REFUSALS.get(exc.reason)
+    message = str(exc)
+    if not fixed or "\n" in message or "\r" in message or not message.startswith(fixed):
+        message = fixed or "refused"
+    canonical = sanitize_display(message, max_len=None)
+    text = sanitize_display(redact_command_secrets(canonical), max_len=None)
+    try:
+        lease = None if exc.reason == "legacy_paths" else _view(root, now, exc.current)
+    except (gitsafe.GitError, team.TeamUsageError, OSError, ValueError):
+        if args.team_action != "claim":
+            raise
+        lease = None
+    if lease and any(char.isspace() for path in lease["paths"] for char in path):
+        lease = None
     if args.json:
         payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
-        payload.update({
-            "status": "refused",
-            "reason": exc.reason,
-            "message": str(exc),
-            "current": exc.current,
-            "lanes": list(exc.lanes),
-            "lease": lease,
-            "warnings": list(exc.warnings),
-        })
-        _emit(payload)
-        return EXIT_REFUSED
-    _warn(list(exc.warnings))
-    print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
-    for line in _lease_lines(lease):
-        print(line, file=sys.stderr)
-    return EXIT_REFUSED
+        payload.update(status="refused", reason=exc.reason, message=text,
+                       current=exc.current, lanes=list(exc.lanes), lease=lease,
+                       warnings=list(exc.warnings))
+        if exc.next_action:
+            payload["next_action"] = exc.next_action
+        response.json(payload)
+    else:
+        response.warn(exc.warnings)
+        response.line(sanitize_display(text, max_len=None), "stderr")
+        if exc.next_action:
+            response.line(sanitize_display(exc.next_action, max_len=None), "stderr")
+        for line in _lease_lines(lease):
+            response.line(line, "stderr")
+    return response if pending else response.publish()
 
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action == "mail":
+        return mail_cli.run_mail(args)
+    if action == "board":
+        return board_cli.run_board(args)
+    if action == "queue":
+        return queue_cli.run_queue(args)
+    if action == "isolation":
+        return isolation_cli.run_isolation(args)
+    if action == "qualify":
+        return qualify_cli.run_qualify(args)
+    if action == "model":
+        values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
+        root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
+        result = model_result(values, root)
+        policy = getattr(args, "_model_error_policy", None)
+        if policy is not None:
+            return policy.output(result)
+        _emit(result)
+        return EXIT_USAGE if "error" in result else EXIT_OK
+    if action in ("config", "doctor", "hosts"):
+        root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
+        return _profile_command(args, root, int(time.time()))
     if action not in _HANDLERS:
         print(f"usage: aegis team {{{','.join(ACTIONS)}}} ...", file=sys.stderr)
         print("aegis team --help describes each action.", file=sys.stderr)
@@ -236,13 +672,204 @@ def run_team(args: argparse.Namespace) -> int:
     root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
     now = int(time.time())
     try:
-        return _HANDLERS[action](args, root, now)
+        return (lease_output.operation(root, _HANDLERS[action], args, now, _refused) if action in ("renew", "gc")
+                else _HANDLERS[action](args, root, now))
     except team.LeaseRefused as exc:
         return _refused(args, root, now, exc)
     except team.TeamUsageError as exc:
         return _failed(args, root, now, str(exc), EXIT_USAGE)
     except gitsafe.GitError as exc:
-        return _failed(args, root, now, str(exc), EXIT_REFUSED)
+        return (_liveness_refused(args, root, now, "ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
+                if action in ("renew", "gc") else _failed(args, root, now, str(exc), EXIT_REFUSED))
+
+
+def _configure_model_parser(sub, common):
+    model = sub.add_parser("model", parents=[common], help="Select a model; optionally record the decision",
+                           description="Preview model selection as JSON; --record atomically selects and appends. "
+                           "Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. "
+                           "No model is launched; unprobed and rejected levels refuse with binding_not_admitted.")
+    model._model_errors = True
+    for flag, help_text in (
+        ("bindings", "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)"),
+        ("policy", "Team selection policy JSON file inside the workspace (bounded, regular, no symlinks)"),
+        ("history", "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history"),
+        ("task-kind", "Task kind T1 through T14, validated by the core"),
+        ("role-kind", "Seat kind: orchestrator, decider, implementer, integrator or reviewer"),
+        ("subject", "Single-line lane/endpoint/generation identifier for this decision"),
+    ):
+        model.add_argument("--" + flag, required=True, help=help_text)
+    model.add_argument("--host-kind", dest="host_kinds", action=ModelHostKinds, required=True,
+                       help="Host registry kind; repeat for each host (at most 256)")
+    model.add_argument("--intent", help="Semantic intent: light, standard, deep, extended, max or ultra; default from policy/role band")
+    model.add_argument("--author-family", help="Author family required for reviews; T7 binds it to its chosen family")
+    model.add_argument("--lane-family", help="Lane family required for T3; writer lanes must match team_family")
+    model.add_argument("--review-stage", default="primary", help="Review stage: primary, correctness, security, whole or second as allowed by the task")
+    model.add_argument("--record", action="store_true", help="Atomically select and append under the history lock (60-second timeout); default preview")
+
+
+class _QualifyParsing:
+    """Track actual qualify entry while preserving the sibling parse policies."""
+
+    def __init__(self, parser):
+        self.entered = False
+        self.model_policy = None
+        outer = getattr(parser, "_error_policy", None)
+        if outer is None:
+            return
+        policy = outer
+        while policy is not None:
+            if isinstance(policy, ModelErrorPolicy):
+                policy.qualify_parsing = self
+                self.model_policy = policy
+            if isinstance(policy, queue_cli.QueueErrorPolicy):
+                policy.qualify_parsing = self
+            policy = getattr(policy, "fallback", None)
+        self.outer_parse = outer.parse
+        outer.parse = self.parse
+
+    def configure_child(self, parser, sub, common):
+        selection = self
+
+        class QualifyParser(type(parser)):
+            def error(self, message):
+                qualify_cli.refuse_usage()
+                self.exit(EXIT_USAGE)
+
+            def parse_known_args(self, args=None, namespace=None):
+                selection.entered = True
+                if selection.model_policy is not None:
+                    selection.model_policy.model_invocation = False
+                    selection.model_policy.model_errors = False
+                return super().parse_known_args(args, namespace)
+
+        factory = sub._parser_class
+        keywords = {"error_policy": None, "scan_state": parser._scan_state} if hasattr(parser, "_scan_state") else {}
+        sub._parser_class = partial(QualifyParser, **keywords)
+        try:
+            qualify_cli.configure_parser(sub, common)
+        finally:
+            sub._parser_class = factory
+
+    def parse(self, root, argv):
+        parse_known = root.parse_known_args
+
+        def parse_known_args(args=None, namespace=None):
+            values, extras = parse_known(args, namespace)
+            if self.entered and extras:
+                qualify_cli.refuse_usage()
+                root.exit(EXIT_USAGE)
+            return values, extras
+
+        root.parse_known_args = parse_known_args
+        try:
+            return self.outer_parse(root, argv)
+        finally:
+            root.parse_known_args = parse_known
+
+
+def _preserve_team_prefix_output(parser, sub):
+    """Keep the integration-base help and invalid-action text before child entry."""
+    sibling_actions = copy(sub)
+    sibling_actions.choices = {name: child for name, child in sub.choices.items() if name != "qualify"}
+    check_value = parser._check_value
+    choices = sub._choices_actions
+    sibling_help = [choice for choice in choices if choice.dest != "qualify"]
+    format_help = parser.format_help
+
+    def check_action(action, value):
+        if action is sub and value not in sub.choices:
+            action = sibling_actions
+        check_value(action, value)
+
+    def format_team_help():
+        sub._choices_actions = sibling_help
+        try:
+            return format_help()
+        finally:
+            sub._choices_actions = choices
+
+    parser._check_value = check_action
+    parser.format_help = format_team_help
+
+
+def _configure_action_parsers(sub, common, parser):
+    _configure_model_parser(sub, common)
+    queue_cli.configure_parser(sub, common, parser)
+    mail_cli.configure_parser(sub, common, parser)
+    board_cli.configure_parser(sub, common, parser)
+    isolation_cli.configure_parser(sub, common, parser)
+
+
+def _configure_lease_parsers(sub, common):
+    lane_help = f"Lane name: {team.LANE_GRAMMAR}"
+    expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
+
+    claim = sub.add_parser(
+        "claim", parents=[common], help="Lease a lane's paths; prints the lease oid",
+        description=(
+            "Refuse when a live lease of another lane may overlap the paths; otherwise create the "
+            "lane's lease, or take over its expired lease. Prints the new lease oid."
+        ),
+    )
+    claim.add_argument("lane", metavar="LANE", help=lane_help)
+    claim.add_argument("--paths", nargs="+", required=True, metavar="GLOB",
+                       help="Globs the lane will change (the conflict scope)")
+    claim.add_argument("--role", default=None, help=f"Display label (default: {team.DEFAULT_ROLE})")
+    claim.add_argument("--owner", default=None, help="Display label (default: <user>@<hostname>)")
+    claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS",
+                       help=f"Seconds until the lease expires, at most {team.MAX_TTL_S}")
+    claim.add_argument("--branch", default=None, help="The lane's branch; when recorded, it must exist for CLI renewal")
+
+    renew = sub.add_parser(
+        "renew", parents=[common], help="Extend a lease; prints the new lease oid",
+        description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. "
+               "CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
+               "worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
+    )
+    renew.add_argument("lane", metavar="LANE", help=lane_help)
+    renew.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+    renew.add_argument("--ttl", type=int, default=None, metavar="SECONDS",
+                       help=f"New lifetime in seconds, at most {team.MAX_TTL_S} (default: keep it)")
+
+    transfer = sub.add_parser("transfer", parents=[common], help="Give a live lease to another owner",
+                              description="Change a live lease's owner (and role) by compare-and-swap.")
+    transfer.add_argument("lane", metavar="LANE", help=lane_help)
+    transfer.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+    transfer.add_argument("--owner", required=True, help="The new owner label")
+    transfer.add_argument("--role", default=None, help="The new role label (default: keep it)")
+
+    release = sub.add_parser(
+        "release", parents=[common], help="Delete a lease",
+        description="Delete a lease by compare-and-swap. Anyone may release; the events log records the caller.",
+    )
+    release.add_argument("lane", metavar="LANE", help=lane_help)
+    release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+
+    sub.add_parser("gc", parents=[common], help="Delete expired leases",
+                   description="Delete every expired lease by compare-and-swap; unreadable leases are kept. "
+                          "CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; "
+                          "expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.")
+    sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
+                   description=team.LEASE_NOTE)
+    status = sub.add_parser("status", parents=[common], help="Inspect every lane, branch and optional tip verdict",
+                            description=team.LEASE_NOTE + " Inspection changes no leases, worktrees or events.")
+    status.add_argument("--base", default=None, metavar="REF",
+                        help="Compare branch tips to this commit (default: the base resolved by check --lane)")
+    status.add_argument("--check", action="store_true",
+                        help="Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts")
+    metrics = sub.add_parser(
+        "metrics", parents=[common], help="Lease events and merge outcomes",
+        description=(
+            "Claims and denials from the events log, and for each first-parent merge since --base: "
+            "whether both sides changed a common path and whether git merge-tree reports a conflict "
+            "(unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded."
+        ),
+    )
+    metrics.add_argument("--base", default=None, metavar="REF",
+                         help="Count merges since this commit (default: the branch base, as for "
+                              "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
+                              "develop or master; "
+                              "with none, the whole first-parent history)")
 
 
 class TeamCommand(AegisCommand):
@@ -250,7 +877,7 @@ class TeamCommand(AegisCommand):
 
     name = "team"
     category = CommandCategory.WORKFLOW
-    help = "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)"
+    help = "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)"
     description = (
         "Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is "
         "cooperative conflict input, not a lock, not an identity and not proof that an agent is "
@@ -259,6 +886,9 @@ class TeamCommand(AegisCommand):
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
+        # Malformed team prefixes may target model; non-model children restore ordinary errors.
+        parser._model_errors = True
+        selection = _QualifyParsing(parser)
         common = argparse.ArgumentParser(add_help=False)
         common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                             help="Emit machine-readable JSON output")
@@ -266,65 +896,35 @@ class TeamCommand(AegisCommand):
                             help="Strip ANSI styling and emoji")
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
-        lane_help = f"Lane name: {team.LANE_GRAMMAR}"
-        expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
-
-        claim = sub.add_parser(
-            "claim", parents=[common], help="Lease a lane's paths; prints the lease oid",
-            description=(
-                "Refuse when a live lease of another lane may overlap the paths; otherwise create the "
-                "lane's lease, or take over its expired lease. Prints the new lease oid."
-            ),
-        )
-        claim.add_argument("lane", metavar="LANE", help=lane_help)
-        claim.add_argument("--paths", nargs="+", required=True, metavar="GLOB",
-                           help="Globs the lane will change (the conflict scope)")
-        claim.add_argument("--role", default=None, help=f"Display label (default: {team.DEFAULT_ROLE})")
-        claim.add_argument("--owner", default=None, help="Display label (default: <user>@<hostname>)")
-        claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS",
-                           help=f"Seconds until the lease expires, at most {team.MAX_TTL_S}")
-        claim.add_argument("--branch", default=None, help="The lane's branch, recorded for display")
-
-        renew = sub.add_parser(
-            "renew", parents=[common], help="Extend a lease; prints the new lease oid",
-            description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.",
-        )
-        renew.add_argument("lane", metavar="LANE", help=lane_help)
-        renew.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-        renew.add_argument("--ttl", type=int, default=None, metavar="SECONDS",
-                           help=f"New lifetime in seconds, at most {team.MAX_TTL_S} (default: keep it)")
-
-        transfer = sub.add_parser("transfer", parents=[common], help="Give a live lease to another owner",
-                                  description="Change a live lease's owner (and role) by compare-and-swap.")
-        transfer.add_argument("lane", metavar="LANE", help=lane_help)
-        transfer.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-        transfer.add_argument("--owner", required=True, help="The new owner label")
-        transfer.add_argument("--role", default=None, help="The new role label (default: keep it)")
-
-        release = sub.add_parser(
-            "release", parents=[common], help="Delete a lease",
-            description="Delete a lease by compare-and-swap. Anyone may release; the events log records the caller.",
-        )
-        release.add_argument("lane", metavar="LANE", help=lane_help)
-        release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-
-        sub.add_parser("gc", parents=[common], help="Delete expired leases",
-                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept.")
-        sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
-                       description=team.LEASE_NOTE)
-        metrics = sub.add_parser(
-            "metrics", parents=[common], help="Lease events and merge outcomes",
-            description=(
-                "Claims and denials from the events log, and for each first-parent merge since --base: "
-                "whether both sides changed a common path and whether git merge-tree reports a conflict "
-                "(unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded."
-            ),
-        )
-        metrics.add_argument("--base", default=None, metavar="REF",
-                             help="Count merges since this commit (default: the branch base, as for "
-                                  "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
-                                  "develop or master; "
-                                  "with none, the whole first-parent history)")
+        _configure_action_parsers(sub, common, parser)
+        selection.configure_child(parser, sub, common)
+        config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
+        config_sub = config.add_subparsers(dest="config_action")
+        config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
+        config_sub.add_parser("presets", parents=[common], help="List built-in team presets")
+        config_init = config_sub.add_parser("init", parents=[common], help="Write the repository team profile")
+        config_init.add_argument("--preset", required=True, help="Preset name from config presets")
+        config_init.add_argument("--host", default=None, metavar="KIND", help="Bind the preset host kind at initialization; see config presets --json")
+        config_init.add_argument("--force", action="store_true", help="Replace an existing valid profile")
+        sub.add_parser("doctor", parents=[common], help="Check profile completeness and host CLIs on PATH")
+        hosts = sub.add_parser("hosts", parents=[common], help="Read host capacity and per-host usage",
+                               description="Read capacity advice: status | usage | check HOST KIND. "
+                               "KIND: writer, review, extra-review, doc, research, a declared role or lens. "
+                               "check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. "
+                               "Real usage readers are adapter extension points; credentials are never read.")
+        hosts.add_argument("hosts_action", nargs="?", metavar="VERB", help="status, check or usage")
+        hosts.add_argument("host", nargs="?", metavar="HOST", help="Declared host alias (see status --json)")
+        hosts.add_argument("kind", nargs="?", metavar="KIND", help="Job kind or declared role/lens")
+        _configure_lease_parsers(sub, common)
+        _preserve_team_prefix_output(parser, sub)
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_team(args)
+
+    def workspace_refusal(self, args, error):
+        action = getattr(args, "team_action", None)
+        if action == "qualify":
+            return qualify_cli.workspace_refusal(args, error)
+        if action in ("mail", "board"):
+            return mail_cli.workspace_refusal(args, error)
+        return None

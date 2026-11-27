@@ -15,13 +15,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import hosts
 from aegis_core.ast.detect import NATIVE_SOURCE_EXTENSIONS
 from aegis_core.errors import AegisValidationError
+from aegis_core.guidance_projection import (
+    GuidanceProjectionError, MAX_GUIDANCE_CHARS, SLOT_REF_PATTERN, contains_control_characters,
+    assembled_text, normalize_layout, project_error_name, project_field, redact_clean_text,
+)
+from aegis_core.guidance_projection import GuidanceResult as _GuidanceResult
 from aegis_core.hosts import GENERIC
+from aegis_core.guidance_grammar import clip_redacted
 
 __all__ = [
     "SlotResolutionError",
@@ -32,11 +37,10 @@ __all__ = [
     "profile_id",
     "render_for_host",
     "render_scan_result",
+    "scan_registry",
     "sanitize_slot_value",
     "MAX_SLOT_VALUE_LEN",
 ]
-
-SLOT_REF_PATTERN = re.compile(r"\$\{(?:SLOT|RULE)\.([A-Za-z0-9_\-]+)\}|\$\{([A-Za-z0-9_\-]+)\}")
 
 # One profile per host slot_profile id (aegis_core.hosts). Values are single tool or
 # model names, so they pass sanitize_slot_value and render inside backticks.
@@ -132,24 +136,27 @@ _CAPABILITY_PREFIXES = ("TOOL_", "MODEL_")
 _CAPABILITY_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+\-]*")
 _KNOWN_CAPABILITY_KEYS = frozenset(_GENERIC_PROFILE)
 _MAX_LISTED_KEYS = 5
-# Cc: C0/C1 controls incl. newlines; Cf: bidi overrides, zero-width chars; Zl/Zp: U+2028/U+2029.
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 def sanitize_slot_value(key: str, value: str) -> Optional[str]:
-    """Return ``value`` made safe to inline into agent-facing text, or None to leave it unresolved.
-
-    Control and format characters become spaces, whitespace collapses to one line and
-    the result is capped at MAX_SLOT_VALUE_LEN. TOOL_*/MODEL_* values must be a plain
-    tool or model name, otherwise None.
-    """
-    text = "".join(" " if unicodedata.category(ch) in _UNSAFE_CATEGORIES else ch for ch in str(value))
-    text = " ".join(text.split())
-    if str(key).startswith(_CAPABILITY_PREFIXES):
-        if len(text) <= MAX_SLOT_VALUE_LEN and _CAPABILITY_VALUE.fullmatch(text):
-            return text
+    """Refuse non-layout controls; collapse layout, redact once, then cap."""
+    value = str(value)
+    if len(value) > MAX_GUIDANCE_CHARS:
         return None
-    return text[:MAX_SLOT_VALUE_LEN] or None
+    try:
+        text = normalize_layout(value, single_line=True)
+    except GuidanceProjectionError:
+        return None
+    capability = str(key).startswith(_CAPABILITY_PREFIXES)
+    if capability and (len(text) > MAX_SLOT_VALUE_LEN or not _CAPABILITY_VALUE.fullmatch(text)):
+        return None
+    try:
+        text = clip_redacted(redact_clean_text(text), MAX_SLOT_VALUE_LEN)
+    except GuidanceProjectionError:
+        return None
+    if capability and not _CAPABILITY_VALUE.fullmatch(text):
+        return None
+    return text or None
 
 
 def _keys_summary(keys: Sequence[str]) -> str:
@@ -194,6 +201,8 @@ class SlotRegistry:
                 and '.' + str(k)[len('ast_driver_'):].lstrip('.').lower() in NATIVE_SOURCE_EXTENSIONS)
         }
         self._warnings: List[str] = list(warnings or [])
+        self._warning_source = self._warnings
+        self._control_refusals: set[str] = set()
 
     @property
     def warnings(self) -> List[str]:
@@ -260,11 +269,14 @@ class SlotRegistry:
         user_reg = cls.load_user(workspace)
         warnings = user_reg.warnings
         invalid: List[str] = []
+        control_refusals: set[str] = set()
         for key, value in user_reg.to_dict().items():
             if key.startswith(_CAPABILITY_PREFIXES):
                 clean = sanitize_slot_value(key, value)
                 if clean is None:
                     invalid.append(key)
+                    if contains_control_characters(value):
+                        control_refusals.add(key)
                     continue
                 value = clean
             merged[key] = value
@@ -277,16 +289,42 @@ class SlotRegistry:
             ws_reg = cls.load(workspace)
             warnings.extend(ws_reg.warnings)
             merged.update(ws_reg.to_dict())
-        return cls(merged, warnings=warnings)
+        registry = cls(merged, warnings=warnings)
+        registry._control_refusals = control_refusals
+        return registry
 
     def sanitized(self) -> SlotRegistry:
-        """Copy whose values are safe to inline into agent-facing text (see sanitize_slot_value)."""
+        """Copy safe values; remember only names of overrides refused for controls."""
         safe = {}
+        refused = set(self._control_refusals)
         for key, value in self._slots.items():
             clean = sanitize_slot_value(key, value)
             if clean is not None:
                 safe[key] = clean
-        return SlotRegistry(safe, warnings=self._warnings)
+            elif contains_control_characters(value):
+                refused.add(key)
+        registry = SlotRegistry(safe)
+        registry._control_refusals = refused
+        # Raw warning text is a complete field. Refused-slot notices below are
+        # assembled from separately projected keys owned by this producer.
+        warnings = project_field(self._warning_source)
+        for key in sorted(refused):
+            try:
+                name = project_error_name(key)
+            except GuidanceProjectionError as exc:
+                name = exc.code
+            if len(name) > 80:
+                name = clip_redacted(name, 77) + "..."
+            warning = assembled_text(f"ignored slot {name}: value withheld (control characters)")
+            if warning not in warnings:
+                warnings.append(warning)
+        registry._warnings = warnings
+        registry._warning_source = self._warning_source
+        return registry
+
+    def control_refused(self, key: str) -> bool:
+        """Whether substitution must withhold the instruction for a refused override."""
+        return key in self._control_refusals
 
     def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
         return self._slots.get(key, default)
@@ -337,10 +375,14 @@ def render_for_host(text: str, host: Optional[str], workspace: str | Path | None
     with no value stays as written so the gap is visible. A user config that cannot be
     read never costs the text: the host's built-in values are used and a fixed warning
     (no file content) says so.
+
+    Completed text shares scan's Evidence/control/redaction projection. An
+    unclassifiable body is withheld; a resource/type refusal returns that same
+    fixed withholding text and its fixed projection code in warnings.
     """
     try:
         registry = SlotRegistry.for_platform(host or GENERIC, workspace=workspace)
-        warnings = registry.warnings
+        warnings = []
     except (SlotResolutionError, OSError):
         merged = dict(DEFAULT_SLOTS)
         merged.update(PLATFORM_SLOT_PROFILES[profile_id(host)])
@@ -348,17 +390,22 @@ def render_for_host(text: str, host: Optional[str], workspace: str | Path | None
 
         files = f"~/{AEGIS_DIRNAME}/config.json" + (f" or {AEGIS_DIRNAME}/config.json" if workspace is not None else "")
         registry, warnings = SlotRegistry(merged), [_CONFIG_UNREADABLE.format(files=files)]
-    return registry.sanitized().resolve(text, strict=False), warnings
+    from aegis_core.guidance_projection import GuidanceProjectionError, WITHHELD_GUIDANCE, field_text, project_field
+
+    try:
+        registry = registry.sanitized()
+        warnings.extend(w for w in registry.warnings if w not in warnings)
+        return field_text(project_field(text, registry)), warnings
+    except GuidanceProjectionError as exc:
+        return WITHHELD_GUIDANCE, warnings + [exc.code]
 
 
 _SCAN_CONFIG_UNREADABLE = (
     "config files (.aegis/config.json or ~/.aegis/config.json) could not be read or parsed; "
     "${SLOT.*} placeholders were left unresolved"
 )
-# The scan fields an agent reads that may quote rule text: the guidance, and the
-# hypothesis/prediction (and a body, where one is carried) of each listed rule.
+# Compatibility rule collections use the shared shape/projection predicate.
 _SCAN_LISTS = ("relevant_rules", "invariant_warnings")
-_SCAN_RULE_FIELDS = ("body", "hypothesis", "prediction")
 
 
 def _add_warnings(result: Dict[str, Any], warnings: Sequence[str]) -> None:
@@ -369,39 +416,119 @@ def _add_warnings(result: Dict[str, Any], warnings: Sequence[str]) -> None:
         result["warnings"] = merged
 
 
+def scan_registry(host: Optional[str], workspace: str | Path | None = None) -> SlotRegistry:
+    """Load one sanitized request registry, with fixed warnings on config failure.
+
+    An empty fallback leaves placeholders unresolved while Evidence projection
+    and token accounting still run. No config content or exception is echoed.
+    """
+    try:
+        loaded = SlotRegistry.for_platform(host or GENERIC, workspace=str(workspace) if workspace is not None else None)
+    except (SlotResolutionError, OSError, RuntimeError):
+        return SlotRegistry(warnings=[_SCAN_CONFIG_UNREADABLE])
+    return loaded.sanitized()
+
+
 def render_scan_result(result: Dict[str, Any], host: Optional[str],
                        workspace: str | Path | None = None) -> Dict[str, Any]:
     """A scan result (aegis_core.scan) with its ${SLOT.*} references rendered for ``host``.
 
-    One renderer for the MCP aegis_scan (the identified host's profile) and the CLI
-    ``aegis scan`` (no host: the generic profile). The agent reads this output, so
+    Real scan results retain private source/fitness snapshots. Reproject that
+    snapshot with one request registry, so complete slots are rendered before
+    truncation, selection and budgeting even when called after a raw scan.
+    Ordinary dictionaries are projected from a bounded private copy and receive
+    final token accounting. Opaque overflow refuses as guidance_projection_budget.
+    Checked projection refusals retain their fixed code and diagnostic locations
+    independently of the guidance token budget, including plain/JSON copies.
+    The agent reads this output, so
     values are sanitized before they are inlined, and ignored keys or a config file
     that cannot be parsed are reported in ``result["warnings"]`` (H5). Slot loading
     never costs the agent its guidance: on such an error the placeholders stay as
     written and a fixed warning, quoting no file content or path, says so.
     """
+    from aegis_core.guidance_projection import GuidanceResult
+
+    registry = scan_registry(host, workspace)
+    if isinstance(result, _PlainScanResult):
+        return result.with_registry(registry)
+    if isinstance(result, GuidanceResult):
+        return _render_bound_result(result, registry)
+    return _render_plain_result(result, registry)
+
+
+class _PlainScanResult(_GuidanceResult):
+    def __init__(self, payload: Dict[str, Any], source: Dict[str, Any] | _GuidanceResult, *,
+                 identities: tuple[str, ...] = (), mandatory_count: Optional[int] = None) -> None:
+        super().__init__(payload)
+        self._source = source
+        self._canonical_rule_ids = identities
+        self._mandatory_count = mandatory_count
+
+    def with_registry(self, registry: SlotRegistry) -> Dict[str, Any]:
+        if isinstance(self._source, _GuidanceResult):
+            return _render_bound_result(self._source, registry)
+        return _render_plain_result(self._source, registry)
+
+    def exposure_rule_ids(self) -> tuple[str, ...]:
+        return self._canonical_rule_ids
+
+    def staged_mandatory_count(self) -> int:
+        if self._mandatory_count is not None:
+            return self._mandatory_count
+        return super().staged_mandatory_count()
+
+
+def _render_bound_result(source: _GuidanceResult, registry: SlotRegistry) -> Dict[str, Any]:
+    # Bind the captured structured source once, then treat every resulting
+    # assembled field as text. None prevents expansion of literal slot values.
+    bound = source.with_registry(registry)
+    identities = bound.exposure_rule_ids() if isinstance(bound, _GuidanceResult) else ()
+    mandatory_count = bound.staged_mandatory_count() if isinstance(bound, _GuidanceResult) else None
+    return _render_plain_result(dict(bound), None, replay_source=source,
+                                identities=identities, staged_mandatory_count=mandatory_count)
+
+
+def _render_plain_result(source: Dict[str, Any], registry: Optional[SlotRegistry], *,
+                         replay_source: Optional[_GuidanceResult] = None,
+                         identities: tuple[str, ...] = (),
+                         staged_mandatory_count: Optional[int] = None) -> Dict[str, Any]:
+    from copy import deepcopy
+    from aegis_core.guidance_projection import (
+        GuidanceProjectionError, checked_result_copy, finish_payload, projection_refusal, projection_refusal_copy,
+    )
+
     try:
-        loaded = SlotRegistry.for_platform(host or GENERIC, workspace=str(workspace) if workspace is not None else None)
-    except (SlotResolutionError, OSError, RuntimeError):
-        _add_warnings(result, [_SCAN_CONFIG_UNREADABLE])
-        return result
-    _add_warnings(result, loaded.warnings)
-    registry = loaded.sanitized()
+        refusal = projection_refusal_copy(source)
+        if refusal is not None:
+            return _PlainScanResult(deepcopy(refusal), replay_source if replay_source is not None else refusal,
+                                    identities=(), mandatory_count=0)
+        snapshot = checked_result_copy(source, registry)
+        result = deepcopy(snapshot)
+        if registry is not None:
+            _add_warnings(result, registry.warnings)
+        result = _project_scan_fields(result, registry)
+        payload = finish_payload(result, preserve_omissions=replay_source is not None,
+                                 reserve_warning=replay_source is None,
+                                 staged_mandatory_count=staged_mandatory_count)
+        # Finalization either retains all entries or discards the selection.
+        # Replay remains the original source; telemetry describes this result.
+        if payload.get("status") == "FAIL" or len(payload.get("relevant_rules", [])) != len(result.get("relevant_rules", [])):
+            identities, staged_mandatory_count = (), 0
+        return _PlainScanResult(payload, replay_source if replay_source is not None else snapshot,
+                                identities=identities, mandatory_count=staged_mandatory_count)
+    except GuidanceProjectionError as exc:
+        return projection_refusal(exc.code)
+
+
+def _project_scan_fields(result: Dict[str, Any], registry: Optional[SlotRegistry]) -> Dict[str, Any]:
+    """Project compatibility fields using the same pure functions as scan."""
+    from aegis_core.guidance_projection import field_text, project_field, project_envelope_fields, project_rule_entries
 
     guidance = result.get("guidance")
-    if isinstance(guidance, str) and "${SLOT." in guidance:
-        result["guidance"] = registry.resolve(guidance, strict=False)
-    seen = set()
+    if "guidance" in result:
+        result["guidance"] = field_text(project_field(guidance, registry))
     for key in _SCAN_LISTS:
-        items = result.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict) or id(item) in seen:
-                continue
-            seen.add(id(item))
-            for name in _SCAN_RULE_FIELDS:
-                value = item.get(name)
-                if isinstance(value, str) and "${SLOT." in value:
-                    item[name] = registry.resolve(value, strict=False)
+        if key in result:
+            result[key] = project_rule_entries(result[key], registry)
+    project_envelope_fields(result, registry)
     return result

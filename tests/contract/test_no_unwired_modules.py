@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.contract.test_import_boundary import REPO, _module_files, import_edges, import_nodes
+from tests.contract.test_import_boundary import REPO, import_edges, import_nodes, module_inventory
 from tests.contract.test_process_ratchets import ScopedNames, import_bindings
 
 MODULE_PREFIXES = ('aegis_core.verification', 'aegis_core.ast', 'aegis_cli.formatters')
@@ -26,19 +26,19 @@ def _under(name: str, prefixes: tuple[str, ...]) -> bool:
 _runtime_nodes = import_nodes
 
 
-def _runtime_imports(root: Path):
+def _runtime_imports(root: Path, inventory):
     # Keep the established module resolver. Filter script-only sites here too so this
     # guard works before and after the boundary scanner adds its own main exclusion.
-    sites = {(module, node.lineno) for module, path in _module_files(root).items()
-             for node in _runtime_nodes(ast.parse(path.read_text(encoding='utf-8')))
+    sites = {(module, node.lineno) for module, (_, tree) in inventory.items()
+             for node in _runtime_nodes(tree)
              if isinstance(node, (ast.Import, ast.ImportFrom, ast.Call))}
-    return [edge for edge in import_edges(root)
+    return [edge for edge in import_edges(root, inventory=inventory)
             if (edge.source, int(edge.where.rsplit(':', 1)[1])) in sites]
 
 
 def orphan_modules(root: Path) -> list[str]:
-    modules = _module_files(root)
-    imported = {edge.target for edge in _runtime_imports(root) if edge.source != edge.target}
+    modules = module_inventory(root)
+    imported = {edge.target for edge in _runtime_imports(root, modules) if edge.source != edge.target}
     return sorted(module for module in modules if _under(module, MODULE_PREFIXES) and not any(target == module or target.startswith(module + ".") for target in imported))
 
 
@@ -94,13 +94,12 @@ def declared_exports(tree, rel, resolver):
 
 
 def unused_exports(root: Path) -> list[str]:
-    modules = _module_files(root)
+    modules = module_inventory(root)
     # Imports and attribute references share the script-body exclusion.
-    sites = {(edge.source, int(edge.where.rsplit(':', 1)[1])) for edge in _runtime_imports(root)}
+    sites = {(edge.source, int(edge.where.rsplit(':', 1)[1])) for edge in _runtime_imports(root, modules)}
     exports = {}
     references = {}
-    for module, path in modules.items():
-        tree = ast.parse(path.read_text(encoding='utf-8'))
+    for module, (path, tree) in modules.items():
         rel = path.relative_to(root).as_posix()
         resolver = ScopedNames(tree, rel, runtime_only=True)
         used = set()

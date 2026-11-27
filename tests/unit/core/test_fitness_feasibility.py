@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
+from uuid import uuid4
 
 import pytest
 
@@ -83,8 +84,13 @@ def test_volume_is_measured_only_after_the_minimum_observation(tmp_path: Path, d
                                                                state: str) -> None:
     _rule(tmp_path, "trap-new")
     if days_ago is not None:
-        credit.record_exposure(tmp_path, "claude-code", "s1", ["trap-new"], scope_basis="match", heartbeat=True,
-                               ts=_iso(days_ago))
+        # A passing case's tmp_path can be reused after its ledger is deleted.
+        # Each scenario needs its own session, independent of exposure memoization.
+        session = uuid4().hex
+        written = credit.record_exposure(tmp_path, "claude-code", session, ["trap-new"], scope_basis="match",
+                                         heartbeat=True, ts=_iso(days_ago))
+        assert len(written) == 1, "the observation needs a persisted exposure"
+        assert credit.read_rows(tmp_path) == written
     fit = _fit(tmp_path, "trap-new")
     assert fit.state == state
     assert (fit.mde is None) is (state == "insufficient")

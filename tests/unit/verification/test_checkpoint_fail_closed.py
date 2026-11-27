@@ -1,6 +1,7 @@
 """Fail-closed and read-only regression tests for CLI/MCP checkpoint."""
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -8,16 +9,16 @@ from aegis_core.verification import checkpoint_checks
 
 
 def _write_invariant(root, content=None):
-    path = root / '.aegis' / 'rules' / 'invariants' / 'wall-test.md'
+    path = root / '.aegis' / 'rules' / 'invariants' / 'invariant-test.md'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content or (
         '---\n'
-        'id: wall-test\n'
+        'id: invariant-test\n'
         'domain: testing\n'
         'type: invariant\n'
         'enforcement: gate\n'
         '---\n'
-        '# Test wall\n'
+        '# Test invariant\n'
     ), encoding='utf-8')
     return path
 
@@ -67,11 +68,11 @@ def test_hardcoded_path_read_failure_is_an_issue(tmp_path, monkeypatch):
 def test_rule_stat_failure_is_an_issue(tmp_path, monkeypatch):
     import aegis_core.rule_inventory as inventory
 
-    cell = _write_invariant(tmp_path)
+    rule = _write_invariant(tmp_path)
     real_stat = inventory.os.stat
 
     def denied(path, *args, **kwargs):
-        if os.fspath(path) == str(cell):
+        if os.fspath(path) == str(rule):
             raise PermissionError('simulated stat denial')
         return real_stat(path, *args, **kwargs)
 
@@ -79,7 +80,7 @@ def test_rule_stat_failure_is_an_issue(tmp_path, monkeypatch):
     issues = checkpoint_checks.check_rule_conventions(tmp_path)
     assert any(
         issue['check'] == 'rule_load'
-        and issue.get('file') == '.aegis/rules/invariants/wall-test.md'
+        and issue.get('file') == '.aegis/rules/invariants/invariant-test.md'
         and 'stat' in issue['message'].lower()
         for issue in issues
     )
@@ -88,7 +89,7 @@ def test_rule_stat_failure_is_an_issue(tmp_path, monkeypatch):
 @pytest.mark.parametrize('content, expected', [
     ('---\nid: [unterminated\n---\nbody\n', 'malformed'),
     ('---\n- one\n- two\n---\nbody\n', 'mapping'),
-    ('---\nid: wall-test\n', 'unterminated'),
+    ('---\nid: invariant-test\n', 'unterminated'),
 ])
 def test_malformed_rule_frontmatter_is_an_issue(tmp_path, content, expected):
     _write_invariant(tmp_path, content)
@@ -112,20 +113,25 @@ def test_checkpoint_is_recursively_read_only_on_pass_and_fail(tmp_path, malforme
     _write_invariant(tmp_path, content)
     marker = tmp_path / '.marker'
     marker.write_bytes(b'unchanged bytes\x00\xff')
-    external = tmp_path.parent / f'{tmp_path.name}-external'
-    external.mkdir()
-    link = tmp_path / '.snapshot-link'
-    try:
-        link.symlink_to(external, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip('symlinks are unavailable')
+    # Passing tmp_path directories can be deleted and their names reused. Give
+    # the external target its own unique name and clean it on pass/fail/skip.
+    with TemporaryDirectory(prefix='checkpoint-external-', dir=tmp_path.parent) as directory:
+        external = Path(directory)
+        (external / '.marker').write_bytes(b'external bytes\x00\xff')
+        link = tmp_path / '.snapshot-link'
+        try:
+            link.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip('symlinks are unavailable')
 
-    before = _snapshot(tmp_path)
-    result = _run_cli(tmp_path)
-    after = _snapshot(tmp_path)
+        before = _snapshot(tmp_path)
+        external_before = _snapshot(external)
+        result = _run_cli(tmp_path)
+        after = _snapshot(tmp_path)
 
-    assert after == before
-    assert result == (1 if malformed else 0)
+        assert after == before
+        assert _snapshot(external) == external_before
+        assert result == (1 if malformed else 0)
 
 
 def test_resolve_canonical_test_candidates(tmp_path: Path):
@@ -133,11 +139,11 @@ def test_resolve_canonical_test_candidates(tmp_path: Path):
     from aegis_core.verification.checkpoint_checks import _resolve_canonical_test_candidates
 
     # Subpackage file
-    sub_src = tmp_path / "aegis_core" / "schemas" / "cells.py"
+    sub_src = tmp_path / "aegis_core" / "schemas" / "rules.py"
     candidates = [p.as_posix() for p in _resolve_canonical_test_candidates(tmp_path, sub_src)]
 
     # Must include canonical mirrored path and subpackage grouped test
-    assert any("tests/core/schemas/test_cells.py" in c for c in candidates)
+    assert any("tests/core/schemas/test_rules.py" in c for c in candidates)
     assert any("tests/test_schemas.py" in c for c in candidates)
 
     # Standard module

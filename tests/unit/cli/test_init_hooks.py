@@ -1,9 +1,9 @@
 from pathlib import Path
-"""TDD Gate 1 tests for soma init --hooks pre-commit hook installation.
+"""TDD Gate 1 tests for aegis init --hooks pre-commit hook installation.
 
-The pre-commit hook bridges governance cells into the git workflow:
-- `soma init` installs a git pre-commit hook that runs `soma checkpoint --pre-commit`
-- Hook is executable and contains the soma checkpoint invocation
+The pre-commit hook bridges governance rules into the git workflow:
+- `aegis init` installs a git pre-commit hook that runs `aegis checkpoint --pre-commit`
+- Hook is executable and contains the aegis checkpoint invocation
 - Hook installation is skipped if no .git directory exists
 - Existing hooks are preserved (appended to, not overwritten)
 - --dry-run previews but doesn't install
@@ -54,8 +54,8 @@ class TestInstallHookFunction:
         mode = hook_file.stat().st_mode
         assert mode & stat.S_IXUSR, "Hook must be user-executable"
 
-    def test_install_hook_contains_soma_checkpoint(self, tmp_path):
-        """Hook content must invoke soma checkpoint --pre-commit."""
+    def test_install_hook_contains_aegis_checkpoint(self, tmp_path):
+        """Hook content must invoke aegis checkpoint --pre-commit."""
         from aegis_cli.init import install_hook
 
         git_dir = tmp_path / ".git" / "hooks"
@@ -65,7 +65,7 @@ class TestInstallHookFunction:
 
         hook_file = git_dir / "pre-commit"
         content = hook_file.read_text()
-        assert "check --hook" in content or "soma checkpoint" in content
+        assert "check --hook" in content or "aegis checkpoint" in content
 
     def test_install_hook_has_shebang(self, tmp_path):
         """Hook file must start with a valid shebang line."""
@@ -100,7 +100,7 @@ class TestInstallHookFunction:
         assert not hook_file.exists(), "Dry run must not create hook"
 
     def test_install_hook_preserves_existing_hook(self, tmp_path):
-        """If pre-commit already exists, soma appends rather than overwriting."""
+        """If pre-commit already exists, aegis appends rather than overwriting."""
         from aegis_cli.init import install_hook
 
         git_dir = tmp_path / ".git" / "hooks"
@@ -114,10 +114,10 @@ class TestInstallHookFunction:
 
         content = hook_file.read_text()
         assert "existing hook" in content, "Original hook content must be preserved"
-        assert "check --hook" in content or "soma checkpoint" in content, "Hook must be appended"
+        assert "check --hook" in content or "aegis checkpoint" in content, "Hook must be appended"
 
     def test_install_hook_idempotent(self, tmp_path):
-        """Running install_hook twice does not duplicate the soma section."""
+        """Running install_hook twice does not duplicate the aegis section."""
         from aegis_cli.init import install_hook
 
         git_dir = tmp_path / ".git" / "hooks"
@@ -130,8 +130,8 @@ class TestInstallHookFunction:
         content = hook_file.read_text()
         assert (
             content.count("# >>> aegis pre-commit >>>") == 1
-            or content.count("# >>> soma pre-commit >>>") == 1
-            or content.count("soma checkpoint") == 1
+            or content.count("# >>> aegis pre-commit >>>") == 1
+            or content.count("aegis checkpoint") == 1
         ), "Must not duplicate hook section"
 
     def test_install_hook_returns_true_on_success(self, tmp_path):
@@ -146,10 +146,10 @@ class TestInstallHookFunction:
 
 
 class TestInitInstallsHook:
-    """Test that soma init integrates hook installation."""
+    """Test that aegis init integrates hook installation."""
 
     def test_init_installs_hook_in_git_repo(self, tmp_path, monkeypatch):
-        """soma init in a git repo installs the pre-commit hook."""
+        """aegis init in a git repo installs the pre-commit hook."""
         from aegis_cli.init import run_init
 
         # Set up a minimal git repo
@@ -166,12 +166,12 @@ class TestInitInstallsHook:
         run_init(args)
 
         hook_file = git_dir / "pre-commit"
-        assert hook_file.exists(), "soma init must install pre-commit hook"
+        assert hook_file.exists(), "aegis init must install pre-commit hook"
         content = hook_file.read_text()
-        assert "check --hook" in content or "soma checkpoint" in content
+        assert "check --hook" in content or "aegis checkpoint" in content
 
     def test_init_dry_run_does_not_install_hook(self, tmp_path, monkeypatch):
-        """soma init --dry-run does not create the hook file."""
+        """aegis init --dry-run does not create the hook file."""
         from aegis_cli.init import run_init
 
         git_dir = tmp_path / ".git" / "hooks"

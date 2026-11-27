@@ -1,0 +1,95 @@
+name: Wave tests
+
+# Owner decision, 2026-11-05: run the tests on agent-authored pull requests
+# into develop, without secrets. For these pull requests Validate keeps its
+# base-sourced, no-exec aegis-check, which stays the required check and flags any
+# change to this file as a governance change that needs the owner's signed
+# approval. Pull requests into main and release/** run the full Validate workflow
+# and are unchanged.
+on:
+  pull_request:
+    branches: [develop]
+
+# A read-only token, no secrets, no caches and no persisted credentials: the pull
+# request's code runs with nothing to leak or publish.
+permissions:
+  contents: read
+
+concurrency:
+  group: wave-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Same legs and limits as Validate's test job.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.11']
+        exclude:
+          - os: ubuntu-latest
+            python-version: '3.9'
+        include:
+          - os: ubuntu-24.04
+            python-version: '3.9'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies and the package
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install .
+
+      - name: Lint
+        run: make lint
+
+      - name: Run test suite
+        run: make test
+
+  test-windows:
+    # Same legs and limits as Validate's Windows job, without its acceptance steps.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies and the package
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install .
+
+      # HOME and USERPROFILE point at a throwaway directory so no test writes to
+      # the runner's real profile; PYTHONUTF8=0 keeps the legacy Windows encodings.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+        run: |
+          python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
+          python -m pytest tests/ -q -n auto

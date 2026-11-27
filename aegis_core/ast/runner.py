@@ -14,12 +14,13 @@ from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
+from aegis_core.argv import split_command
+from aegis_core.ast.drivers import templates
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS, NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.schema import NormalizedAST
@@ -35,11 +36,13 @@ __all__ = [
     "ASTDriverRegistry",
     "ASTDriverRunner",
     "resolve_driver_executable",
+    "split_driver_command",
     "enforce_source_size",
+    "source_limit_from_error",
 ]
 
 _PYTHON_NAMES = frozenset({"{python}", "python3", "python", "python.exe", "python3.exe"})
-_TEMPLATES_DIR = Path(__file__).resolve().parent / "drivers" / "templates"
+_TEMPLATES_DIR = Path(templates.__file__).resolve().parent
 # Packaged external template -> interpreter looked up on PATH.
 _PACKAGED_INTERPRETERS = {"go_ast.go": "go"}
 SOURCE_LIMIT_BYTES = 2 * 1024 * 1024
@@ -48,7 +51,24 @@ SOURCE_LIMIT_BYTES = 2 * 1024 * 1024
 def enforce_source_size(file_path: Path | str) -> None:
     """Apply the byte-size policy after the caller confines the source path."""
     if Path(file_path).stat().st_size > SOURCE_LIMIT_BYTES:
-        raise ASTDriverError('source exceeds 2 MiB', reason='too_large')
+        raise ASTDriverError(f'source exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB', reason='too_large', limit_bytes=SOURCE_LIMIT_BYTES)
+
+
+def source_limit_from_error(exc: BaseException) -> Optional[int]:
+    """Read the refusing producer's byte limit through typed extraction wrappers.
+
+    Missing provenance stays unknown: a current configuration value cannot tell
+    which of the independent producer limits refused an earlier parse.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ASTDriverError) and getattr(exc, 'reason', None) == 'too_large':
+            limit = getattr(exc, 'limit_bytes', None)
+            if type(limit) is int and limit > 0:
+                return limit
+        exc = exc.__cause__
+    return None
 
 
 def _is_python_name(name: str) -> bool:
@@ -79,7 +99,7 @@ def _command_plan(command: str, ext: str, ws_root: Optional[Path] = None, where:
     current directory) would resolve against the workspace.
     """
     try:
-        parts = _split_command(command)
+        parts = split_driver_command(command)
     except ValueError as exc:  # unbalanced quotes
         return _DriverPlan(label=command, unavailable=f"the driver command cannot be parsed: {exc}")
     if parts and _is_python_name(parts[0]):
@@ -159,7 +179,7 @@ def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_Drive
     if plan.unavailable or not plan.argv:
         return plan
     argv = list(plan.argv)
-    first = _split_command(command)[0]
+    first = split_driver_command(command)[0]
     if not _is_python_name(first):  # python names already resolved to sys.executable, which runs aegis itself
         if not is_bare(first):
             # The child runs in an empty directory, so a relative path is joined to the
@@ -272,18 +292,21 @@ def _names_program(token: str) -> bool:
     return os.path.isabs(token) and os.path.isfile(token)
 
 
-def _split_command(cmd: str) -> list[str]:
+def split_driver_command(cmd: str) -> list[str]:
     """Split a driver command line string into argv arguments, preserving Windows paths."""
+    parts = split_command(cmd)
     if os.name == "nt":
-        parts = [p.strip('"') for p in shlex.split(cmd, posix=False)]
         # Rejoin the words of an unquoted path with spaces (C:\Program Files\...).
         if parts and not _names_program(parts[0]):
             for i in range(1, len(parts)):
                 cand = " ".join(parts[: i + 1])
                 if _names_program(cand):
                     return [cand] + parts[i + 1 :]
-        return parts
-    return shlex.split(cmd)
+    return parts
+
+
+# Compatibility for existing direct imports; consumers use the public decoder.
+_split_command = split_driver_command
 
 
 def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] = None) -> Optional[str]:
@@ -483,7 +506,7 @@ class ASTDriverRunner:
             with target_path.open('rb') as stream:
                 data = stream.read(SOURCE_LIMIT_BYTES + 1)
             if len(data) > SOURCE_LIMIT_BYTES:
-                raise ASTDriverError('native source exceeds 2 MiB', reason='too_large')
+                raise ASTDriverError(f'native source exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB', reason='too_large', limit_bytes=SOURCE_LIMIT_BYTES)
             try:
                 source = data.decode('utf-8')
             except UnicodeError as exc:

@@ -75,6 +75,7 @@ WIN_DRIVE_RE = re.compile(r'([a-zA-Z]:)\\([\s*?$"]|$)')
 RM_DANGEROUS_TARGETS = frozenset({"/", "~", "/home", "$home", "/root", "$root", ".", "..", "*"})
 GLOB_CHARS = frozenset({"*", "?", "[", "]"})
 _DELIMITER_PIECE = re.compile(r"&&|\|\||\|&|[;&|\n\r]")
+_POWERSHELL_PREFIX = re.compile(r'\(\s*(?:remove-item|rm|del|erase|rd|ri|format-volume)\b', re.IGNORECASE)
 
 
 @dataclass
@@ -236,7 +237,7 @@ def extract_subshell_commands(cmd: str) -> list[str]:
             while k >= 0 and cmd[k] in " \t":
                 k -= 1
             is_cmd_boundary = (k < 0) or (cmd[k] in ";|&\n\r({")
-            is_ps_expr = bool(re.match(r'\(\s*(?:remove-item|rm|del|erase|rd|ri|format-volume)\b', cmd[i:], re.IGNORECASE))
+            is_ps_expr = bool(_POWERSHELL_PREFIX.match(cmd, i))
             if is_cmd_boundary or is_ps_expr:
                 start = i + 1
                 depth = 1

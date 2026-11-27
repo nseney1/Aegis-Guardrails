@@ -65,6 +65,18 @@ def test_a_definitions_decorators_survive_the_json_round_trip():
     assert NormalizedAST.from_json(ast_obj.to_json()).definitions == ast_obj.definitions
 
 
+@pytest.mark.parametrize("decorators", [[], ["declared"]], ids=["empty", "nonempty"])
+def test_explicit_decorator_metadata_survives_roundtrip_without_disk_fallback(tmp_path, decorators):
+    target = tmp_path / "changed.py"
+    target.write_bytes(b"def (:\n")
+    tree = NormalizedAST(file_path=str(target), decorators=decorators)
+
+    restored = NormalizedAST.from_json(tree.to_json())
+
+    assert restored.to_dict()["metadata"]["decorators"] == decorators
+    assert restored.decorators == tuple(decorators)
+
+
 def test_schema_validation_rejects_malformed_payload():
     with pytest.raises(ValueError, match="file_path cannot be empty"):
         NormalizedAST(file_path="", language="python", definitions=(), call_sites=(), imports=())

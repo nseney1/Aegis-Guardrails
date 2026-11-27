@@ -1,5 +1,8 @@
 """JavaScript lexical boundaries through the public tokenizer."""
+import ast
+import importlib.util
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -424,3 +427,1242 @@ def test_a_brace_after_a_newline_comment_or_property_name_fails_closed(source, p
 def test_jsx_cannot_start_inside_a_tsx_type_literal(source):
     with pytest.raises(ASTDriverError, match='unsupported_lexical_context:tsx_type_literal_angle'):
         tokens(source, 'fixture.tsx')
+
+
+def test_frame_depth_kinds_live_in_one_table():
+    import aegis_core.ast.drivers.js.tokenizer as tokenizer
+
+    source = Path(tokenizer.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(source)
+    assignments = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == '_FRAME_DEPTHS' for target in node.targets)
+    ]
+    assert len(assignments) == 1
+    lexer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Lexer')
+    methods = {node.name: node for node in lexer.body if isinstance(node, ast.FunctionDef)}
+    frame_names = {name for name, _ in tokenizer._FRAME_DEPTHS}
+    for method in ('code', 'compact_declaration', 'punctuation', 'close_context'):
+        names = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(methods[method]) if isinstance(node, (ast.Name, ast.Attribute))
+        }
+        assert '_FRAME_DEPTHS' not in names, method
+        # Only the arrow and generator lexical transitions need kind-specific state here.
+        assert names & frame_names <= {'arrow_markers', 'generator_frames'}, method
+
+    first, second = tokenizer.Lexer('', 'a.js'), tokenizer.Lexer('', 'b.js')
+    owned, other = first.frame_depths, second.frame_depths
+    assert len(owned) == len(other) == len(tokenizer._FRAME_DEPTHS)
+    assert len({id(depths) for depths in owned + other}) == 2 * len(frame_names)
+    assert all(depths == set() for depths in owned + other)
+    blockers = [depths for (_, blocks), depths in zip(tokenizer._FRAME_DEPTHS, owned) if blocks]
+    assert tuple(map(id, first.declaration_depths)) == tuple(map(id, blockers))
+
+
+@pytest.mark.parametrize('source', ['(!x)', '[!x]'], ids=['expression-fast-close', 'punctuation-close'])
+def test_frame_depth_table_extension_cleans_up_on_close(source):
+    import aegis_core.ast.drivers.js.tokenizer as tokenizer
+
+    spec = importlib.util.spec_from_file_location('test_frame_tokenizer', tokenizer.__file__)
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+
+    class LexerWithSyntheticMarker(isolated.Lexer):
+        def after_operator(self, operator):
+            super().after_operator(operator)
+            if operator == '!':
+                self.synthetic_frames.update((0, len(self.frames)))
+
+        def run(self):
+            result = super().run()
+            assert self.synthetic_frames == {0}
+            return result
+
+    expected = tokenizer.tokenize(source, 'fixture.js')
+    isolated._FRAME_DEPTHS = (*isolated._FRAME_DEPTHS, ('synthetic_frames', True))
+    isolated.Lexer = LexerWithSyntheticMarker
+    assert isolated.tokenize(source, 'fixture.js') == expected
+
+
+def test_frame_depth_refusal_does_not_echo_input_and_retry_is_fresh():
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError, tokenize
+
+    marker = 'ZQMARK'
+    source = 'function* g() { yield ' + marker + ' ]'
+    with pytest.raises(JSLexError) as caught:
+        tokenize(source, 'fixture.js')
+    assert caught.value.reason == 'syntax:unbalanced_delimiter'
+    assert marker not in str(caught.value)
+    assert marker not in repr(caught.value.args)
+    retried = tokenize('function* g() { yield /a/ }', 'fixture.js')
+    assert [(token.kind, token.value) for token in retried if token.kind == 'regex'] == [('regex', '/a/')]
+
+
+def test_frame_depth_tokenization_is_isolated_across_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError, tokenize
+
+    good, bad = 'function* g() { yield /a/ }', 'function h() { yield /a/ }'
+
+    def once(_index):
+        accepted = tokenize(good, 'fixture.js')
+        assert any(token.kind == 'regex' and token.value == '/a/' for token in accepted)
+        with pytest.raises(JSLexError) as caught:
+            tokenize(bad, 'fixture.js')
+        assert caught.value.reason == 'unsupported_lexical_context:contextual_yield'
+        assert 'yield /a/' not in str(caught.value)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(once, range(8)))
+
+
+# Each label names a (source, path) pair or a label that owns that pair and its goldens.
+_FRAME_MATRIX = {
+    'generator-open-template': ('function* g() { return `x ${yield /a/}` }', 'fixture.js'),
+    'generator-open-regex': ('function* g() { yield /a/ }', 'fixture.js'),
+    'generator-open-block': ('function* g() { { yield /a/ } }', 'fixture.js'),
+    'generator-open-call': ('function* g() { f(yield /a/) }', 'fixture.js'),
+    'generator-nested-template': ('function* g() { function* h() { return `x ${yield /a/}` } return `y ${yield /b/}` }', 'fixture.js'),
+    'generator-nested-regex': ('function* g() { function* h() { yield /a/ } yield /b/ }', 'fixture.js'),
+    'generator-nested-block': ('function* g() { function* h() { { yield /a/ } } { yield /b/ } }', 'fixture.js'),
+    'generator-nested-call': ('function* g() { function* h() { f(yield /a/) } f(yield /b/) }', 'fixture.js'),
+    'generator-close-template': 'generator-open-template',
+    'generator-close-regex': 'generator-open-regex',
+    'generator-close-block': 'generator-open-block',
+    'generator-close-call': 'generator-open-call',
+    'generator-mismatched-template': ('function* g() { return `x ${yield /a/}` ]', 'fixture.js'),
+    'generator-mismatched-regex': ('function* g() { yield /a/ ]', 'fixture.js'),
+    'generator-mismatched-block': ('function* g() { { yield /a/ } ]', 'fixture.js'),
+    'generator-mismatched-call': ('function* g() { f(yield /a/) ]', 'fixture.js'),
+    'generator-discard-template': ('function* g() { return `x ${yield /a/}` } function h() { return `y ${yield /b/}` }', 'fixture.js'),
+    'generator-discard-regex': ('function* g() { yield /a/ } function h() { yield /b/ }', 'fixture.js'),
+    'generator-discard-block': ('function* g() { { yield /a/ } } function h() { { yield /b/ } }', 'fixture.js'),
+    'generator-discard-call': ('function* g() { f(yield /a/) } function h() { f(yield /b/) }', 'fixture.js'),
+    'strict-open-template': ('class A { m() { return `x ${yield /a/}` } }', 'fixture.js'),
+    'strict-open-regex': ('class A { m() { return yield /a/ } }', 'fixture.js'),
+    'strict-open-block': ('class A { m() { { return yield /a/ } } }', 'fixture.js'),
+    'strict-open-call': ('class A { m() { f(yield /a/) } }', 'fixture.js'),
+    'strict-nested-template': ('class A { m() { class B { n() { return `x ${yield /a/}` } } return `y ${yield /b/}` } }', 'fixture.js'),
+    'strict-nested-regex': ('class A { m() { class B { n() { return yield /a/ } } return yield /b/ } }', 'fixture.js'),
+    'strict-nested-block': ('class A { m() { class B { n() { { return yield /a/ } } } { return yield /b/ } } }', 'fixture.js'),
+    'strict-nested-call': ('class A { m() { class B { n() { f(yield /a/) } } f(yield /b/) } }', 'fixture.js'),
+    'strict-close-template': 'strict-open-template',
+    'strict-close-regex': 'strict-open-regex',
+    'strict-close-block': 'strict-open-block',
+    'strict-close-call': 'strict-open-call',
+    'strict-mismatched-template': ('class A { m() { return `x ${yield /a/}` ] }', 'fixture.js'),
+    'strict-mismatched-regex': ('class A { m() { return yield /a/ ] }', 'fixture.js'),
+    'strict-mismatched-block': ('class A { m() { { return yield /a/ } ] }', 'fixture.js'),
+    'strict-mismatched-call': ('class A { m() { f(yield /a/) ] }', 'fixture.js'),
+    'strict-discard-template': ('class A { m() { return `x ${yield /a/}` } } function h() { return `y ${yield /b/}` }', 'fixture.js'),
+    'strict-discard-regex': ('class A { m() { return yield /a/ } } function h() { yield /b/ }', 'fixture.js'),
+    'strict-discard-block': ('class A { m() { { return yield /a/ } } } function h() { { yield /b/ } }', 'fixture.js'),
+    'strict-discard-call': ('class A { m() { f(yield /a/) } } function h() { f(yield /b/) }', 'fixture.js'),
+    'arrow-open-template': ('function* g() { const f = () => `x ${yield /a/}` }', 'fixture.js'),
+    'arrow-open-regex': ('function* g() { const f = () => yield /a/ }', 'fixture.js'),
+    'arrow-open-block': ('function* g() { const f = () => { yield /a/ } }', 'fixture.js'),
+    'arrow-open-call': ('function* g() { f(() => yield /a/) }', 'fixture.js'),
+    'arrow-nested-template': ('function* g() { f(x => [y => `x ${yield /a/}`]) }', 'fixture.js'),
+    'arrow-nested-regex': ('function* g() { f(x => [y => yield /a/]) }', 'fixture.js'),
+    'arrow-nested-block': ('function* g() { f(x => [y => (() => { return /a/ })()]) }', 'fixture.js'),
+    'arrow-nested-call': ('function* g() { f(x => h(y => yield /a/)) }', 'fixture.js'),
+    'arrow-close-template': ('const f = `x ${y => y}`', 'fixture.js'),
+    'arrow-close-regex': ('const f = [x => /a/]', 'fixture.js'),
+    'arrow-close-block': ('{ x => x }', 'fixture.js'),
+    'arrow-close-call': ('f(x => x)', 'fixture.js'),
+    'arrow-mismatched-template': ('const f = () => `x ${1}` ]', 'fixture.js'),
+    'arrow-mismatched-regex': ('const f = () => /a/ ]', 'fixture.js'),
+    'arrow-mismatched-block': ('const f = () => { const x = 1 ]', 'fixture.js'),
+    'arrow-mismatched-call': ('const f = () => f(1) ]', 'fixture.js'),
+    'arrow-discard-template': ('function* g() { const x = `x ${y => y}`; return `y ${yield /a/}` }', 'fixture.js'),
+    'arrow-discard-regex': ('function* g() { const x = [y => y]; return [yield /a/]; }', 'fixture.js'),
+    'arrow-discard-block': ('function* g() { { y => y }\n{ yield /a/ } }', 'fixture.js'),
+    'arrow-discard-call': ('function* g() { f(y => y); f(yield /a/) }', 'fixture.js'),
+    'for_head-open-template': ('function h() { return `x ${for (const a of /b/) {}}` }', 'fixture.js'),
+    'for_head-open-regex': ('for (const x of /a/) {}', 'fixture.js'),
+    'for_head-open-block': ('for (const x of /a/) { const z = 1 }', 'fixture.js'),
+    'for_head-open-call': ('for (const x of /a/) { f(1) }', 'fixture.js'),
+    'for_head-nested-template': ('for (const x of `x ${function () { for (const y of /b/) {} }}`) {}', 'fixture.js'),
+    'for_head-nested-regex': ('for (const x of (() => { for (const y of /b/) {} return /a/ })()) {}', 'fixture.js'),
+    'for_head-nested-block': ('for (const x of (() => { for (const y of /b/) { const z = 1 } return x })()) {}', 'fixture.js'),
+    'for_head-nested-call': ('for (const x of f(() => { for (const y of /b/) {} })) {}', 'fixture.js'),
+    'for_head-close-template': ('for (const x of `a`) {}', 'fixture.js'),
+    'for_head-close-regex': 'for_head-open-regex',
+    'for_head-close-block': 'for_head-open-block',
+    'for_head-close-call': 'for_head-open-call',
+    'for_head-mismatched-template': ('for (const x of `a`) ]', 'fixture.js'),
+    'for_head-mismatched-regex': ('for (const x of /a/ ]', 'fixture.js'),
+    'for_head-mismatched-block': ('for (const x of /a/) { ]', 'fixture.js'),
+    'for_head-mismatched-call': ('for (const x of /a/) { f(1) ]', 'fixture.js'),
+    'for_head-discard-template': ('for (const x of /a/) {} if (b of /c/) {}', 'fixture.js'),
+    'for_head-discard-regex': 'for_head-discard-template',
+    'for_head-discard-block': ('for (const x of /a/) { const z = 1 } if (b of /c/) {}', 'fixture.js'),
+    'for_head-discard-call': ('for (const x of /a/) { f(1) } if (b of /c/) {}', 'fixture.js'),
+    'type_literal-open-template': ('const a = b as { f: `x ${<T>() => 1}` }', 'fixture.tsx'),
+    'type_literal-open-regex': ('const a = b as { f: /a/, g: <T>() => 1 }', 'fixture.tsx'),
+    'type_literal-open-block': ('const a = b as { f: { g: <T>() => 1 } }', 'fixture.tsx'),
+    'type_literal-open-call': ('const a = b as { f: g(<T>() => 1) }', 'fixture.tsx'),
+    'type_literal-nested-template': ('const a = b as { f: c as { h: `x ${<T>() => 1}` } }', 'fixture.tsx'),
+    'type_literal-nested-regex': ('const a = b as { f: c as { g: /a/ }, h: <T>() => 1 }', 'fixture.tsx'),
+    'type_literal-nested-block': ('const a = b as { f: c as { g: { h: <T>() => 1 } } }', 'fixture.tsx'),
+    'type_literal-nested-call': ('const a = b as { f: c as { g: h(<T>() => 1) } }', 'fixture.tsx'),
+    'type_literal-close-template': ('const a = b as { f: `a` }; eval(code)', 'fixture.ts'),
+    'type_literal-close-regex': ('const a = b as { f: /a/ }; eval(code)', 'fixture.ts'),
+    'type_literal-close-block': ('const a = b as { f: { x: 1 } }; eval(code)', 'fixture.ts'),
+    'type_literal-close-call': ('const a = b as { f: g(1) }; eval(code)', 'fixture.ts'),
+    'type_literal-mismatched-template': ('const a = b as { f: `a` ]', 'fixture.ts'),
+    'type_literal-mismatched-regex': ('const a = b as { f: /a/ ]', 'fixture.ts'),
+    'type_literal-mismatched-block': ('const a = b as { f: { x: 1 } ]', 'fixture.ts'),
+    'type_literal-mismatched-call': ('const a = b as { f: g(1) ]', 'fixture.ts'),
+    'type_literal-discard-template': ('const a = b as { f: `a` }; const c = <A />', 'fixture.tsx'),
+    'type_literal-discard-regex': ('const a = b as { f: /a/ }; const c = <A />', 'fixture.tsx'),
+    'type_literal-discard-block': ('const a = b as { f: { x: 1 } }; const c = <A />', 'fixture.tsx'),
+    'type_literal-discard-call': ('const a = b as { f: g(1) }; const c = <A />', 'fixture.tsx'),
+}
+
+
+def _frame_outcome(tokenize, error_type, source, path, compact):
+    try:
+        return ('tokens', tokenize(source, path, compact=compact))
+    except error_type as exc:
+        return ('refusal', type(exc).__name__, exc.reason, exc.line, exc.offset,
+                exc.limit_bytes, exc.code, exc.message, exc.args, str(exc))
+
+
+@pytest.mark.parametrize('case', tuple(_FRAME_MATRIX))
+@pytest.mark.parametrize('compact', [False, True], ids=['default', 'compact'])
+def test_frame_depth_kind_matrix(case, compact):
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError, tokenize
+
+    row = _FRAME_MATRIX[case]
+    if isinstance(row, str):
+        case = row
+        row = _FRAME_MATRIX[case]
+    source, path = row
+    golden = _FRAME_GOLDEN_DEFAULT[case]
+    if compact:
+        golden = _FRAME_GOLDEN_COMPACT.get(case, golden)
+    assert _frame_outcome(tokenize, JSLexError, source, path, compact) == golden
+
+
+# Complete baseline results from 3015c09094f9559384aa96d9ebfcb22a23933172.
+# Compact rows absent from the second table match their default snapshot.
+_FRAME_GOLDEN_DEFAULT = {
+    'generator-open-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'return', 1, 16, 22, '', None), ('template_start', '`', 1, 23, 24, '', None),
+            ('template_text', 'x ', 1, 24, 26, '', None), ('punct', '${', 1, 26, 28, 'interpolation', None),
+            ('identifier', 'yield', 1, 28, 33, '', None), ('regex', '/a/', 1, 34, 37, '', None),
+            ('punct', '}', 1, 37, 38, 'interpolation', None), ('template_end', '`', 1, 38, 39, '', None),
+            ('punct', '}', 1, 40, 41, 'function_decl', None),
+        ],
+    ),
+    'generator-open-regex': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'yield', 1, 16, 21, '', None), ('regex', '/a/', 1, 22, 25, '', None),
+            ('punct', '}', 1, 26, 27, 'function_decl', None),
+        ],
+    ),
+    'generator-open-block': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('punct', '{', 1, 16, 17, 'block', None), ('identifier', 'yield', 1, 18, 23, '', None),
+            ('regex', '/a/', 1, 24, 27, '', None), ('punct', '}', 1, 28, 29, 'block', None),
+            ('punct', '}', 1, 30, 31, 'function_decl', None),
+        ],
+    ),
+    'generator-open-call': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'f', 1, 16, 17, '', None), ('punct', '(', 1, 17, 18, 'expression', None),
+            ('identifier', 'yield', 1, 18, 23, '', None), ('regex', '/a/', 1, 24, 27, '', None),
+            ('punct', ')', 1, 27, 28, 'expression', None), ('punct', '}', 1, 29, 30, 'function_decl', None),
+        ],
+    ),
+    'generator-nested-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'function', 1, 16, 24, '', None), ('punct', '*', 1, 24, 25, '', None),
+            ('identifier', 'h', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_decl', None),
+            ('punct', ')', 1, 28, 29, 'parameters_decl', None), ('punct', '{', 1, 30, 31, 'function_decl', None),
+            ('identifier', 'return', 1, 32, 38, '', None), ('template_start', '`', 1, 39, 40, '', None),
+            ('template_text', 'x ', 1, 40, 42, '', None), ('punct', '${', 1, 42, 44, 'interpolation', None),
+            ('identifier', 'yield', 1, 44, 49, '', None), ('regex', '/a/', 1, 50, 53, '', None),
+            ('punct', '}', 1, 53, 54, 'interpolation', None), ('template_end', '`', 1, 54, 55, '', None),
+            ('punct', '}', 1, 56, 57, 'function_decl', None), ('identifier', 'return', 1, 58, 64, '', None),
+            ('template_start', '`', 1, 65, 66, '', None), ('template_text', 'y ', 1, 66, 68, '', None),
+            ('punct', '${', 1, 68, 70, 'interpolation', None), ('identifier', 'yield', 1, 70, 75, '', None),
+            ('regex', '/b/', 1, 76, 79, '', None), ('punct', '}', 1, 79, 80, 'interpolation', None),
+            ('template_end', '`', 1, 80, 81, '', None), ('punct', '}', 1, 82, 83, 'function_decl', None),
+        ],
+    ),
+    'generator-nested-regex': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'function', 1, 16, 24, '', None), ('punct', '*', 1, 24, 25, '', None),
+            ('identifier', 'h', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_decl', None),
+            ('punct', ')', 1, 28, 29, 'parameters_decl', None), ('punct', '{', 1, 30, 31, 'function_decl', None),
+            ('identifier', 'yield', 1, 32, 37, '', None), ('regex', '/a/', 1, 38, 41, '', None),
+            ('punct', '}', 1, 42, 43, 'function_decl', None), ('identifier', 'yield', 1, 44, 49, '', None),
+            ('regex', '/b/', 1, 50, 53, '', None), ('punct', '}', 1, 54, 55, 'function_decl', None),
+        ],
+    ),
+    'generator-nested-block': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'function', 1, 16, 24, '', None), ('punct', '*', 1, 24, 25, '', None),
+            ('identifier', 'h', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_decl', None),
+            ('punct', ')', 1, 28, 29, 'parameters_decl', None), ('punct', '{', 1, 30, 31, 'function_decl', None),
+            ('punct', '{', 1, 32, 33, 'block', None), ('identifier', 'yield', 1, 34, 39, '', None),
+            ('regex', '/a/', 1, 40, 43, '', None), ('punct', '}', 1, 44, 45, 'block', None),
+            ('punct', '}', 1, 46, 47, 'function_decl', None), ('punct', '{', 1, 48, 49, 'block', None),
+            ('identifier', 'yield', 1, 50, 55, '', None), ('regex', '/b/', 1, 56, 59, '', None),
+            ('punct', '}', 1, 60, 61, 'block', None), ('punct', '}', 1, 62, 63, 'function_decl', None),
+        ],
+    ),
+    'generator-nested-call': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'function', 1, 16, 24, '', None), ('punct', '*', 1, 24, 25, '', None),
+            ('identifier', 'h', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_decl', None),
+            ('punct', ')', 1, 28, 29, 'parameters_decl', None), ('punct', '{', 1, 30, 31, 'function_decl', None),
+            ('identifier', 'f', 1, 32, 33, '', None), ('punct', '(', 1, 33, 34, 'expression', None),
+            ('identifier', 'yield', 1, 34, 39, '', None), ('regex', '/a/', 1, 40, 43, '', None),
+            ('punct', ')', 1, 43, 44, 'expression', None), ('punct', '}', 1, 45, 46, 'function_decl', None),
+            ('identifier', 'f', 1, 47, 48, '', None), ('punct', '(', 1, 48, 49, 'expression', None),
+            ('identifier', 'yield', 1, 49, 54, '', None), ('regex', '/b/', 1, 55, 58, '', None),
+            ('punct', ')', 1, 58, 59, 'expression', None), ('punct', '}', 1, 60, 61, 'function_decl', None),
+        ],
+    ),
+    'generator-mismatched-template': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 40,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 40',
+        ('syntax:unbalanced_delimiter at line 1, offset 40',), 'syntax:unbalanced_delimiter at line 1, offset 40',
+    ),
+    'generator-mismatched-regex': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 26,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 26',
+        ('syntax:unbalanced_delimiter at line 1, offset 26',), 'syntax:unbalanced_delimiter at line 1, offset 26',
+    ),
+    'generator-mismatched-block': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 30,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 30',
+        ('syntax:unbalanced_delimiter at line 1, offset 30',), 'syntax:unbalanced_delimiter at line 1, offset 30',
+    ),
+    'generator-mismatched-call': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 29,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 29',
+        ('syntax:unbalanced_delimiter at line 1, offset 29',), 'syntax:unbalanced_delimiter at line 1, offset 29',
+    ),
+    'generator-discard-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 75,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 75',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 75',), 'unsupported_lexical_context:contextual_yield at line 1, offset 75',
+    ),
+    'generator-discard-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 49,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 49',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 49',), 'unsupported_lexical_context:contextual_yield at line 1, offset 49',
+    ),
+    'generator-discard-block': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 55,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 55',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 55',), 'unsupported_lexical_context:contextual_yield at line 1, offset 55',
+    ),
+    'generator-discard-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 54,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 54',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 54',), 'unsupported_lexical_context:contextual_yield at line 1, offset 54',
+    ),
+    'strict-open-template': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'return', 1, 16, 22, '', None),
+            ('template_start', '`', 1, 23, 24, '', None), ('template_text', 'x ', 1, 24, 26, '', None),
+            ('punct', '${', 1, 26, 28, 'interpolation', None), ('identifier', 'yield', 1, 28, 33, '', None),
+            ('regex', '/a/', 1, 34, 37, '', None), ('punct', '}', 1, 37, 38, 'interpolation', None),
+            ('template_end', '`', 1, 38, 39, '', None), ('punct', '}', 1, 40, 41, 'function_expr', None),
+            ('punct', '}', 1, 42, 43, 'class_decl', None),
+        ],
+    ),
+    'strict-open-regex': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'return', 1, 16, 22, '', None),
+            ('identifier', 'yield', 1, 23, 28, '', None), ('regex', '/a/', 1, 29, 32, '', None),
+            ('punct', '}', 1, 33, 34, 'function_expr', None), ('punct', '}', 1, 35, 36, 'class_decl', None),
+        ],
+    ),
+    'strict-open-block': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('punct', '{', 1, 16, 17, 'block', None),
+            ('identifier', 'return', 1, 18, 24, '', None), ('identifier', 'yield', 1, 25, 30, '', None),
+            ('regex', '/a/', 1, 31, 34, '', None), ('punct', '}', 1, 35, 36, 'block', None),
+            ('punct', '}', 1, 37, 38, 'function_expr', None), ('punct', '}', 1, 39, 40, 'class_decl', None),
+        ],
+    ),
+    'strict-open-call': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'f', 1, 16, 17, '', None),
+            ('punct', '(', 1, 17, 18, 'expression', None), ('identifier', 'yield', 1, 18, 23, '', None),
+            ('regex', '/a/', 1, 24, 27, '', None), ('punct', ')', 1, 27, 28, 'expression', None),
+            ('punct', '}', 1, 29, 30, 'function_expr', None), ('punct', '}', 1, 31, 32, 'class_decl', None),
+        ],
+    ),
+    'strict-nested-template': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'class', 1, 16, 21, '', None),
+            ('identifier', 'B', 1, 22, 23, '', None), ('punct', '{', 1, 24, 25, 'class_decl', None),
+            ('identifier', 'n', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_method', None),
+            ('punct', ')', 1, 28, 29, 'parameters_method', None), ('punct', '{', 1, 30, 31, 'function_expr', None),
+            ('identifier', 'return', 1, 32, 38, '', None), ('template_start', '`', 1, 39, 40, '', None),
+            ('template_text', 'x ', 1, 40, 42, '', None), ('punct', '${', 1, 42, 44, 'interpolation', None),
+            ('identifier', 'yield', 1, 44, 49, '', None), ('regex', '/a/', 1, 50, 53, '', None),
+            ('punct', '}', 1, 53, 54, 'interpolation', None), ('template_end', '`', 1, 54, 55, '', None),
+            ('punct', '}', 1, 56, 57, 'function_expr', None), ('punct', '}', 1, 58, 59, 'class_decl', None),
+            ('identifier', 'return', 1, 60, 66, '', None), ('template_start', '`', 1, 67, 68, '', None),
+            ('template_text', 'y ', 1, 68, 70, '', None), ('punct', '${', 1, 70, 72, 'interpolation', None),
+            ('identifier', 'yield', 1, 72, 77, '', None), ('regex', '/b/', 1, 78, 81, '', None),
+            ('punct', '}', 1, 81, 82, 'interpolation', None), ('template_end', '`', 1, 82, 83, '', None),
+            ('punct', '}', 1, 84, 85, 'function_expr', None), ('punct', '}', 1, 86, 87, 'class_decl', None),
+        ],
+    ),
+    'strict-nested-regex': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'class', 1, 16, 21, '', None),
+            ('identifier', 'B', 1, 22, 23, '', None), ('punct', '{', 1, 24, 25, 'class_decl', None),
+            ('identifier', 'n', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_method', None),
+            ('punct', ')', 1, 28, 29, 'parameters_method', None), ('punct', '{', 1, 30, 31, 'function_expr', None),
+            ('identifier', 'return', 1, 32, 38, '', None), ('identifier', 'yield', 1, 39, 44, '', None),
+            ('regex', '/a/', 1, 45, 48, '', None), ('punct', '}', 1, 49, 50, 'function_expr', None),
+            ('punct', '}', 1, 51, 52, 'class_decl', None), ('identifier', 'return', 1, 53, 59, '', None),
+            ('identifier', 'yield', 1, 60, 65, '', None), ('regex', '/b/', 1, 66, 69, '', None),
+            ('punct', '}', 1, 70, 71, 'function_expr', None), ('punct', '}', 1, 72, 73, 'class_decl', None),
+        ],
+    ),
+    'strict-nested-block': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'class', 1, 16, 21, '', None),
+            ('identifier', 'B', 1, 22, 23, '', None), ('punct', '{', 1, 24, 25, 'class_decl', None),
+            ('identifier', 'n', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_method', None),
+            ('punct', ')', 1, 28, 29, 'parameters_method', None), ('punct', '{', 1, 30, 31, 'function_expr', None),
+            ('punct', '{', 1, 32, 33, 'block', None), ('identifier', 'return', 1, 34, 40, '', None),
+            ('identifier', 'yield', 1, 41, 46, '', None), ('regex', '/a/', 1, 47, 50, '', None),
+            ('punct', '}', 1, 51, 52, 'block', None), ('punct', '}', 1, 53, 54, 'function_expr', None),
+            ('punct', '}', 1, 55, 56, 'class_decl', None), ('punct', '{', 1, 57, 58, 'block', None),
+            ('identifier', 'return', 1, 59, 65, '', None), ('identifier', 'yield', 1, 66, 71, '', None),
+            ('regex', '/b/', 1, 72, 75, '', None), ('punct', '}', 1, 76, 77, 'block', None),
+            ('punct', '}', 1, 78, 79, 'function_expr', None), ('punct', '}', 1, 80, 81, 'class_decl', None),
+        ],
+    ),
+    'strict-nested-call': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'class', 1, 16, 21, '', None),
+            ('identifier', 'B', 1, 22, 23, '', None), ('punct', '{', 1, 24, 25, 'class_decl', None),
+            ('identifier', 'n', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_method', None),
+            ('punct', ')', 1, 28, 29, 'parameters_method', None), ('punct', '{', 1, 30, 31, 'function_expr', None),
+            ('identifier', 'f', 1, 32, 33, '', None), ('punct', '(', 1, 33, 34, 'expression', None),
+            ('identifier', 'yield', 1, 34, 39, '', None), ('regex', '/a/', 1, 40, 43, '', None),
+            ('punct', ')', 1, 43, 44, 'expression', None), ('punct', '}', 1, 45, 46, 'function_expr', None),
+            ('punct', '}', 1, 47, 48, 'class_decl', None), ('identifier', 'f', 1, 49, 50, '', None),
+            ('punct', '(', 1, 50, 51, 'expression', None), ('identifier', 'yield', 1, 51, 56, '', None),
+            ('regex', '/b/', 1, 57, 60, '', None), ('punct', ')', 1, 60, 61, 'expression', None),
+            ('punct', '}', 1, 62, 63, 'function_expr', None), ('punct', '}', 1, 64, 65, 'class_decl', None),
+        ],
+    ),
+    'strict-mismatched-template': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 40,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 40',
+        ('syntax:unbalanced_delimiter at line 1, offset 40',), 'syntax:unbalanced_delimiter at line 1, offset 40',
+    ),
+    'strict-mismatched-regex': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 33,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 33',
+        ('syntax:unbalanced_delimiter at line 1, offset 33',), 'syntax:unbalanced_delimiter at line 1, offset 33',
+    ),
+    'strict-mismatched-block': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 37,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 37',
+        ('syntax:unbalanced_delimiter at line 1, offset 37',), 'syntax:unbalanced_delimiter at line 1, offset 37',
+    ),
+    'strict-mismatched-call': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 29,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 29',
+        ('syntax:unbalanced_delimiter at line 1, offset 29',), 'syntax:unbalanced_delimiter at line 1, offset 29',
+    ),
+    'strict-discard-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 77,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 77',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 77',), 'unsupported_lexical_context:contextual_yield at line 1, offset 77',
+    ),
+    'strict-discard-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 58,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 58',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 58',), 'unsupported_lexical_context:contextual_yield at line 1, offset 58',
+    ),
+    'strict-discard-block': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 64,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 64',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 64',), 'unsupported_lexical_context:contextual_yield at line 1, offset 64',
+    ),
+    'strict-discard-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 56,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 56',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 56',), 'unsupported_lexical_context:contextual_yield at line 1, offset 56',
+    ),
+    'arrow-open-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 43,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 43',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 43',), 'unsupported_lexical_context:contextual_yield at line 1, offset 43',
+    ),
+    'arrow-open-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 38,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 38',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 38',), 'unsupported_lexical_context:contextual_yield at line 1, offset 38',
+    ),
+    'arrow-open-block': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 40,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 40',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 40',), 'unsupported_lexical_context:contextual_yield at line 1, offset 40',
+    ),
+    'arrow-open-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 30,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 30',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 30',), 'unsupported_lexical_context:contextual_yield at line 1, offset 30',
+    ),
+    'arrow-nested-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 40,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 40',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 40',), 'unsupported_lexical_context:contextual_yield at line 1, offset 40',
+    ),
+    'arrow-nested-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 35,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 35',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 35',), 'unsupported_lexical_context:contextual_yield at line 1, offset 35',
+    ),
+    'arrow-nested-block': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'f', 1, 16, 17, '', None), ('punct', '(', 1, 17, 18, 'expression', None),
+            ('identifier', 'x', 1, 18, 19, '', None), ('punct', '=>', 1, 20, 22, '', None),
+            ('punct', '[', 1, 23, 24, 'array', None), ('identifier', 'y', 1, 24, 25, '', None),
+            ('punct', '=>', 1, 26, 28, '', None), ('punct', '(', 1, 29, 30, 'expression', None),
+            ('punct', '(', 1, 30, 31, 'expression', None), ('punct', ')', 1, 31, 32, 'expression', None),
+            ('punct', '=>', 1, 33, 35, '', None), ('punct', '{', 1, 36, 37, 'function_arrow', None),
+            ('identifier', 'return', 1, 38, 44, '', None), ('regex', '/a/', 1, 45, 48, '', None),
+            ('punct', '}', 1, 49, 50, 'function_arrow', None), ('punct', ')', 1, 50, 51, 'expression', None),
+            ('punct', '(', 1, 51, 52, 'expression', None), ('punct', ')', 1, 52, 53, 'expression', None),
+            ('punct', ']', 1, 53, 54, 'array', None), ('punct', ')', 1, 54, 55, 'expression', None),
+            ('punct', '}', 1, 56, 57, 'function_decl', None),
+        ],
+    ),
+    'arrow-nested-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:contextual_yield', 1, 36,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:contextual_yield at line 1, offset 36',
+        ('unsupported_lexical_context:contextual_yield at line 1, offset 36',), 'unsupported_lexical_context:contextual_yield at line 1, offset 36',
+    ),
+    'arrow-close-template': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'f', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('template_start', '`', 1, 10, 11, '', None),
+            ('template_text', 'x ', 1, 11, 13, '', None), ('punct', '${', 1, 13, 15, 'interpolation', None),
+            ('identifier', 'y', 1, 15, 16, '', None), ('punct', '=>', 1, 17, 19, '', None),
+            ('identifier', 'y', 1, 20, 21, '', None), ('punct', '}', 1, 21, 22, 'interpolation', None),
+            ('template_end', '`', 1, 22, 23, '', None),
+        ],
+    ),
+    'arrow-close-regex': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'f', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('punct', '[', 1, 10, 11, 'array', None),
+            ('identifier', 'x', 1, 11, 12, '', None), ('punct', '=>', 1, 13, 15, '', None),
+            ('regex', '/a/', 1, 16, 19, '', None), ('punct', ']', 1, 19, 20, 'array', None),
+        ],
+    ),
+    'arrow-close-block': (
+        'tokens', [
+            ('punct', '{', 1, 0, 1, 'block', None), ('identifier', 'x', 1, 2, 3, '', None),
+            ('punct', '=>', 1, 4, 6, '', None), ('identifier', 'x', 1, 7, 8, '', None),
+            ('punct', '}', 1, 9, 10, 'block', None),
+        ],
+    ),
+    'arrow-close-call': (
+        'tokens', [
+            ('identifier', 'f', 1, 0, 1, '', None), ('punct', '(', 1, 1, 2, 'expression', None),
+            ('identifier', 'x', 1, 2, 3, '', None), ('punct', '=>', 1, 4, 6, '', None),
+            ('identifier', 'x', 1, 7, 8, '', None), ('punct', ')', 1, 8, 9, 'expression', None),
+        ],
+    ),
+    'arrow-mismatched-template': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 25,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 25',
+        ('syntax:unbalanced_delimiter at line 1, offset 25',), 'syntax:unbalanced_delimiter at line 1, offset 25',
+    ),
+    'arrow-mismatched-regex': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 20,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 20',
+        ('syntax:unbalanced_delimiter at line 1, offset 20',), 'syntax:unbalanced_delimiter at line 1, offset 20',
+    ),
+    'arrow-mismatched-block': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 30,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 30',
+        ('syntax:unbalanced_delimiter at line 1, offset 30',), 'syntax:unbalanced_delimiter at line 1, offset 30',
+    ),
+    'arrow-mismatched-call': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 21,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 21',
+        ('syntax:unbalanced_delimiter at line 1, offset 21',), 'syntax:unbalanced_delimiter at line 1, offset 21',
+    ),
+    'arrow-discard-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'const', 1, 16, 21, '', None), ('identifier', 'x', 1, 22, 23, '', None),
+            ('punct', '=', 1, 24, 25, '', None), ('template_start', '`', 1, 26, 27, '', None),
+            ('template_text', 'x ', 1, 27, 29, '', None), ('punct', '${', 1, 29, 31, 'interpolation', None),
+            ('identifier', 'y', 1, 31, 32, '', None), ('punct', '=>', 1, 33, 35, '', None),
+            ('identifier', 'y', 1, 36, 37, '', None), ('punct', '}', 1, 37, 38, 'interpolation', None),
+            ('template_end', '`', 1, 38, 39, '', None), ('punct', ';', 1, 39, 40, '', None),
+            ('identifier', 'return', 1, 41, 47, '', None), ('template_start', '`', 1, 48, 49, '', None),
+            ('template_text', 'y ', 1, 49, 51, '', None), ('punct', '${', 1, 51, 53, 'interpolation', None),
+            ('identifier', 'yield', 1, 53, 58, '', None), ('regex', '/a/', 1, 59, 62, '', None),
+            ('punct', '}', 1, 62, 63, 'interpolation', None), ('template_end', '`', 1, 63, 64, '', None),
+            ('punct', '}', 1, 65, 66, 'function_decl', None),
+        ],
+    ),
+    'arrow-discard-regex': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'const', 1, 16, 21, '', None), ('identifier', 'x', 1, 22, 23, '', None),
+            ('punct', '=', 1, 24, 25, '', None), ('punct', '[', 1, 26, 27, 'array', None),
+            ('identifier', 'y', 1, 27, 28, '', None), ('punct', '=>', 1, 29, 31, '', None),
+            ('identifier', 'y', 1, 32, 33, '', None), ('punct', ']', 1, 33, 34, 'array', None),
+            ('punct', ';', 1, 34, 35, '', None), ('identifier', 'return', 1, 36, 42, '', None),
+            ('punct', '[', 1, 43, 44, 'array', None), ('identifier', 'yield', 1, 44, 49, '', None),
+            ('regex', '/a/', 1, 50, 53, '', None), ('punct', ']', 1, 53, 54, 'array', None),
+            ('punct', ';', 1, 54, 55, '', None), ('punct', '}', 1, 56, 57, 'function_decl', None),
+        ],
+    ),
+    'arrow-discard-block': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('punct', '{', 1, 16, 17, 'block', None), ('identifier', 'y', 1, 18, 19, '', None),
+            ('punct', '=>', 1, 20, 22, '', None), ('identifier', 'y', 1, 23, 24, '', None),
+            ('punct', '}', 1, 25, 26, 'block', None), ('punct', '{', 2, 27, 28, 'block', None),
+            ('identifier', 'yield', 2, 29, 34, '', None), ('regex', '/a/', 2, 35, 38, '', None),
+            ('punct', '}', 2, 39, 40, 'block', None), ('punct', '}', 2, 41, 42, 'function_decl', None),
+        ],
+    ),
+    'arrow-discard-call': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'f', 1, 16, 17, '', None), ('punct', '(', 1, 17, 18, 'expression', None),
+            ('identifier', 'y', 1, 18, 19, '', None), ('punct', '=>', 1, 20, 22, '', None),
+            ('identifier', 'y', 1, 23, 24, '', None), ('punct', ')', 1, 24, 25, 'expression', None),
+            ('punct', ';', 1, 25, 26, '', None), ('identifier', 'f', 1, 27, 28, '', None),
+            ('punct', '(', 1, 28, 29, 'expression', None), ('identifier', 'yield', 1, 29, 34, '', None),
+            ('regex', '/a/', 1, 35, 38, '', None), ('punct', ')', 1, 38, 39, 'expression', None),
+            ('punct', '}', 1, 40, 41, 'function_decl', None),
+        ],
+    ),
+    'for_head-open-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('identifier', 'h', 1, 9, 10, '', None),
+            ('punct', '(', 1, 10, 11, 'parameters_decl', None), ('punct', ')', 1, 11, 12, 'parameters_decl', None),
+            ('punct', '{', 1, 13, 14, 'function_decl', None), ('identifier', 'return', 1, 15, 21, '', None),
+            ('template_start', '`', 1, 22, 23, '', None), ('template_text', 'x ', 1, 23, 25, '', None),
+            ('punct', '${', 1, 25, 27, 'interpolation', None), ('identifier', 'for', 1, 27, 30, '', None),
+            ('punct', '(', 1, 31, 32, 'control', None), ('identifier', 'const', 1, 32, 37, '', None),
+            ('identifier', 'a', 1, 38, 39, '', None), ('identifier', 'of', 1, 40, 42, '', None),
+            ('regex', '/b/', 1, 43, 46, '', None), ('punct', ')', 1, 46, 47, 'control', None),
+            ('punct', '{', 1, 48, 49, 'block', None), ('punct', '}', 1, 49, 50, 'block', None),
+            ('punct', '}', 1, 50, 51, 'interpolation', None), ('template_end', '`', 1, 51, 52, '', None),
+            ('punct', '}', 1, 53, 54, 'function_decl', None),
+        ],
+    ),
+    'for_head-open-regex': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('punct', '}', 1, 22, 23, 'block', None),
+        ],
+    ),
+    'for_head-open-block': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('identifier', 'const', 1, 23, 28, '', None), ('identifier', 'z', 1, 29, 30, '', None),
+            ('punct', '=', 1, 31, 32, '', None), ('number', '1', 1, 33, 34, '', None),
+            ('punct', '}', 1, 35, 36, 'block', None),
+        ],
+    ),
+    'for_head-open-call': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('identifier', 'f', 1, 23, 24, '', None), ('punct', '(', 1, 24, 25, 'expression', None),
+            ('number', '1', 1, 25, 26, '', None), ('punct', ')', 1, 26, 27, 'expression', None),
+            ('punct', '}', 1, 28, 29, 'block', None),
+        ],
+    ),
+    'for_head-nested-template': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('template_start', '`', 1, 16, 17, '', None),
+            ('template_text', 'x ', 1, 17, 19, '', None), ('punct', '${', 1, 19, 21, 'interpolation', None),
+            ('identifier', 'function', 1, 21, 29, '', None), ('punct', '(', 1, 30, 31, 'parameters_expr', None),
+            ('punct', ')', 1, 31, 32, 'parameters_expr', None), ('punct', '{', 1, 33, 34, 'function_expr', None),
+            ('identifier', 'for', 1, 35, 38, '', None), ('punct', '(', 1, 39, 40, 'control', None),
+            ('identifier', 'const', 1, 40, 45, '', None), ('identifier', 'y', 1, 46, 47, '', None),
+            ('identifier', 'of', 1, 48, 50, '', None), ('regex', '/b/', 1, 51, 54, '', None),
+            ('punct', ')', 1, 54, 55, 'control', None), ('punct', '{', 1, 56, 57, 'block', None),
+            ('punct', '}', 1, 57, 58, 'block', None), ('punct', '}', 1, 59, 60, 'function_expr', None),
+            ('punct', '}', 1, 60, 61, 'interpolation', None), ('template_end', '`', 1, 61, 62, '', None),
+            ('punct', ')', 1, 62, 63, 'control', None), ('punct', '{', 1, 64, 65, 'block', None),
+            ('punct', '}', 1, 65, 66, 'block', None),
+        ],
+    ),
+    'for_head-nested-regex': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('punct', '(', 1, 16, 17, 'expression', None),
+            ('punct', '(', 1, 17, 18, 'expression', None), ('punct', ')', 1, 18, 19, 'expression', None),
+            ('punct', '=>', 1, 20, 22, '', None), ('punct', '{', 1, 23, 24, 'function_arrow', None),
+            ('identifier', 'for', 1, 25, 28, '', None), ('punct', '(', 1, 29, 30, 'control', None),
+            ('identifier', 'const', 1, 30, 35, '', None), ('identifier', 'y', 1, 36, 37, '', None),
+            ('identifier', 'of', 1, 38, 40, '', None), ('regex', '/b/', 1, 41, 44, '', None),
+            ('punct', ')', 1, 44, 45, 'control', None), ('punct', '{', 1, 46, 47, 'block', None),
+            ('punct', '}', 1, 47, 48, 'block', None), ('identifier', 'return', 1, 49, 55, '', None),
+            ('regex', '/a/', 1, 56, 59, '', None), ('punct', '}', 1, 60, 61, 'function_arrow', None),
+            ('punct', ')', 1, 61, 62, 'expression', None), ('punct', '(', 1, 62, 63, 'expression', None),
+            ('punct', ')', 1, 63, 64, 'expression', None), ('punct', ')', 1, 64, 65, 'control', None),
+            ('punct', '{', 1, 66, 67, 'block', None), ('punct', '}', 1, 67, 68, 'block', None),
+        ],
+    ),
+    'for_head-nested-block': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('punct', '(', 1, 16, 17, 'expression', None),
+            ('punct', '(', 1, 17, 18, 'expression', None), ('punct', ')', 1, 18, 19, 'expression', None),
+            ('punct', '=>', 1, 20, 22, '', None), ('punct', '{', 1, 23, 24, 'function_arrow', None),
+            ('identifier', 'for', 1, 25, 28, '', None), ('punct', '(', 1, 29, 30, 'control', None),
+            ('identifier', 'const', 1, 30, 35, '', None), ('identifier', 'y', 1, 36, 37, '', None),
+            ('identifier', 'of', 1, 38, 40, '', None), ('regex', '/b/', 1, 41, 44, '', None),
+            ('punct', ')', 1, 44, 45, 'control', None), ('punct', '{', 1, 46, 47, 'block', None),
+            ('identifier', 'const', 1, 48, 53, '', None), ('identifier', 'z', 1, 54, 55, '', None),
+            ('punct', '=', 1, 56, 57, '', None), ('number', '1', 1, 58, 59, '', None),
+            ('punct', '}', 1, 60, 61, 'block', None), ('identifier', 'return', 1, 62, 68, '', None),
+            ('identifier', 'x', 1, 69, 70, '', None), ('punct', '}', 1, 71, 72, 'function_arrow', None),
+            ('punct', ')', 1, 72, 73, 'expression', None), ('punct', '(', 1, 73, 74, 'expression', None),
+            ('punct', ')', 1, 74, 75, 'expression', None), ('punct', ')', 1, 75, 76, 'control', None),
+            ('punct', '{', 1, 77, 78, 'block', None), ('punct', '}', 1, 78, 79, 'block', None),
+        ],
+    ),
+    'for_head-nested-call': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('identifier', 'f', 1, 16, 17, '', None),
+            ('punct', '(', 1, 17, 18, 'expression', None), ('punct', '(', 1, 18, 19, 'expression', None),
+            ('punct', ')', 1, 19, 20, 'expression', None), ('punct', '=>', 1, 21, 23, '', None),
+            ('punct', '{', 1, 24, 25, 'function_arrow', None), ('identifier', 'for', 1, 26, 29, '', None),
+            ('punct', '(', 1, 30, 31, 'control', None), ('identifier', 'const', 1, 31, 36, '', None),
+            ('identifier', 'y', 1, 37, 38, '', None), ('identifier', 'of', 1, 39, 41, '', None),
+            ('regex', '/b/', 1, 42, 45, '', None), ('punct', ')', 1, 45, 46, 'control', None),
+            ('punct', '{', 1, 47, 48, 'block', None), ('punct', '}', 1, 48, 49, 'block', None),
+            ('punct', '}', 1, 50, 51, 'function_arrow', None), ('punct', ')', 1, 51, 52, 'expression', None),
+            ('punct', ')', 1, 52, 53, 'control', None), ('punct', '{', 1, 54, 55, 'block', None),
+            ('punct', '}', 1, 55, 56, 'block', None),
+        ],
+    ),
+    'for_head-close-template': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('template_start', '`', 1, 16, 17, '', None),
+            ('template_text', 'a', 1, 17, 18, '', None), ('template_end', '`', 1, 18, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('punct', '}', 1, 22, 23, 'block', None),
+        ],
+    ),
+    'for_head-mismatched-template': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 21,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 21',
+        ('syntax:unbalanced_delimiter at line 1, offset 21',), 'syntax:unbalanced_delimiter at line 1, offset 21',
+    ),
+    'for_head-mismatched-regex': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 20,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 20',
+        ('syntax:unbalanced_delimiter at line 1, offset 20',), 'syntax:unbalanced_delimiter at line 1, offset 20',
+    ),
+    'for_head-mismatched-block': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 23,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 23',
+        ('syntax:unbalanced_delimiter at line 1, offset 23',), 'syntax:unbalanced_delimiter at line 1, offset 23',
+    ),
+    'for_head-mismatched-call': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 28,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 28',
+        ('syntax:unbalanced_delimiter at line 1, offset 28',), 'syntax:unbalanced_delimiter at line 1, offset 28',
+    ),
+    'for_head-discard-template': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('punct', '}', 1, 22, 23, 'block', None), ('identifier', 'if', 1, 24, 26, '', None),
+            ('punct', '(', 1, 27, 28, 'control', None), ('identifier', 'b', 1, 28, 29, '', None),
+            ('identifier', 'of', 1, 30, 32, '', None), ('punct', '/', 1, 33, 34, '', None),
+            ('identifier', 'c', 1, 34, 35, '', None), ('punct', '/', 1, 35, 36, '', None),
+            ('punct', ')', 1, 36, 37, 'control', None), ('punct', '{', 1, 38, 39, 'block', None),
+            ('punct', '}', 1, 39, 40, 'block', None),
+        ],
+    ),
+    'for_head-discard-block': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('identifier', 'const', 1, 23, 28, '', None), ('identifier', 'z', 1, 29, 30, '', None),
+            ('punct', '=', 1, 31, 32, '', None), ('number', '1', 1, 33, 34, '', None),
+            ('punct', '}', 1, 35, 36, 'block', None), ('identifier', 'if', 1, 37, 39, '', None),
+            ('punct', '(', 1, 40, 41, 'control', None), ('identifier', 'b', 1, 41, 42, '', None),
+            ('identifier', 'of', 1, 43, 45, '', None), ('punct', '/', 1, 46, 47, '', None),
+            ('identifier', 'c', 1, 47, 48, '', None), ('punct', '/', 1, 48, 49, '', None),
+            ('punct', ')', 1, 49, 50, 'control', None), ('punct', '{', 1, 51, 52, 'block', None),
+            ('punct', '}', 1, 52, 53, 'block', None),
+        ],
+    ),
+    'for_head-discard-call': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('regex', '/a/', 1, 16, 19, '', None),
+            ('punct', ')', 1, 19, 20, 'control', None), ('punct', '{', 1, 21, 22, 'block', None),
+            ('identifier', 'f', 1, 23, 24, '', None), ('punct', '(', 1, 24, 25, 'expression', None),
+            ('number', '1', 1, 25, 26, '', None), ('punct', ')', 1, 26, 27, 'expression', None),
+            ('punct', '}', 1, 28, 29, 'block', None), ('identifier', 'if', 1, 30, 32, '', None),
+            ('punct', '(', 1, 33, 34, 'control', None), ('identifier', 'b', 1, 34, 35, '', None),
+            ('identifier', 'of', 1, 36, 38, '', None), ('punct', '/', 1, 39, 40, '', None),
+            ('identifier', 'c', 1, 40, 41, '', None), ('punct', '/', 1, 41, 42, '', None),
+            ('punct', ')', 1, 42, 43, 'control', None), ('punct', '{', 1, 44, 45, 'block', None),
+            ('punct', '}', 1, 45, 46, 'block', None),
+        ],
+    ),
+    'type_literal-open-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 25,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',
+    ),
+    'type_literal-open-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 28,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 28',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 28',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 28',
+    ),
+    'type_literal-open-block': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 25,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 25',
+    ),
+    'type_literal-open-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 22,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 22',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 22',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 22',
+    ),
+    'type_literal-nested-template': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 35,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',
+    ),
+    'type_literal-nested-regex': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 40,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 40',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 40',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 40',
+    ),
+    'type_literal-nested-block': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 35,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 35',
+    ),
+    'type_literal-nested-call': (
+        'refusal', 'JSLexError', 'unsupported_lexical_context:tsx_type_literal_angle', 1, 32,
+        None, 'ERR_AEGIS', 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 32',
+        ('unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 32',), 'unsupported_lexical_context:tsx_type_literal_angle at line 1, offset 32',
+    ),
+    'type_literal-close-template': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('template_start', '`', 1, 20, 21, '', None), ('template_text', 'a', 1, 21, 22, '', None),
+            ('template_end', '`', 1, 22, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('identifier', 'eval', 1, 27, 31, '', None),
+            ('punct', '(', 1, 31, 32, 'expression', None), ('identifier', 'code', 1, 32, 36, '', None),
+            ('punct', ')', 1, 36, 37, 'expression', None),
+        ],
+    ),
+    'type_literal-close-regex': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('regex', '/a/', 1, 20, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('identifier', 'eval', 1, 27, 31, '', None),
+            ('punct', '(', 1, 31, 32, 'expression', None), ('identifier', 'code', 1, 32, 36, '', None),
+            ('punct', ')', 1, 36, 37, 'expression', None),
+        ],
+    ),
+    'type_literal-close-block': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('punct', '{', 1, 20, 21, 'object', None), ('identifier', 'x', 1, 22, 23, '', None),
+            ('punct', ':', 1, 23, 24, '', None), ('number', '1', 1, 25, 26, '', None),
+            ('punct', '}', 1, 27, 28, 'object', None), ('punct', '}', 1, 29, 30, 'object', None),
+            ('punct', ';', 1, 30, 31, '', None), ('identifier', 'eval', 1, 32, 36, '', None),
+            ('punct', '(', 1, 36, 37, 'expression', None), ('identifier', 'code', 1, 37, 41, '', None),
+            ('punct', ')', 1, 41, 42, 'expression', None),
+        ],
+    ),
+    'type_literal-close-call': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('identifier', 'g', 1, 20, 21, '', None), ('punct', '(', 1, 21, 22, 'expression', None),
+            ('number', '1', 1, 22, 23, '', None), ('punct', ')', 1, 23, 24, 'expression', None),
+            ('punct', '}', 1, 25, 26, 'object', None), ('punct', ';', 1, 26, 27, '', None),
+            ('identifier', 'eval', 1, 28, 32, '', None), ('punct', '(', 1, 32, 33, 'expression', None),
+            ('identifier', 'code', 1, 33, 37, '', None), ('punct', ')', 1, 37, 38, 'expression', None),
+        ],
+    ),
+    'type_literal-mismatched-template': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 24,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 24',
+        ('syntax:unbalanced_delimiter at line 1, offset 24',), 'syntax:unbalanced_delimiter at line 1, offset 24',
+    ),
+    'type_literal-mismatched-regex': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 24,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 24',
+        ('syntax:unbalanced_delimiter at line 1, offset 24',), 'syntax:unbalanced_delimiter at line 1, offset 24',
+    ),
+    'type_literal-mismatched-block': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 29,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 29',
+        ('syntax:unbalanced_delimiter at line 1, offset 29',), 'syntax:unbalanced_delimiter at line 1, offset 29',
+    ),
+    'type_literal-mismatched-call': (
+        'refusal', 'JSLexError', 'syntax:unbalanced_delimiter', 1, 25,
+        None, 'ERR_AEGIS', 'syntax:unbalanced_delimiter at line 1, offset 25',
+        ('syntax:unbalanced_delimiter at line 1, offset 25',), 'syntax:unbalanced_delimiter at line 1, offset 25',
+    ),
+    'type_literal-discard-template': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('template_start', '`', 1, 20, 21, '', None), ('template_text', 'a', 1, 21, 22, '', None),
+            ('template_end', '`', 1, 22, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('identifier', 'const', 1, 27, 32, '', None),
+            ('identifier', 'c', 1, 33, 34, '', None), ('punct', '=', 1, 35, 36, '', None),
+            ('jsx', '<A', 1, 37, 39, '', None), ('jsx', ' ', 1, 39, 40, '', None),
+            ('jsx', '/>', 1, 40, 42, '', None),
+        ],
+    ),
+    'type_literal-discard-regex': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('regex', '/a/', 1, 20, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('identifier', 'const', 1, 27, 32, '', None),
+            ('identifier', 'c', 1, 33, 34, '', None), ('punct', '=', 1, 35, 36, '', None),
+            ('jsx', '<A', 1, 37, 39, '', None), ('jsx', ' ', 1, 39, 40, '', None),
+            ('jsx', '/>', 1, 40, 42, '', None),
+        ],
+    ),
+    'type_literal-discard-block': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('punct', '{', 1, 20, 21, 'object', None), ('identifier', 'x', 1, 22, 23, '', None),
+            ('punct', ':', 1, 23, 24, '', None), ('number', '1', 1, 25, 26, '', None),
+            ('punct', '}', 1, 27, 28, 'object', None), ('punct', '}', 1, 29, 30, 'object', None),
+            ('punct', ';', 1, 30, 31, '', None), ('identifier', 'const', 1, 32, 37, '', None),
+            ('identifier', 'c', 1, 38, 39, '', None), ('punct', '=', 1, 40, 41, '', None),
+            ('jsx', '<A', 1, 42, 44, '', None), ('jsx', ' ', 1, 44, 45, '', None),
+            ('jsx', '/>', 1, 45, 47, '', None),
+        ],
+    ),
+    'type_literal-discard-call': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('identifier', 'g', 1, 20, 21, '', None), ('punct', '(', 1, 21, 22, 'expression', None),
+            ('number', '1', 1, 22, 23, '', None), ('punct', ')', 1, 23, 24, 'expression', None),
+            ('punct', '}', 1, 25, 26, 'object', None), ('punct', ';', 1, 26, 27, '', None),
+            ('identifier', 'const', 1, 28, 33, '', None), ('identifier', 'c', 1, 34, 35, '', None),
+            ('punct', '=', 1, 36, 37, '', None), ('jsx', '<A', 1, 38, 40, '', None),
+            ('jsx', ' ', 1, 40, 41, '', None), ('jsx', '/>', 1, 41, 43, '', None),
+        ],
+    ),
+}
+
+_FRAME_GOLDEN_COMPACT = {
+    'generator-open-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'return', 1, 16, 22, '', None), ('template_start', '`', 1, 23, 24, '', None),
+            ('punct', '${', 1, 26, 28, 'interpolation', None), ('identifier', 'yield', 1, 28, 33, '', None),
+            ('regex', '/a/', 1, 34, 37, '', None), ('punct', '}', 1, 37, 38, 'interpolation', None),
+            ('template_end', '`', 1, 38, 39, '', None), ('punct', '}', 1, 40, 41, 'function_decl', None),
+        ],
+    ),
+    'generator-nested-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'function', 1, 16, 24, '', None), ('punct', '*', 1, 24, 25, '', None),
+            ('identifier', 'h', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_decl', None),
+            ('punct', ')', 1, 28, 29, 'parameters_decl', None), ('punct', '{', 1, 30, 31, 'function_decl', None),
+            ('identifier', 'return', 1, 32, 38, '', None), ('template_start', '`', 1, 39, 40, '', None),
+            ('punct', '${', 1, 42, 44, 'interpolation', None), ('identifier', 'yield', 1, 44, 49, '', None),
+            ('regex', '/a/', 1, 50, 53, '', None), ('punct', '}', 1, 53, 54, 'interpolation', None),
+            ('template_end', '`', 1, 54, 55, '', None), ('punct', '}', 1, 56, 57, 'function_decl', None),
+            ('identifier', 'return', 1, 58, 64, '', None), ('template_start', '`', 1, 65, 66, '', None),
+            ('punct', '${', 1, 68, 70, 'interpolation', None), ('identifier', 'yield', 1, 70, 75, '', None),
+            ('regex', '/b/', 1, 76, 79, '', None), ('punct', '}', 1, 79, 80, 'interpolation', None),
+            ('template_end', '`', 1, 80, 81, '', None), ('punct', '}', 1, 82, 83, 'function_decl', None),
+        ],
+    ),
+    'strict-open-template': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'return', 1, 16, 22, '', None),
+            ('template_start', '`', 1, 23, 24, '', None), ('punct', '${', 1, 26, 28, 'interpolation', None),
+            ('identifier', 'yield', 1, 28, 33, '', None), ('regex', '/a/', 1, 34, 37, '', None),
+            ('punct', '}', 1, 37, 38, 'interpolation', None), ('template_end', '`', 1, 38, 39, '', None),
+            ('punct', '}', 1, 40, 41, 'function_expr', None), ('punct', '}', 1, 42, 43, 'class_decl', None),
+        ],
+    ),
+    'strict-nested-template': (
+        'tokens', [
+            ('identifier', 'class', 1, 0, 5, '', None), ('identifier', 'A', 1, 6, 7, '', None),
+            ('punct', '{', 1, 8, 9, 'class_decl', None), ('identifier', 'm', 1, 10, 11, '', None),
+            ('punct', '(', 1, 11, 12, 'parameters_method', None), ('punct', ')', 1, 12, 13, 'parameters_method', None),
+            ('punct', '{', 1, 14, 15, 'function_expr', None), ('identifier', 'class', 1, 16, 21, '', None),
+            ('identifier', 'B', 1, 22, 23, '', None), ('punct', '{', 1, 24, 25, 'class_decl', None),
+            ('identifier', 'n', 1, 26, 27, '', None), ('punct', '(', 1, 27, 28, 'parameters_method', None),
+            ('punct', ')', 1, 28, 29, 'parameters_method', None), ('punct', '{', 1, 30, 31, 'function_expr', None),
+            ('identifier', 'return', 1, 32, 38, '', None), ('template_start', '`', 1, 39, 40, '', None),
+            ('punct', '${', 1, 42, 44, 'interpolation', None), ('identifier', 'yield', 1, 44, 49, '', None),
+            ('regex', '/a/', 1, 50, 53, '', None), ('punct', '}', 1, 53, 54, 'interpolation', None),
+            ('template_end', '`', 1, 54, 55, '', None), ('punct', '}', 1, 56, 57, 'function_expr', None),
+            ('punct', '}', 1, 58, 59, 'class_decl', None), ('identifier', 'return', 1, 60, 66, '', None),
+            ('template_start', '`', 1, 67, 68, '', None), ('punct', '${', 1, 70, 72, 'interpolation', None),
+            ('identifier', 'yield', 1, 72, 77, '', None), ('regex', '/b/', 1, 78, 81, '', None),
+            ('punct', '}', 1, 81, 82, 'interpolation', None), ('template_end', '`', 1, 82, 83, '', None),
+            ('punct', '}', 1, 84, 85, 'function_expr', None), ('punct', '}', 1, 86, 87, 'class_decl', None),
+        ],
+    ),
+    'arrow-close-template': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'f', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('template_start', '`', 1, 10, 11, '', None),
+            ('punct', '${', 1, 13, 15, 'interpolation', None), ('identifier', 'y', 1, 15, 16, '', None),
+            ('punct', '=>', 1, 17, 19, '', None), ('identifier', 'y', 1, 20, 21, '', None),
+            ('punct', '}', 1, 21, 22, 'interpolation', None), ('template_end', '`', 1, 22, 23, '', None),
+        ],
+    ),
+    'arrow-discard-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('punct', '*', 1, 8, 9, '', None),
+            ('identifier', 'g', 1, 10, 11, '', None), ('punct', '(', 1, 11, 12, 'parameters_decl', None),
+            ('punct', ')', 1, 12, 13, 'parameters_decl', None), ('punct', '{', 1, 14, 15, 'function_decl', None),
+            ('identifier', 'const', 1, 16, 21, '', None), ('identifier', 'x', 1, 22, 23, '', None),
+            ('punct', '=', 1, 24, 25, '', None), ('template_start', '`', 1, 26, 27, '', None),
+            ('punct', '${', 1, 29, 31, 'interpolation', None), ('identifier', 'y', 1, 31, 32, '', None),
+            ('punct', '=>', 1, 33, 35, '', None), ('identifier', 'y', 1, 36, 37, '', None),
+            ('punct', '}', 1, 37, 38, 'interpolation', None), ('template_end', '`', 1, 38, 39, '', None),
+            ('punct', ';', 1, 39, 40, '', None), ('identifier', 'return', 1, 41, 47, '', None),
+            ('template_start', '`', 1, 48, 49, '', None), ('punct', '${', 1, 51, 53, 'interpolation', None),
+            ('identifier', 'yield', 1, 53, 58, '', None), ('regex', '/a/', 1, 59, 62, '', None),
+            ('punct', '}', 1, 62, 63, 'interpolation', None), ('template_end', '`', 1, 63, 64, '', None),
+            ('punct', '}', 1, 65, 66, 'function_decl', None),
+        ],
+    ),
+    'for_head-open-template': (
+        'tokens', [
+            ('identifier', 'function', 1, 0, 8, '', None), ('identifier', 'h', 1, 9, 10, '', None),
+            ('punct', '(', 1, 10, 11, 'parameters_decl', None), ('punct', ')', 1, 11, 12, 'parameters_decl', None),
+            ('punct', '{', 1, 13, 14, 'function_decl', None), ('identifier', 'return', 1, 15, 21, '', None),
+            ('template_start', '`', 1, 22, 23, '', None), ('punct', '${', 1, 25, 27, 'interpolation', None),
+            ('identifier', 'for', 1, 27, 30, '', None), ('punct', '(', 1, 31, 32, 'control', None),
+            ('identifier', 'const', 1, 32, 37, '', None), ('identifier', 'a', 1, 38, 39, '', None),
+            ('identifier', 'of', 1, 40, 42, '', None), ('regex', '/b/', 1, 43, 46, '', None),
+            ('punct', ')', 1, 46, 47, 'control', None), ('punct', '{', 1, 48, 49, 'block', None),
+            ('punct', '}', 1, 49, 50, 'block', None), ('punct', '}', 1, 50, 51, 'interpolation', None),
+            ('template_end', '`', 1, 51, 52, '', None), ('punct', '}', 1, 53, 54, 'function_decl', None),
+        ],
+    ),
+    'for_head-nested-template': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('template_start', '`', 1, 16, 17, '', None),
+            ('punct', '${', 1, 19, 21, 'interpolation', None), ('identifier', 'function', 1, 21, 29, '', None),
+            ('punct', '(', 1, 30, 31, 'parameters_expr', None), ('punct', ')', 1, 31, 32, 'parameters_expr', None),
+            ('punct', '{', 1, 33, 34, 'function_expr', None), ('identifier', 'for', 1, 35, 38, '', None),
+            ('punct', '(', 1, 39, 40, 'control', None), ('identifier', 'const', 1, 40, 45, '', None),
+            ('identifier', 'y', 1, 46, 47, '', None), ('identifier', 'of', 1, 48, 50, '', None),
+            ('regex', '/b/', 1, 51, 54, '', None), ('punct', ')', 1, 54, 55, 'control', None),
+            ('punct', '{', 1, 56, 57, 'block', None), ('punct', '}', 1, 57, 58, 'block', None),
+            ('punct', '}', 1, 59, 60, 'function_expr', None), ('punct', '}', 1, 60, 61, 'interpolation', None),
+            ('template_end', '`', 1, 61, 62, '', None), ('punct', ')', 1, 62, 63, 'control', None),
+            ('punct', '{', 1, 64, 65, 'block', None), ('punct', '}', 1, 65, 66, 'block', None),
+        ],
+    ),
+    'for_head-close-template': (
+        'tokens', [
+            ('identifier', 'for', 1, 0, 3, '', None), ('punct', '(', 1, 4, 5, 'control', None),
+            ('identifier', 'const', 1, 5, 10, '', None), ('identifier', 'x', 1, 11, 12, '', None),
+            ('identifier', 'of', 1, 13, 15, '', None), ('template_start', '`', 1, 16, 17, '', None),
+            ('template_end', '`', 1, 18, 19, '', None), ('punct', ')', 1, 19, 20, 'control', None),
+            ('punct', '{', 1, 21, 22, 'block', None), ('punct', '}', 1, 22, 23, 'block', None),
+        ],
+    ),
+    'type_literal-close-template': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('template_start', '`', 1, 20, 21, '', None), ('template_text', 'a', 1, 21, 22, '', None),
+            ('template_end', '`', 1, 22, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('flat_call', 'eval', 1, 27, 37, 'expression', ('code',)),
+        ],
+    ),
+    'type_literal-close-regex': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('regex', '/a/', 1, 20, 23, '', None), ('punct', '}', 1, 24, 25, 'object', None),
+            ('punct', ';', 1, 25, 26, '', None), ('flat_call', 'eval', 1, 27, 37, 'expression', ('code',)),
+        ],
+    ),
+    'type_literal-close-block': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('flat_object', '{ x: 1 }', 1, 20, 28, 'object', None), ('punct', '}', 1, 29, 30, 'object', None),
+            ('punct', ';', 1, 30, 31, '', None), ('flat_call', 'eval', 1, 32, 42, 'expression', ('code',)),
+        ],
+    ),
+    'type_literal-close-call': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('identifier', 'g', 1, 20, 21, '', None), ('punct', '(', 1, 21, 22, 'expression', None),
+            ('number', '1', 1, 22, 23, '', None), ('punct', ')', 1, 23, 24, 'expression', None),
+            ('punct', '}', 1, 25, 26, 'object', None), ('punct', ';', 1, 26, 27, '', None),
+            ('flat_call', 'eval', 1, 28, 38, 'expression', ('code',)),
+        ],
+    ),
+    'type_literal-discard-block': (
+        'tokens', [
+            ('identifier', 'const', 1, 0, 5, '', None), ('identifier', 'a', 1, 6, 7, '', None),
+            ('punct', '=', 1, 8, 9, '', None), ('identifier', 'b', 1, 10, 11, '', None),
+            ('identifier', 'as', 1, 12, 14, '', None), ('punct', '{', 1, 15, 16, 'object', None),
+            ('identifier', 'f', 1, 17, 18, '', None), ('punct', ':', 1, 18, 19, '', None),
+            ('flat_object', '{ x: 1 }', 1, 20, 28, 'object', None), ('punct', '}', 1, 29, 30, 'object', None),
+            ('punct', ';', 1, 30, 31, '', None), ('identifier', 'const', 1, 32, 37, '', None),
+            ('identifier', 'c', 1, 38, 39, '', None), ('punct', '=', 1, 40, 41, '', None),
+            ('jsx', '<A', 1, 42, 44, '', None), ('jsx', ' ', 1, 44, 45, '', None),
+            ('jsx', '/>', 1, 45, 47, '', None),
+        ],
+    ),
+}

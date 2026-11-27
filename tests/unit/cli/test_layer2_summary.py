@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from aegis_cli.formatters.report import format_layer2_summary
 from aegis_core.verification import (
     ArbitrationResult, Divergence, Prediction, RiskCategory, Severity, ToolEvidence, Verdict,
@@ -48,6 +50,7 @@ def test_long_risk_text_is_cut_to_one_bounded_line():
     assert "..." in out
 
 
+@pytest.mark.timing
 def test_unterminated_escape_introducers_cost_the_same_at_any_length():
     for n in (SMALL, LARGE):
         assert _longest_line(_summary("\x1b]" * n)) < 400

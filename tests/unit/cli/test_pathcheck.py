@@ -1,8 +1,8 @@
-"""BUG-041: tell the user how to put the soma CLI on PATH for their shell.
+"""BUG-041: tell the user how to put the aegis CLI on PATH for their shell.
 
 After `pip install --user`, the console script lands in the user scripts
 directory (~/.local/bin on Linux). zsh does not read ~/.profile, so on a stock
-oh-my-zsh setup `soma` is "command not found" and nothing said why.
+oh-my-zsh setup `aegis` is "command not found" and nothing said why.
 aegis_cli.pathcheck detects that and prints a shell-specific remedy.
 """
 from __future__ import annotations
@@ -219,7 +219,7 @@ def test_build_hint_not_installed(tmp_path):
 
 
 def test_build_hint_defaults_to_the_aegis_package(tmp_path):
-    """The default names aegis-guardrails, never the v3 soma-governance package."""
+    """The default names aegis-guardrails, never the v3 aegis-governance package."""
     env = {"SHELL": "/usr/bin/zsh", "PATH": "/usr/bin", "HOME": str(tmp_path)}
     text = build_hint(env=env, candidates=[str(tmp_path)], which=lambda *_a, **_k: None,
                       home=str(tmp_path), platform="linux", os_name="posix")
@@ -382,29 +382,29 @@ def test_build_hint_windows_uses_python_not_python3(tmp_path):
     assert f"{tmp_path / 'aegis.exe'} <command>" in text
     assert "-m aegis_cli" not in text
 
-def test_scripts_dir_ignores_a_v3_soma_script(tmp_path):
-    # v4 installs only `aegis`; a leftover v3 `soma` script is not where aegis is.
-    (tmp_path / "soma").write_text("#!/bin/sh\n")
-    (tmp_path / "soma.exe").write_bytes(b"MZ")
+def test_scripts_dir_ignores_an_unrelated_script(tmp_path):
+    # v4 installs only `aegis`; an unrelated script is not where aegis is.
+    (tmp_path / "foreign-tool").write_text("#!/bin/sh\n")
+    (tmp_path / "foreign-tool.exe").write_bytes(b"MZ")
     assert scripts_dir([str(tmp_path)]) is None
 
 
-def test_build_hint_is_not_silenced_by_a_soma_on_path(tmp_path):
+def test_build_hint_is_not_silenced_by_an_unrelated_tool_on_path(tmp_path):
     env = {"SHELL": "/usr/bin/zsh", "PATH": "/usr/bin", "HOME": str(tmp_path)}
     text = build_hint(env=env, candidates=[str(tmp_path)],
-                      which=lambda cmd, **_k: "/usr/bin/soma" if cmd == "soma" else None,
+                      which=lambda cmd, **_k: "/usr/bin/foreign-tool" if cmd == "foreign-tool" else None,
                       home=str(tmp_path), platform="linux", os_name="posix")
     assert text is not None and "The 'aegis' command is not installed" in text
 
 
 # ── module entry points ──────────────────────────────────────────────────────
 
-def test_python_m_soma_cli_runs():
+def test_python_m_aegis_cli_runs():
     proc = subprocess.run([sys.executable, "-m", "aegis_cli", "--help"],
                           cwd=str(REPO), capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     assert proc.returncode == 0, proc.stderr
-    assert "usage: aegis" in proc.stdout or "usage: soma" in proc.stdout
+    assert "usage: aegis" in proc.stdout or "usage: aegis" in proc.stdout
 
 
 def test_pathcheck_on_path_handles_windows_colons():

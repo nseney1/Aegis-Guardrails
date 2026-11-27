@@ -15,74 +15,15 @@ from aegis_core.match import first_match, is_test_path
 from aegis_core.primitives import is_within, safe_parts
 from aegis_core.workspace.layout import RULES_RELDIR
 from typing import Any, Optional
+from aegis_core.verification.forbid_ast_spec import (
+    CALL_SPEC_KEYS as _CALL_SPEC_KEYS,
+    forbid_ast_spec_error as _forbid_ast_spec_error,
+)
 
 from . import ToolEvidence, persistence_checker, call_graph, import_guard, mutation_tester, ast_checks, structural_checks
-from .ast_checks import NO_DRIVER_NOTE_TOOL
+from .strict_verdict import NO_DRIVER_NOTE_TOOL, evidence_blocks
 
 VerificationResult = ToolEvidence
-
-
-_FORBID_AST_KEYS = ("imports", "calls", "decorators")
-_CALL_SPEC_KEYS = frozenset({"name", "where", "builtin"})
-_SCALARS = (str, int, float, bool, type(None))
-
-
-def _condition_error(cond: object) -> Optional[str]:
-    """Why a where condition is outside the spec grammar: a scalar, {in: [scalars]}, {not: condition}, {absent: bool}."""
-    while isinstance(cond, dict) and list(cond) == ["not"]:
-        cond = cond["not"]
-    if isinstance(cond, _SCALARS):
-        return None
-    op, target = next(iter(cond.items())) if isinstance(cond, dict) and len(cond) == 1 else (None, None)
-    if op == "in":
-        ok = isinstance(target, (list, tuple)) and bool(target) and all(isinstance(t, _SCALARS) for t in target)
-        return None if ok else "in needs a non-empty list of scalars"
-    if op == "absent":
-        return None if isinstance(target, bool) else "absent needs true or false"
-    return f"unknown operator {op} (allowed: in, not, absent)" if op is not None else "a condition is a scalar or one operator: in, not, absent"
-
-
-def _call_spec_error(at: str, entry: dict) -> Optional[str]:
-    extra = sorted(str(key) for key in entry if key not in _CALL_SPEC_KEYS)
-    if extra:
-        return f"{at}: unknown key {extra[0]!r} (allowed: {', '.join(sorted(_CALL_SPEC_KEYS))})"
-    if not (isinstance(entry.get("name"), str) and entry["name"].strip()) or not isinstance(entry.get("builtin", False), bool):
-        return f"{at}: name must be a non-empty string and builtin true or false"
-    where = entry.get("where")
-    if "where" in entry and (not isinstance(where, dict) or not where):
-        return f"{at}.where must map argument names to conditions"
-    for arg, cond in (where or {}).items():
-        named = isinstance(arg, str) and all(n.strip().isidentifier() or re.fullmatch(r"\s*#[0-9]+\s*", n) for n in arg.split("|"))
-        reason = _condition_error(cond) if named else "argument names are identifiers or #N, joined by |"
-        if reason:
-            return f"{at}.where.{arg}: {reason}"
-    return None
-
-
-def _forbid_ast_spec_error(spec: object) -> Optional[str]:
-    """Why a declared ``forbid_ast`` would enforce nothing as written; None when it is well-formed.
-
-    evaluate_forbid_ast ignores what it cannot use (a list, a string where a list belongs,
-    a misspelt key, an operator outside the where grammar), so a gate rule in such a shape
-    would pass every file.
-    """
-    if not isinstance(spec, dict):
-        return f"forbid_ast must map imports/calls/decorators to lists, not {type(spec).__name__}"
-    unknown = sorted(str(key) for key in spec if key not in _FORBID_AST_KEYS)
-    if unknown:
-        listed = ", ".join(repr(key) for key in unknown)
-        return f"unknown forbid_ast key {listed} (allowed: {', '.join(_FORBID_AST_KEYS)})"
-    patterns = 0
-    for key, value in spec.items():
-        mapped = (lambda p: key == "calls" and isinstance(p, dict))
-        if not isinstance(value, list) or not all(mapped(p) or (isinstance(p, str) and p.strip()) for p in value):
-            return f"forbid_ast.{key} must be a list of non-empty strings, not {type(value).__name__}"
-        errors = (_call_spec_error(f"forbid_ast.calls[{i}]", p) for i, p in enumerate(value) if mapped(p))
-        error = next((e for e in errors if e), None)
-        if error:
-            return error
-        patterns += len(value)
-    return None if patterns else "forbid_ast declares no patterns"
 
 
 def _base_holds(root: str, commit: str) -> bool:
@@ -111,13 +52,12 @@ def _discover_forbid_ast_rules(
     not hold ``repo_root`` at all, the working tree. ``reviewed=False`` enforces the working tree
     as is: ``aegis check --record`` runs on an exported snapshot, which no base describes.
 
-    Returns (rules, broken): a rule file that cannot be loaded and names forbid_ast, or
-    whose forbid_ast is malformed, would enforce nothing, so each is returned as
-    (relative path, reason) for the caller to fail closed on instead of being dropped.
-    ``broken`` reads the working tree too, so a malformed new gate fails before it is merged.
-    An unsafe rules tree or an unreadable BASE raises, which the caller also fails on.
+    Returns (rules, broken). Broken entries are (relative path, reason): oversized
+    records from either source, damaged files naming forbid_ast, or malformed specs.
+    The working tree is checked too, so a malformed new gate fails before merge.
+    An unsafe rules tree or an unreadable BASE raises and fails closed.
     """
-    from aegis_core import rule_integrity
+    from aegis_core import rule_integrity, rule_inventory
     from aegis_core.rules import RuleCache, workspace_root
 
     root = workspace_root(repo_root)
@@ -136,17 +76,18 @@ def _discover_forbid_ast_rules(
     broken: list[tuple[str, str]] = []
     for ruleset, collect in ((cache.get(root), False), (enforced, True)):
         for rule in ruleset.rules:
-            if not rule.ok:
-                # Only a file that names the key can declare it: a damaged note does not gate.
-                if b"forbid_ast" in rule.raw and not collect:
-                    broken.append((rule.path, rule.error or "cannot be loaded"))
+            if not rule.ok or (rule.size or 0) > rule_inventory.MAX_RULE_BYTES:
+                if ((rule.size or 0) > rule_inventory.MAX_RULE_BYTES
+                        or b"forbid_ast" in rule.raw and not collect) and not any(
+                        path == rule.path for path, _reason in broken):
+                    broken.append((rule.path, rule.error or "too_large"))
                 continue
             if rule.expired or "forbid_ast" not in rule.meta:
                 continue
             spec = rule.meta.get("forbid_ast")
             spec_error = _forbid_ast_spec_error(spec)
             if spec_error:
-                if (rule.path, spec_error) not in broken:
+                if not any(path == rule.path for path, _reason in broken):
                     broken.append((rule.path, spec_error))
             elif collect:
                 discovered.append((rule, spec))
@@ -424,7 +365,7 @@ def _tool_failure(tool: str, target: str, exc: Exception) -> ToolEvidence:
     from aegis_core.ast.policy import is_size_limit_error
 
     if is_size_limit_error(exc):
-        return ast_checks.too_large_note(target, ast_checks.source_language(target))
+        return ast_checks.too_large_note(target, ast_checks.source_language(target), limit_bytes=ast_checks.source_limit_from_error(exc))
     return ToolEvidence(
         tool=tool,
         target=target,
@@ -692,14 +633,14 @@ def gate_verdict(results: list[ToolEvidence], *, strict: bool = False) -> bool:
     """Simple gate: PASS if all tools pass. Empty results (no changed files) is a clean pass."""
     if not results:
         return True
-    return all(r.verdict and not (strict and r.tool == NO_DRIVER_NOTE_TOOL) for r in results)
+    return all(not evidence_blocks(r.verdict, r.tool, strict=strict) for r in results)
 
 
 def format_summary(results: list[ToolEvidence], *, strict: bool = False) -> str:
     """One-line summary of Layer 1 results."""
     if not results:
         return "Layer 1: No changed files to verify (0 checks run, PASSED)"
-    failed_rows = [r for r in results if not r.verdict or (strict and r.tool == NO_DRIVER_NOTE_TOOL)]
+    failed_rows = [r for r in results if evidence_blocks(r.verdict, r.tool, strict=strict)]
     failed = len(failed_rows)
     passed = len(results) - failed
     total = len(results)
@@ -925,8 +866,8 @@ def _layer1_on_snapshot(
     ``entries`` is the index listing: the snapshot holds only some of its files.
 
     A file in ``too_large`` was not read: a forbid_ast gate rule that covers it fails
-    closed; otherwise the call_graph and import_guard checks it would get are skipped,
-    and passing INDEX_NOTE_TOOL evidence says so."""
+    closed; otherwise pack extensions report via ast_unverified, while other skipped
+    structural checks report via passing INDEX_NOTE_TOOL evidence."""
     from aegis_core.ast.session import ASTParseSession
 
     paths = [(rel, _snapshot_file(snapshot, rel)) for rel in files]

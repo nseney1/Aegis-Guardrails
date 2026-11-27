@@ -1,0 +1,13 @@
+{
+  "id": "aegis-p1",
+  "project": "aegis",
+  "repository": "aegis-guardrails",
+  "priority": 10,
+  "target_branch": "develop",
+  "touched_paths": ["tools/hierarchy_*"],
+  "blocked_by": [],
+  "checkouts": ["/absolute/aegis-lanes/p1"],
+  "lanes": ["aegis-p1"],
+  "mailbox_root": "/absolute/initiatives/aegis-p1/mailbox",
+  "delivery_dir": "/absolute/initiatives/aegis-p1/delivery"
+}

@@ -40,6 +40,7 @@ from aegis_core.match import matches, normalize_path
 __all__ = ["LIMITS", "MAX_PREDICTED", "SOURCE", "Edge", "Frozen", "PartitionUsage", "Report", "check", "parse_splits"]
 
 SOURCE = "aegis check --partition"
+SCHEMA = "aegis.check.partition/v1"
 MAX_PREDICTED = 200  # edges kept in the event: the log is a metric, not an archive
 MIN_LANES = 2
 _NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -341,6 +342,7 @@ class Report:
             "languages": dict(sorted(self.languages.items())),
         }, now=self.checked_at)
         document.update(
+            schema=SCHEMA,
             lanes=[{"name": name, "globs": list(globs), "files": self.lane_files.get(name, 0),
                     "analyzed": self.analyzed.get(name, 0)} for name, globs in self.lanes.items()],
             overlap=[{"path": path, "lanes": list(names)} for path, names in self.overlap],

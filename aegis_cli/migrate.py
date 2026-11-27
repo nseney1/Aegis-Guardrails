@@ -3,7 +3,8 @@
 The work is aegis_core.migrate; this module parses flags and prints the plan.
 ``--apply`` also tightens the repository's shared state (``<git common dir>/aegis``) to
 directories 0700 and files 0600, whatever the umask made them; the report's ``state_modes``
-counts what was looser, never naming it. Exit codes: 0 done (or nothing to do), 1 refused (nothing written: an unconfined path,
+counts what was looser, never naming it. The state directory and its lock may be created
+before a refusal. Exit codes: 0 done (or nothing to do), 1 refused (no rule, config.json or .aegis/.gitignore was changed: an unconfined path,
 the lock held by another process, files that changed between planning and applying, or
 a workspace Aegis would still refuse with nothing to convert, whose blocker is named)
 or something was left unmigrated (an unmapped type, a destination conflict, an
@@ -114,7 +115,7 @@ def run_migrate(args: argparse.Namespace) -> int:
     if apply_it and not plan.refusal:
         try:
             backup = migrate.apply(plan).backup
-        except (migrate.MigrationRefused, LockTimeoutError) as exc:  # raised before anything is written
+        except (migrate.MigrationRefused, LockTimeoutError) as exc:  # state/ and its lock may already exist
             report["status"], report["refusal"] = "refused", str(exc)
     if apply_it and report["status"] == "pending":
         report["status"] = "applied"

@@ -11,6 +11,7 @@ import pytest
 
 from aegis_core import atomicio, storage
 from aegis_core.errors import PathTraversalError
+from tests.conftest import symlink_or_skip
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits, FIFOs and O_NOFOLLOW")
 both = pytest.mark.parametrize("module", [storage, atomicio], ids=["storage", "atomicio"])
@@ -34,6 +35,41 @@ def umask():
 def test_storage_keeps_every_public_atomic_name():
     assert set(PUBLIC) <= set(atomicio.__all__) and set(PUBLIC) <= set(storage.__all__)
     assert all(getattr(storage, name) is getattr(atomicio, name) for name in PUBLIC)
+
+
+def test_public_regular_opener_reads_an_existing_file(tmp_path):
+    target = tmp_path / "source"
+    target.write_bytes(b"source bytes\n")
+    assert "open_regular" in atomicio.__all__
+    with os.fdopen(atomicio.open_regular(str(target), os.O_RDONLY), "rb") as stream:
+        assert stream.read() == b"source bytes\n"
+
+
+def test_public_regular_opener_passes_creation_flags_and_mode(tmp_path):
+    target = tmp_path / "created"
+    with os.fdopen(atomicio.open_regular(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+        stream.write(b"created bytes")
+    assert target.read_bytes() == b"created bytes"
+    if os.name == "posix":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    with pytest.raises(FileExistsError):
+        atomicio.open_regular(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+
+
+def test_public_regular_opener_preserves_missing_and_nonregular_refusals(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        atomicio.open_regular(tmp_path / "missing", os.O_RDONLY)
+    with pytest.raises(PathTraversalError, match="it is not a regular file"):
+        atomicio.open_regular(tmp_path, os.O_RDONLY)
+
+
+def test_public_regular_opener_refuses_a_symlink(tmp_path):
+    target = tmp_path / "source"
+    target.write_bytes(b"source bytes")
+    linked = tmp_path / "link"
+    symlink_or_skip(target, linked)
+    with pytest.raises(PathTraversalError, match="it is a symlink"):
+        atomicio.open_regular(linked, os.O_RDONLY)
 
 
 @both

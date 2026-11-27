@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
+from functools import partial
 from pathlib import PurePath
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from aegis_core import hosts
+from aegis_core import hosts, scan_exposure
+from aegis_core.guidance_projection import GuidanceResult, project_diagnostic, project_display_text
 from aegis_core.primitives import parse_utc
 from aegis_core.scan import scan, scan_user_layer
-from aegis_core.skills.slots import render_scan_result
+from aegis_core.skills.slots import render_scan_result as render_scan_result
+from aegis_core.skills.slots import scan_registry
 from aegis_mcp.handlers.common import STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, get_workspace
 from aegis_mcp.handlers.common import remember_bounded
 
@@ -23,6 +26,10 @@ from aegis_mcp.handlers.common import remember_bounded
 # write nothing. Bounded: a forgotten key costs one extra row, never the scan result.
 _RECORDED: Dict[Tuple[str, str, Tuple[str, ...]], datetime] = {}
 _MAX_RECORDED = 1024
+
+
+def _scan_error(message: str) -> dict:
+    return {"error": project_display_text(message), "status": STATUS_FAIL}
 
 
 def _slot_profile(host: Any) -> str:
@@ -74,7 +81,7 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
             binding=args.get("_binding"), basis=basis,
         )
     except Exception as exc:  # telemetry only: never fail the scan
-        print(f"aegis-mcp: scan event not recorded: {exc}", file=sys.stderr)
+        print("aegis-mcp: scan event not recorded: " + project_diagnostic(str(exc), refuse_controls=True), file=sys.stderr)
         return
     stamp = parse_utc(row["ts"])
     if stamp is not None:
@@ -82,72 +89,98 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
 
 
 def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List[str]] = None) -> None:
-    """Remember which rules this server session was shown, at each rule's rev: aegis_report_outcome
-    credits only those, and insight review joins a correction to them by host, time and rev."""
+    """Retain delivery telemetry for the insight review's host, time and revision join."""
     from aegis_core import credit
-    from aegis_core.scan import RULE_CACHE
     from aegis_core.storage import ledger_site
 
     names = [item.get("name") for key in ("relevant_rules", "invariant_warnings")
              for item in (res.get(key) or []) if isinstance(item, dict)]
-    rule_ids = [n for n in names if isinstance(n, str)]
+    rule_ids = list(res.exposure_rule_ids()) if isinstance(res, GuidanceResult) else [n for n in names if isinstance(n, str)]
     host = str(args.get("_host") or "")
     session = str(args.get("_session") or "")
     error: Optional[Exception] = None
-    revs: Dict[str, str] = {}
+    revisions = res.exposure_revisions() if isinstance(res, GuidanceResult) else ()
+    revs = {rule_id: revision[:16] for rule_id, revision in revisions}
     try:
-        revs = {rule.id: rule.digest[:16] for rule in RULE_CACHE.get(workspace).served}
         persist = bool(session) and (not args.get("_binding") or ledger_site(workspace.root, create=False).shared)
-    except Exception as exc:  # no row without its rev; the in-memory record still lets reports credit
+    except Exception as exc:
         persist, error = False, exc
     try:
-        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, revs=revs, persist=persist)
+        recorded_ids = [rule_id for rule_id in rule_ids if rule_id in revs] if persist and revisions else rule_ids
+        credit.record_exposure(workspace.root, host, session, recorded_ids, paths=files, revs=revs,
+                               persist=persist and bool(revisions))
     except Exception as exc:  # telemetry only: never fail the scan
         error = exc
     if error is not None:
-        print(f"aegis-mcp: exposure record not written: {error}", file=sys.stderr)
+        print("aegis-mcp: exposure record not written: " + project_diagnostic(str(error), refuse_controls=True), file=sys.stderr)
 
 
 def _scan_user_layer(args: dict) -> dict:
     """Nothing governs this call (H8): the read-only user layer, never a ledger write."""
     files = args.get("files")
     if files is not None and (not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files)):
-        return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
-    res = scan_user_layer(list(files) if files else None)
-    if res.get("status") == STATUS_FAIL:
-        return res
-    res = {"status": "not_governed", "message": NOT_GOVERNED_MESSAGE, "reason": args.get("_unbound"), **res}
-    return render_scan_result(res, _slot_profile(args.get("_host")), None)
+        return _scan_error("'files' must be a list of file paths")
+    registry = scan_registry(_slot_profile(args.get("_host")))
+    return scan_user_layer(list(files) if files else None, registry=registry,
+                           extras={"status": "not_governed", "message": NOT_GOVERNED_MESSAGE,
+                                   "reason": args.get("_unbound")})
 
 
-def handle_scan(args: dict) -> dict:
+def handle_scan(args: dict, *, project: Optional[Callable[[dict], dict]] = None) -> dict:
     """Express the JIT rules for the given files (or the git diff when none are given)."""
     from aegis_core import gitsafe
 
     # Its own scope: recording the scan and its exposures asks where the ledger is after scan() returns.
     with gitsafe.memo():
-        return _handle_scan(args)
+        result, delivered = _handle_scan(args)
+        projected = result if project is None else project(result)
+        if delivered is not None and projected is result:
+            delivered(project is not None)
+        return projected
 
 
-def _handle_scan(args: dict) -> dict:
+def _literal_scope(root, requested, confined):
+    try:
+        path = PurePath(requested)
+        if path.is_absolute():
+            path = path.relative_to(root)
+        return path.as_posix() == confined
+    except ValueError:
+        return False
+
+
+def _handle_scan(args: dict) -> Tuple[dict, Optional[Callable[[bool], None]]]:
     if args.get("_unbound"):
-        return _scan_user_layer(args)
+        return _scan_user_layer(args), None
     try:
         workspace = get_workspace(args)
-    except ValueError as exc:
-        return {"error": str(exc), "status": STATUS_FAIL}
+    except (ValueError, OSError, RuntimeError) as exc:
+        return _scan_error(str(exc)), None
     files = args.get("files")
+    exposure_allowed = True
     if files is not None:
         if not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files):
-            return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
+            return _scan_error("'files' must be a list of file paths"), None
         try:  # [] means "none given" here as in scan(): the git diff, recorded as such
-            files = [str(workspace.confine_path(f)[1]) for f in files] or None
-        except ValueError as exc:
-            return {"error": str(exc), "status": STATUS_FAIL}
+            scoped = [PurePath(workspace.confine_path(f)[1]).as_posix() for f in files]
+            exposure_allowed = all(_literal_scope(workspace.root, raw, path) for raw, path in zip(files, scoped))
+            files = scoped or None
+        except (ValueError, OSError, RuntimeError) as exc:
+            return _scan_error(str(exc)), None
 
-    res = scan(workspace, changed_files=files)
+    registry = scan_registry(_slot_profile(args.get("_host")), workspace.root)
+    options = {} if exposure_allowed else {"exposure_allowed": False}
+    res = scan(workspace, changed_files=files, registry=registry, **options)
     if res.get("status") == STATUS_FAIL:
-        return res
+        return res, None
     _record_scan(workspace, args, files)
-    _record_exposure(workspace, args, res, files)
-    return render_scan_result(res, _slot_profile(args.get("_host")), workspace)
+
+    def delivered(with_receipt):
+        record = partial(_record_exposure, workspace, args, res, files)
+        if not with_receipt:
+            record()
+        elif isinstance(res, GuidanceResult) and not res.get("status") and args.get("_session"):
+            scan_exposure.offer(str(workspace.root), args.get("_host") or "", args["_session"],
+                                res.exposure_snapshot(), delivered=record)
+
+    return res, delivered

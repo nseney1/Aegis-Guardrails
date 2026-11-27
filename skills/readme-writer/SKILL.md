@@ -49,7 +49,7 @@ When activated, adopt the persona of a **Senior Technical Writer** producing dev
 
 ## Anti-Patterns
 
-- Never pad with marketing language, project history, or badge walls that push quick start below the fold.
+- Never pad with marketing language, project history, or excessive badges that push quick start below the fold.
 - Never document commands or Makefile targets that don't actually exist.
 - Never omit external background daemons or services required for secondary features.
 - Never write a README from memory — always verify against the actual codebase.
@@ -62,6 +62,6 @@ When reviewing an existing README:
 - [ ] Are all code blocks copy-pasteable without modification?
 - [ ] Are all prerequisites listed before the commands that need them?
 - [ ] Are all external services and daemons documented?
-- [ ] Is the structure scannable (headers, tables, code) vs wall-of-text?
+- [ ] Is the structure scannable (headers, tables, code) with short paragraphs?
 - [ ] Are platform-specific instructions cleanly separated?
 - [ ] Are there any stale/incorrect commands or paths?

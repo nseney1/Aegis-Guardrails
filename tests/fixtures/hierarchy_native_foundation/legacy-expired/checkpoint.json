@@ -1,0 +1,220 @@
+{
+  "execution_enabled": false,
+  "native_enforcement": "unqualified",
+  "policy": {
+    "actors": {
+      "coordinator-1": {
+        "cap_seconds": 3600,
+        "generation": 1,
+        "profile": {
+          "effort": "max",
+          "filesystem": "workspace-write",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": []
+        },
+        "role": "coordinator"
+      },
+      "operator-1": {
+        "cap_seconds": 3600,
+        "generation": 1,
+        "profile": {
+          "effort": "max",
+          "filesystem": "workspace-write",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": []
+        },
+        "role": "operator"
+      },
+      "operator-2": {
+        "cap_seconds": 3600,
+        "generation": 2,
+        "profile": {
+          "effort": "max",
+          "filesystem": "workspace-write",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": []
+        },
+        "role": "operator"
+      },
+      "reviewer-1": {
+        "cap_seconds": 3600,
+        "generation": 1,
+        "profile": {
+          "effort": "max",
+          "filesystem": "workspace-write",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": []
+        },
+        "role": "reviewer"
+      },
+      "root-1": {
+        "cap_seconds": 3600,
+        "generation": 1,
+        "profile": {
+          "effort": "max",
+          "filesystem": "read-only",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": [
+            "read",
+            "decide",
+            "attest"
+          ]
+        },
+        "role": "root"
+      },
+      "router-1": {
+        "cap_seconds": 3600,
+        "generation": 1,
+        "profile": {
+          "effort": "medium",
+          "filesystem": "workspace-write",
+          "model": "fixture-model",
+          "tier": "ultrafast",
+          "tools": []
+        },
+        "role": "router"
+      }
+    },
+    "authority": [
+      {
+        "path": "/fixture/legacy/retained-evidence.json",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ],
+    "current": {
+      "coordinator": "coordinator-1",
+      "operator": "operator-1",
+      "reviewer": "reviewer-1",
+      "root": "root-1",
+      "router": "router-1"
+    },
+    "schema": "aegis.lifecycle-policy/v1",
+    "source": {
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dirty_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "successors": {
+      "operator-1": "operator-2"
+    }
+  },
+  "policy_sha256": "ec6d830eb452bcb955d019e70956e4987f78a8cb7f6fcb52ad9558762dac4665",
+  "schema": "aegis.lifecycle-checkpoint/v1",
+  "sha256": "0118035e60c98f855bd7fef7b5e4bd37f336cb3e099c71b0ffcecf4a4c845450",
+  "state": {
+    "consumed": {},
+    "current": {
+      "coordinator": "coordinator-1",
+      "operator": "operator-1",
+      "reviewer": "reviewer-1",
+      "root": "root-1",
+      "router": "router-1"
+    },
+    "decisions": [
+      {
+        "actor": "root-1",
+        "at": "2001-01-01T00:00:00Z",
+        "decision": "approve",
+        "generation": 1,
+        "reason": "bounded fixture approval",
+        "request_id": "legacy-expired-approval",
+        "request_sha256": "7dfe9fab248d36523ef82e584388c5adb167038d7d3209cca3700f533bc764a7",
+        "type": "decision"
+      }
+    ],
+    "head": "c9557576a247f531e35b0316793de96c2ca97d1ea0595fece258ff860b149bb5",
+    "meters": {
+      "coordinator-1": {
+        "active_seconds": 0,
+        "open_since": null
+      },
+      "operator-1": {
+        "active_seconds": 0,
+        "open_since": null
+      },
+      "operator-2": {
+        "active_seconds": 0,
+        "open_since": null
+      },
+      "reviewer-1": {
+        "active_seconds": 0,
+        "open_since": null
+      },
+      "root-1": {
+        "active_seconds": 0,
+        "open_since": null
+      },
+      "router-1": {
+        "active_seconds": 0,
+        "open_since": null
+      }
+    },
+    "receipts": {
+      "legacy-approve": {
+        "event_id": "legacy-approve",
+        "event_sha256": "4e25f03177bf9eadc4e31eb8ede5d1ac86fbee2d716eba50ec1d93b4bd130946",
+        "execution_enabled": false,
+        "sequence": 2
+      },
+      "legacy-publish": {
+        "event_id": "legacy-publish",
+        "event_sha256": "0e8ac17967f5db814c33b6f94eaa5d779252c85d80d68fd71a0d909106265b02",
+        "execution_enabled": false,
+        "sequence": 1
+      }
+    },
+    "requests": {
+      "legacy-expired-approval": {
+        "admission": null,
+        "delivery": null,
+        "dispositions": [],
+        "intent": null,
+        "publisher": "coordinator-1",
+        "raw": {
+          "raw": "{\n \"authority\": \"legacy-expired-approval\",\n \"continuation\": {\n  \"expires_at\": \"2000-01-01T00:00:00Z\",\n  \"max_starts\": 1,\n  \"members\": []\n },\n \"id\": \"legacy-expired-approval\",\n \"next_decision\": \"review retained failure evidence\",\n \"operation\": \"targeted-tests\",\n \"owner\": \"engine/coordinator\",\n \"paths\": [\n  \"/fixture/engine/tests\"\n ],\n \"phase\": \"validation\",\n \"prerequisites\": [],\n \"schema\": \"aegis.lifecycle-request/v1\",\n \"source\": {\n  \"commit\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"dirty_sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\n  \"tree\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n },\n \"team\": \"engine\",\n \"version\": 1\n}\n",
+          "sha256": "7dfe9fab248d36523ef82e584388c5adb167038d7d3209cca3700f533bc764a7"
+        },
+        "read": null,
+        "request": {
+          "authority": "legacy-expired-approval",
+          "continuation": {
+            "expires_at": "2000-01-01T00:00:00Z",
+            "max_starts": 1,
+            "members": []
+          },
+          "id": "legacy-expired-approval",
+          "next_decision": "review retained failure evidence",
+          "operation": "targeted-tests",
+          "owner": "engine/coordinator",
+          "paths": [
+            "/fixture/engine/tests"
+          ],
+          "phase": "validation",
+          "prerequisites": [],
+          "schema": "aegis.lifecycle-request/v1",
+          "source": {
+            "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dirty_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "team": "engine",
+          "version": 1
+        },
+        "resolution": null,
+        "results": [],
+        "review": null,
+        "routed": null,
+        "start": null,
+        "terminal": null,
+        "wait": null
+      }
+    },
+    "sequence": 2,
+    "successions": []
+  }
+}

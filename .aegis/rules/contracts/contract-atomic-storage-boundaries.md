@@ -10,8 +10,10 @@ minimum_mode: patrol
 tags: [project-contract, v4.5]
 target_paths:
   - "aegis_core/storage.py"
+  - "aegis_core/storage_shared.py"
   - "aegis_core/atomicio.py"
   - "tests/unit/core/test_storage.py"
+  - "tests/unit/core/test_storage_shared.py"
 ---
 ## Do
 Use the established atomic/locked storage APIs with explicit symlink and permission semantics; reject unsafe destinations without overwriting valid data or exposing partial/private artifacts.
@@ -24,5 +26,6 @@ Owner instructions and existing approval/release boundaries remain authoritative
 
 ## Evidence
 - tests/unit/core/test_storage.py covers exclusive creation, atomic replacement, permissions, symlink swaps and torn JSONL tails.
-- aegis_core/storage.py and atomicio.py provide the canonical publication primitives.
+- aegis_core/storage.py and atomicio.py provide the canonical publication primitives; storage_shared.py implements shared-state and ledger-directory confinement through storage's live hooks.
+- tests/unit/core/test_storage_shared.py covers confinement and permission hooks and public CLI selection of the storage security rules.
 - aegis_core/telemetry_engine/ledger.py documents shared ledger locking and append-only publication.

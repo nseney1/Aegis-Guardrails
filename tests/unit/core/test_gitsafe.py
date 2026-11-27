@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import os
 from pathlib import Path
 import re
@@ -13,11 +14,381 @@ import time
 
 import pytest
 
-from aegis_core import gitsafe
+import aegis_core.workspace.hooks as workspace_hooks
+from aegis_core import gitsafe, gitsafe_bound, gitsafe_run, gitops_fds
+from tests.helpers_team_git import strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
+
+
+def test_policy_process_environment_defaults_to_ambient_allowlist(tmp_path):
+    from aegis_core import gitsafe_policy
+    assert "PYTEST_CURRENT_TEST" in os.environ
+    envelope = gitsafe_policy.request_environment(os.environ, profile="strict/effect", root=tmp_path)
+    leaked = "PYTEST_CURRENT_TEST" in envelope or "PYTEST_CURRENT_TEST" in envelope.source
+    allowlisted = set(envelope.source).issubset(gitsafe_policy.AMBIENT_ENV)
+    assert not leaked
+    assert allowlisted
+    ordinary = gitsafe_policy.request_environment(os.environ, base={})
+    ordinary_retained = "PYTEST_CURRENT_TEST" in ordinary
+    assert ordinary_retained
+
+
+def test_policy_explicit_map_keeps_explicit_values(tmp_path):
+    from aegis_core import gitsafe_policy
+    envelope = gitsafe_policy.request_environment({"EXPLICIT_MARKER": "caller"},
+        profile="strict/effect", root=tmp_path)
+    assert envelope["EXPLICIT_MARKER"] == "caller"
+
+
+@pytest.mark.parametrize("operation", ["strict", "identity", "layer", "scope", "overrides",
+                                       "inherited", "with_vars", "replace"])
+def test_policy_environment_type_reaches_every_validation_layer(tmp_path, operation):
+    from aegis_core import gitsafe_policy as policy
+    class ChangingEnvironment(dict):
+        pass
+    values = ChangingEnvironment({"LANGUAGE": "en"})
+    if operation == "strict":
+        assert policy.strict_environment(values, environ_type=ChangingEnvironment) == dict(values)
+    elif operation == "identity":
+        assert policy.identity_environment(ChangingEnvironment(), ("version",),
+            environ_type=ChangingEnvironment) == {}
+    elif operation == "layer":
+        assert policy.environment_layer(values, allowed=None, error=gitsafe.GitError,
+            code="git_custody_refused", environ_type=ChangingEnvironment) == dict(values)
+    else:
+        options = dict(profile="strict/effect", root=tmp_path, environ_type=ChangingEnvironment)
+        source = ChangingEnvironment({"LANG": "C"})
+        if operation in ("scope", "overrides"):
+            envelope = policy.request_environment(source, **options, **{operation: values})
+        else:
+            envelope = policy.request_environment(source, **options)
+            if operation == "inherited":
+                envelope = policy.request_environment(envelope, overrides=values, **options)
+            else:
+                envelope = envelope.with_vars(values, replace=operation == "replace")
+        assert envelope["LANGUAGE"] == "en"
+        with pytest.raises(gitsafe.GitError) as caught:
+            envelope.with_vars(ChangingEnvironment({"GIT_DIR": "private-selector"}))
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "git_custody_refused", "Strict lane Git command refused.",
+            "Use the lane Git APIs or the CAS fast-forward writer.")
+        assert envelope.with_vars(ChangingEnvironment({"LANGUAGE": "retry"}))["LANGUAGE"] == "retry"
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("entry", ["run", "execute", "capture", "lane"])
+@pytest.mark.parametrize("mode", ["effect", "strict", "strict-effect"])
+@pytest.mark.parametrize("case", ["stable", "selector"])
+def test_runner_environment_type_seam_preserves_results_and_refusals(
+        repo, tmp_path, effect_lock, monkeypatch, entry, mode, case):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    class ChangingEnvironment(dict):
+        pass
+    program = gitsafe.git_executable()
+    source = ChangingEnvironment({"PATH": os.path.dirname(program)})
+    monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", ChangingEnvironment)
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": source}))
+    strict = mode != "effect"
+    fds = (effect_lock,) if mode != "strict" else None
+    identity = ChangingEnvironment() if fds is None else {}
+    def invoke():
+        context = gitsafe.custody(scratch=tmp_path, strict_lane=strict,
+            env=ChangingEnvironment() if strict else None, worktree_root=repo) if strict or entry == "capture" else nullcontext()
+        with context:
+            options = dict(effect_fds=fds, worktree_root=repo)
+            if entry == "run":
+                return gitsafe.run(["version"], repo, _env=identity if strict else None, **options)
+            if entry == "execute":
+                return gitsafe_run.execute(["version"], repo, executable=gitsafe.git_executable,
+                    legacy_runner=gitsafe.subprocess.run, error=gitsafe.GitError, environ=None,
+                    timeout=5, stdin=None, hardening=gitsafe_run.DEFAULT_HARDENING,
+                    env=identity if strict else None, tty=False, **options)
+            if entry == "capture":
+                argv = [program, *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, "version"] if strict else [program, "version"]
+                return gitsafe_run.capture(argv, cwd=repo, env=source if strict else None,
+                    stdin=None, timeout=5, **options)
+            lane = gitsafe.lane_runner(repo, tmp_path, **options)
+            return lane.run(["version"], _env=identity if strict else None)
+    if case == "selector":
+        source["GIT_DIR"] = "private-selector"
+        with pytest.raises(gitsafe.GitError) as caught:
+            invoke()
+        if entry == "capture" and strict:
+            expected = ("git_custody_refused", "Strict lane Git command refused.",
+                        "Use the lane Git APIs or the CAS fast-forward writer.")
+        elif mode == "strict":
+            expected = ("ambient_git_environment", "Ambient Git environment refused: GIT_DIR.",
+                        "Unset GIT_DIR in the environment, then retry.")
+        else:
+            expected = ("ambient_git_environment", "Ambient Git environment refused.",
+                        "Unset Git program and repository selectors, then retry.")
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == expected
+        assert caught.value.process_started is False
+        del source["GIT_DIR"]
+    for _ in range(2):
+        result = invoke()
+        assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+        assert not gitsafe_run.custody_active()
+
+
+def test_policy_environment_type_proofs_stay_separate_across_threads(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import gitsafe_policy as policy
+    class LeftEnvironment(dict):
+        pass
+    class RightEnvironment(dict):
+        pass
+    gate = Barrier(2, timeout=5)
+    def edit(own, foreign):
+        envelope = policy.request_environment(own({"LANG": "C"}), profile="strict/effect",
+            root=tmp_path, environ_type=own)
+        gate.wait()
+        for _ in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                envelope.with_vars(foreign({"LANGUAGE": "foreign"}))
+            assert caught.value.code == "effect_environment_limit"
+            changed = envelope.with_vars(own({"LANGUAGE": own.__name__}))
+            assert changed["LANGUAGE"] == own.__name__ and changed.origin is envelope.origin
+            envelope = policy.request_environment(changed, profile="strict/effect", environ_type=own)
+        gate.wait()
+        return envelope["LANGUAGE"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left = pool.submit(edit, LeftEnvironment, RightEnvironment)
+        right = pool.submit(edit, RightEnvironment, LeftEnvironment)
+        assert left.result(timeout=10) == "LeftEnvironment"
+        assert right.result(timeout=10) == "RightEnvironment"
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("ordinary", {"marker": "override"}),
+    ("strict", "valid"),
+    ("profile", "git_custody_refused"),
+    ("root", "git_custody_refused"),
+    ("roots", "effect_environment_limit"),
+    ("kind", "git_custody_refused"),
+    ("entries", "ambient_environment_too_large"),
+    ("key", "ambient_environment_too_large"),
+    ("value", "ambient_environment_too_large"),
+    ("nul", "git_custody_refused"),
+    ("type", "git_custody_refused"),
+    ("redirect", "ambient_git_environment"),
+    ("program", "ambient_git_environment"),
+    ("override", "git_custody_refused"),
+])
+def test_policy_environment_golden_before_and_after_extraction(tmp_path, case, expected):
+    source, options = {}, {"profile": "strict/effect", "root": tmp_path}
+    if case == "ordinary":
+        source = {"marker": "source"}
+        options = dict(base={}, scope={"marker": "scope"}, overrides={"marker": "override"})
+    elif case == "profile": options["profile"] = "invalid"
+    elif case == "root": options["root"] = "relative"
+    elif case == "roots": options["roots"] = [tmp_path] * 65
+    elif case == "kind": options["kind"] = "invalid"
+    elif case == "entries": source = {str(i): "value" for i in range(513)}
+    elif case == "key": source = {"k" * 257: "value"}
+    elif case == "value": source = {"key": "v" * 65537}
+    elif case == "nul": source = {"key": "\0"}
+    elif case == "type": source = {"key": 1}
+    elif case == "redirect": source = {"GIT_DIR": "private"}
+    elif case == "program": source = {"GIT_SSH": "private"}
+    elif case == "override": options["overrides"] = {"GIT_DIR": "private"}
+    refusals = {
+        "git_custody_refused": ("Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer."),
+        "effect_environment_limit": ("Git operation effect environment exceeds supported limits.", "Reduce the supplied environment to bounded string entries; no effect process started."),
+        "entries": ("Ambient environment has too many variables.", "Reduce the environment to at most 512 variables, then retry."),
+        "key": ("Ambient environment variable name exceeds its limit.", "Shorten every environment variable name to at most 256 characters, then retry."),
+        "value": ("Ambient environment value exceeds its limit.", "Reduce every environment value to at most 65,536 characters, then retry."),
+        "redirect": ("Ambient Git environment refused: GIT_DIR.", "Unset GIT_DIR in the environment, then retry."),
+        "ambient_git_environment": ("Ambient Git environment refused.", "Unset Git program and repository selectors, then retry."),
+    }
+    if case in ("ordinary", "strict"):
+        result = gitsafe_run.request_environment(source, **options)
+        if case == "ordinary": assert result == expected
+        else:
+            assert isinstance(result, gitsafe_run.Environment)
+            assert result["GIT_TERMINAL_PROMPT"] == "0" and result["GIT_ALLOW_PROTOCOL"] == ""
+            assert result.root == os.path.normcase(str(tmp_path.resolve()))
+        return
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.request_environment(source, **options)
+    error = caught.value
+    assert (error.code, str(error), error.next_action, error.process_started) == (
+        expected, *refusals.get(case, refusals.get(expected, (None, None))), False)
+
+
+@pytest.mark.parametrize("operation", ["headers", "object", "objects"])
+@pytest.mark.parametrize("case", ["valid", "malformed", "oversized", "missing", "corrupt", "limit"])
+def test_policy_private_reader_golden_before_and_after_extraction(tmp_path, operation, case):
+    from contextlib import nullcontext
+    data, oid = b"payload", gitsafe.blob_id(b"payload")
+    oids = [oid] if case != "malformed" else ["private-input"]
+    if case == "oversized": oids = [oid] * 20001
+    body = oid.encode() + b" blob 7\n"
+    if case == "missing": body = oid.encode() + b" missing\n"
+    if case == "corrupt": body = b"private-input\n"
+    def runner(args, cwd, *, stdin):
+        output = body if args == ["cat-file", "--batch-check"] else data
+        if args == ["cat-file", "--batch"]: output = body + data + b"\n"
+        return subprocess.CompletedProcess(args, 0, output, b"")
+    def custody(**kwargs): return nullcontext()
+    def headers(cwd, values, **kwargs):
+        return gitsafe_run.private_headers(cwd, values, runner=runner,
+            batch=["cat-file", "--batch-check"], custody=custody, error=gitsafe.GitError, **kwargs)
+    def read():
+        if operation == "headers": return headers(tmp_path, oids, env={}, scratch=tmp_path)
+        if operation == "object":
+            # The single reader has a scalar OID and a separate bounded cap.
+            value = oids[0] if case != "oversized" else "o" * 16385
+            return gitsafe_run.private_object(tmp_path, value, kind="blob", max_bytes=6 if case == "limit" else 7,
+                env={}, scratch=tmp_path, headers=headers, runner=runner, custody=custody, error=gitsafe.GitError)
+        return gitsafe_run.private_objects(tmp_path, oids, max_bytes=6 if case == "limit" else 7,
+            max_object_bytes=7, env={}, scratch=tmp_path, headers=headers, runner=runner,
+            batch=["cat-file", "--batch"], custody=custody, error=gitsafe.GitError)
+    if case == "valid" or operation == "headers" and case in ("missing", "limit"):
+        result = read()
+        expected = {oid: None if case == "missing" else ("blob", 7)} if operation == "headers" else (
+            data if operation == "object" else {oid: ("blob", data)})
+        assert result == expected
+    else:
+        with pytest.raises(gitsafe.GitError) as caught: read()
+        code, message = ("git_object_limit", "private object size limit exceeded") if case == "limit" else (
+            "invalid_object", "invalid private object request" if case in ("malformed", "oversized") else "invalid private object")
+        assert (caught.value.code, str(caught.value), getattr(caught.value, "next_action", None)) == (code, message, None)
+
+
+def test_policy_implementation_is_below_runner_and_test_only_facades_are_removed():
+    from aegis_core import gitsafe_policy
+    for name in ("private_headers", "private_object", "private_objects"):
+        assert getattr(gitsafe_run, name) is getattr(gitsafe_policy, name)
+    for name in ("private_object_headers", "read_private_object", "read_private_objects"):
+        assert not hasattr(gitsafe, name)
+    tree = ast.parse((ROOT / "aegis_core/gitsafe_policy.py").read_text(encoding="utf-8"))
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assert not any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                   and n.value.id == "os" and n.attr in ("environ", "getenv")
+                   for function in functions for n in ast.walk(function))
+
+
+def test_policy_facade_imports_are_public_and_declared():
+    from aegis_core import gitsafe_policy
+    tree = ast.parse((ROOT / "aegis_core/gitsafe_run.py").read_text(encoding="utf-8"))
+    imports = [alias for node in tree.body if isinstance(node, ast.ImportFrom)
+               and node.module == "aegis_core.gitsafe_policy" for alias in node.names]
+    assert imports
+    assert all(not alias.name.startswith("_") and alias.name in gitsafe_policy.__all__
+               for alias in imports)
+    # ChangingEnvironment tests own this facade patch point; it must still feed
+    # the request constructor rather than a copied policy-module global.
+    assert gitsafe_run._ENVIRON_TYPE is gitsafe_policy.ENVIRON_TYPE
+
+
+@pytest.mark.parametrize("name", ["HARDENING_KEEP_HOOKS_PATH", "DEFAULT_HARDENING",
+                                  "_LANE_OPTIONS", "_FIXED_CONFIG", "_argv", "_command"])
+def test_selector_pinned_policy_sites_stay_in_transport(name):
+    def definitions(module):
+        tree = ast.parse((ROOT / "aegis_core" / (module + ".py")).read_text(encoding="utf-8"))
+        return {node.name if isinstance(node, ast.FunctionDef) else target.id
+                for node in tree.body
+                for target in ([node] if isinstance(node, ast.FunctionDef) else
+                               node.targets if isinstance(node, ast.Assign) else [])
+                if isinstance(target, (ast.Name, ast.FunctionDef))}
+    assert name in definitions("gitsafe_run")
+    assert name not in definitions("gitsafe_policy")
+
+
+@pytest.mark.parametrize("entry", ["facade", "transport"])
+@pytest.mark.parametrize("options, message", [
+    ({"strict_lane": 1}, "invalid custody mode"),
+    ({"stdout_limit": True}, "invalid custody limit"),
+    ({"stderr_limit": -1}, "invalid custody limit"),
+    ({"scratch": "relative"}, "invalid custody scratch"),
+    ({"scratch": "x" * 16385}, "invalid custody scratch"),
+    ({"env": []}, "invalid custody environment"),
+    ({"env": {str(i): "v" for i in range(65)}}, "invalid custody environment"),
+    ({"env": {"key": "v" * 65537}}, "invalid custody environment"),
+    ({"env": {"key": "\0"}}, "invalid custody environment"),
+])
+def test_retained_custody_surfaces_raise_git_error_and_recover(tmp_path, entry, options, message):
+    context = gitsafe.custody if entry == "facade" else gitsafe_run.custody
+    with pytest.raises(gitsafe.GitError) as caught:
+        with context(**{**dict(scratch=tmp_path), **options}):
+            pytest.fail("invalid request entered custody")
+    assert (caught.value.code, str(caught.value), getattr(caught.value, "next_action", None)) == (
+        "invalid_custody", message, None)
+    assert not gitsafe_run.custody_active()
+    with context(scratch=tmp_path): assert gitsafe_run.custody_active()
+    assert not gitsafe_run.custody_active()
+
+
+def test_retained_capture_default_refusal_is_git_error(tmp_path):
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([], cwd=tmp_path, env={}, stdin=None, timeout=1)
+    assert (caught.value.code, str(caught.value), caught.value.process_started) == (
+        "invalid_custody", "invalid custody capture", False)
+
+
+_NATIVE_STUB = {}
+
+
+def _native_program(path, source, *, compiler=None):
+    """Native test executable with an owner-chosen, embedded fixture interpreter."""
+    import json
+    import tempfile
+    binary = _NATIVE_STUB.get("binary")
+    if binary is None or not binary.is_file():
+        compiler = compiler or shutil.which("cc")
+        if compiler is None:
+            pytest.skip("native strict-effect fixture needs an installed C compiler")
+        directory = Path(tempfile.mkdtemp(prefix="native-stub-", dir=path.parent))
+        binary = directory / "launcher"
+        _NATIVE_STUB["binary"] = binary
+        code = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+    char self[16384], data[16392];
+    ssize_t length=readlink("/proc/self/exe",self,sizeof(self)-1);
+    if(length<0 || length>=(ssize_t)sizeof(self)-1) return 124;
+    self[length]=0;
+    snprintf(data,sizeof(data),"%s.source",self);
+    FILE *f=fopen(data,"rb");
+    if(!f) return 124;
+    struct stat st;
+    if(fstat(fileno(f),&st) || st.st_size<2 || st.st_size>1048576) {fclose(f);return 124;}
+    char *body=calloc((size_t)st.st_size+1,1);
+    if(!body) {fclose(f);return 124;}
+    if(fread(body,1,(size_t)st.st_size,f)!=(size_t)st.st_size) {fclose(f);free(body);return 124;}
+    fclose(f);
+    char **args=calloc((size_t)argc+5,sizeof(char*));
+    if(!args) {free(body);return 124;}
+    args[0]=body[0]=='P'?PYTHON:"/bin/sh";
+    args[1]="-c";
+    args[2]=body+2;
+    int offset=body[0]=='P'?2:3;
+    if(offset==3) args[3]=self;
+    for(int i=1;i<argc;i++) args[i+offset]=argv[i];
+    execv(args[0],args);
+    free(args);free(body);return 124;
+}
+'''
+        code = "#define PYTHON " + json.dumps(sys.executable) + "\n" + code
+        subprocess.run([compiler, "-x", "c", "-O2", "-o", str(binary), "-"],
+            input=code.encode(), env={"PATH": os.defpath, "LC_ALL": "C"}, check=True, capture_output=True, timeout=30)
+    first, _, body = source.partition("\n")
+    python = "python" in first or sys.executable in first
+    if python:
+        body = "import sys; sys.argv[0]=" + repr(str(path)) + "\n" + body
+    path.with_name(path.name + ".source").write_text(("P\n" if python else "S\n") + body, encoding="utf-8")
+    shutil.copy2(binary, path)
+    path.chmod(0o700)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -100,7 +471,7 @@ def test_timeout_and_missing_git_raise_git_error(monkeypatch, tmp_path: Path):
 
     (tmp_path / "no-git").mkdir()
     monkeypatch.setenv("PATH", str(tmp_path / "no-git"))
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["status"], tmp_path)
 
 
@@ -137,7 +508,7 @@ def test_a_git_planted_behind_an_empty_or_relative_path_entry_is_never_run(tmp_p
     assert not marker.exists(), "a git found through a relative PATH entry was run"
 
     monkeypatch.setenv("PATH", entry)
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["--version"], repo)
     assert not marker.exists()
 
@@ -147,12 +518,11 @@ def test_on_windows_the_current_directory_is_not_searched_for_git(tmp_path, monk
     # in a cloned repository, its git.exe would run.
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("PATHEXT", os.pathsep.join([".COM", ".EXE", ".BAT", ".CMD"]))
-    for where in (tmp_path / "repo", tmp_path / "Git" / "cmd"):
-        where.mkdir(parents=True)
-        (where / "git.exe").write_bytes(b"MZ")
-        (where / "git.exe").chmod(0o755)
-    monkeypatch.chdir(tmp_path / "repo")
-    monkeypatch.setenv("PATH", str(tmp_path / "Git" / "cmd"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "git.exe").write_bytes(b"MZ")
+    (repo / "git.exe").chmod(0o755)
+    monkeypatch.chdir(repo)
     started = []
 
     def record(argv, **kwargs):
@@ -160,8 +530,12 @@ def test_on_windows_the_current_directory_is_not_searched_for_git(tmp_path, monk
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(gitsafe.subprocess, "run", record)
-    gitsafe.run(["status"], tmp_path / "repo")
-    assert started == [str(tmp_path / "Git" / "cmd" / "git.exe")]
+    with _outside_programs(repo) as host:
+        (host / "git.exe").write_bytes(b"MZ")
+        (host / "git.exe").chmod(0o755)
+        monkeypatch.setenv("PATH", str(host))
+        gitsafe.run(["status"], repo)
+        assert started == [str(host / "git.exe")]
 
 
 # ── The fsmonitor regression (red team blocker) ──────────────────────────────
@@ -570,6 +944,8 @@ def test_read_blob_returns_committed_bytes(repo: Path):
     (repo / "a.py").write_text("a = 9\n", encoding="utf-8")  # the worktree is not what is read
     assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
     assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None
+
+
     assert gitsafe.read_blob(repo, "no-such-rev", "a.py") is None
 
 
@@ -648,6 +1024,251 @@ def test_blob_sizes_reads_each_blobs_size_from_its_header(repo: Path):
     sizes = {oid: int(_git(repo, "cat-file", "-s", oid)) for oid in (oid_a, oid_gone)}
     assert gitsafe.blob_sizes(repo, []) == {}
     assert gitsafe.blob_sizes(repo, [oid_a, oid_gone, oid_a]) == sizes
+
+
+@pytest.mark.parametrize("replace_env", [False, True])
+def test_custody_replace_env_controls_the_real_git_object_children(repo, tmp_path, monkeypatch, replace_env):
+    import json
+    from types import SimpleNamespace
+
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    markers = {"CODEX_SESSION_ID": "fixture-session", "ANTHROPIC_API_KEY": "fixture-billing", "GIT_TRACE": "0"}
+    ambient = {**os.environ, **markers}
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": ambient}))
+    trace = tmp_path / "object-children.jsonl"
+    supplied = {"PATH": _REAL_GIT_DIR, "GIT_TRACE2_EVENT": str(trace), "GIT_TRACE2_ENV_VARS": ",".join(markers)}
+    if os.name == "nt":
+        supplied.update({key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ})
+    options = {"replace_env": True} if replace_env else {}
+    with gitsafe.custody(scratch=tmp_path, env=supplied, **options):
+        assert gitsafe.blob_sizes(repo, [oid]) == {oid: 6}
+        assert gitsafe.read_blobs(repo, [oid]) == {oid: b"a = 1\n"}
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    children = {event["sid"] for event in events if event.get("name") == "cat-file"}
+    assert len(children) == 2
+    for sid in children:
+        seen = {event.get("param") for event in events if event["sid"] == sid}
+        assert markers.keys() & seen == (set() if replace_env else markers.keys())
+
+
+@pytest.mark.parametrize("options", [{"replace_env": 1}, {"replace_env": True, "strict_lane": True}])
+def test_custody_rejects_invalid_replacement_mode(tmp_path, options):
+    with pytest.raises(gitsafe.GitError) as error:
+        with gitsafe.custody(scratch=tmp_path, **options):
+            pytest.fail("invalid replacement scope was entered")
+    assert error.value.code == "invalid_custody"
+
+
+@pytest.mark.parametrize("pin_program", [False, True])
+def test_replacement_full_blob_reads_never_read_ambient_environment(repo, tmp_path, pin_program):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    _git(repo, "branch", "scoped-base")
+    code = """
+import os, sys
+from collections.abc import Mapping
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitsafe_run
+
+class UnreadableEnvironment(Mapping):
+    def __getitem__(self, key):
+        raise AssertionError('ambient environment read')
+    def __iter__(self):
+        raise AssertionError('ambient environment iteration')
+    def __len__(self):
+        raise AssertionError('ambient environment length')
+
+repo, scratch, oid, program, pin = sys.argv[2:]
+values = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
+values.update(PATH=str(Path(program).parent), GIT_CONFIG_NOSYSTEM='1',
+              GIT_CONFIG_GLOBAL=os.devnull, GITHUB_BASE_REF='scoped-base')
+original = os.environ
+try:
+    os.environ = UnreadableEnvironment()
+    with gitsafe.custody(scratch=scratch, env=values, replace_env=True,
+                         program=program if pin == 'True' else None):
+        assert gitsafe.read_blobs(repo, [oid]) == {oid: b'a = 1\\n'}
+        assert gitsafe.resolve_base_ref(repo) == 'scoped-base'
+        with gitsafe.custody(scratch=scratch, stdout_limit=4096):
+            assert gitsafe_run.request_environment(base={}) == values
+            assert gitsafe.read_blobs(repo, [oid]) == {oid: b'a = 1\\n'}
+finally:
+    os.environ = original
+"""
+    completed = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(tmp_path),
+                                oid, shutil.which("git"), str(pin_program)], capture_output=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+
+def test_replacement_refuses_lookup_and_nested_environment_overrides(repo, tmp_path):
+    scoped = {"PATH": _REAL_GIT_DIR, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    override = {"PATH": str(tmp_path / "wrong")}
+    with gitsafe.custody(scratch=tmp_path, env=scoped, replace_env=True):
+        for call in (lambda: gitsafe.git_executable(environ=override, cwd=repo),
+                     lambda: gitsafe.resolve_base_ref(repo, environ=override),
+                     lambda: gitsafe_run.request_environment(override),
+                     lambda: gitsafe_run.request_environment(overrides=override),
+                     lambda: gitsafe_run.request_environment(base=override)):
+            with pytest.raises(gitsafe.GitError) as caught:
+                call()
+            assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+        for kwargs in ({"env": {}}, {"replace_env": False}, {"replace_env": 1},
+                       {"program": shutil.which("git")}, {"replace_env": True, "program": shutil.which("git")}):
+            with pytest.raises(gitsafe.GitError) as caught:
+                with gitsafe.custody(scratch=tmp_path, **kwargs):
+                    pytest.fail("conflicting nested custody was entered")
+            assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+        with gitsafe.custody(scratch=tmp_path, env=dict(scoped), replace_env=True):
+            assert gitsafe_run.request_environment(base={}) == scoped
+    assert gitsafe_run.request_environment(override, base={}) == override
+
+    program = shutil.which("git")
+    with gitsafe.custody(scratch=tmp_path, env=scoped, replace_env=True, program=program):
+        with pytest.raises(gitsafe.GitError) as caught:
+            with gitsafe.custody(scratch=tmp_path, replace_env=True, program=sys.executable):
+                pytest.fail("different nested executable was accepted")
+        assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+        with gitsafe.custody(scratch=tmp_path, replace_env=True, program=program):
+            assert gitsafe.git_executable(cwd=repo) == program
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("source", [None, {"PATH": ""}])
+def test_replacement_refuses_strict_program_lookup(repo, tmp_path, source):
+    with gitsafe.custody(scratch=tmp_path, env={"PATH": _REAL_GIT_DIR}, replace_env=True):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.custody_program(repo, environ=source)
+        assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+
+
+def test_nested_replacement_refuses_ambient_or_changing_inputs(tmp_path, monkeypatch):
+    class AmbientValues(dict):
+        def __len__(self):
+            pytest.fail("nested replacement read ambient inputs")
+
+    class ChangingValues(dict):
+        def items(self):
+            iterator = iter(super().items())
+            yield next(iterator)
+            self["PATH2"] = "changed"
+            yield from iterator
+
+    monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", AmbientValues)
+    for source in (ChangingValues(PATH=_REAL_GIT_DIR), AmbientValues(PATH=_REAL_GIT_DIR)):
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": _REAL_GIT_DIR}, replace_env=True):
+            with pytest.raises(gitsafe.GitError) as caught:
+                with gitsafe.custody(scratch=tmp_path, env=source):
+                    pytest.fail("unstable nested custody was entered")
+            assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+            assert gitsafe_run.request_environment(base={}) == {"PATH": _REAL_GIT_DIR}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses executable shell fixtures")
+def test_replacement_git_uses_scoped_path_and_keeps_the_repository_fence(repo, tmp_path, fresh_git_lookup):
+    from tests.conftest import symlink_or_skip
+
+    ambient, selected, alias = (tmp_path / name for name in ("ambient", "selected", "alias"))
+    ambient_marker, selected_marker, repo_marker = (tmp_path / name for name in ("ambient-ran", "selected-ran", "repo-ran"))
+    _plant_git(ambient, ambient_marker)
+    _plant_git(selected, selected_marker)
+    _plant_git(repo / "bin", repo_marker)
+    alias.mkdir()
+    symlink_or_skip(repo / "bin" / "git", alias / "git")
+    supplied = {"PATH": os.pathsep.join(map(str, (repo / "bin", alias, selected)))}
+    with _temporary_env({"PATH": str(ambient)}):
+        with gitsafe.custody(scratch=tmp_path, env=supplied, replace_env=True):
+            assert gitsafe.run(["version"], repo).returncode == 0
+        assert selected_marker.exists()
+        assert not ambient_marker.exists() and not repo_marker.exists()
+        assert gitsafe.run(["version"], repo).returncode == 0
+    assert ambient_marker.exists()
+
+
+def test_replacement_git_passes_scoped_pathext_to_fenced_lookup(repo, tmp_path, monkeypatch, fresh_git_lookup):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def which(name, **options):
+        calls.append((name, options))
+        return sys.executable
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=which))
+    search = str(tmp_path / "host")
+    with _bound_ordinary_root(repo), _temporary_env({"PATHEXT": ".CMD;.EXE"}):
+        assert gitsafe.git_executable(cwd=repo) == sys.executable
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": search, "PATHEXT": ".EXE"}, replace_env=True):
+            assert gitsafe.git_executable(cwd=repo) == sys.executable
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": search}, replace_env=True):
+            assert gitsafe.git_executable(cwd=repo) == sys.executable
+        assert gitsafe.git_executable(cwd=repo) == sys.executable
+    fence = {"outside": _bound_fence(repo), "fence_program": True, "descriptors": False}
+    assert calls == [("git", fence), ("git", dict(fence, path=search, pathext=".EXE")),
+                     ("git", dict(fence, path=search, pathext=""))]
+
+def test_replacement_windows_environment_canonicalizes_once_and_refuses_conflicts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    supplied = {"Path": "owner-bin", "PATH": "owner-bin", "PathExt": ".EXE"}
+    with gitsafe.custody(scratch=tmp_path, env=supplied, replace_env=True):
+        supplied["PathExt"] = ".CMD"
+        assert gitsafe_run.custody_inputs() == {"PATH": "owner-bin", "PATHEXT": ".EXE"}
+    with pytest.raises(gitsafe.GitError) as error:
+        with gitsafe.custody(scratch=tmp_path, env={"Path": "one", "PATH": "two"}, replace_env=True):
+            pytest.fail("conflicting Windows keys entered custody")
+    assert (error.value.code, str(error.value)) == ("invalid_custody", "invalid custody environment")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses executable and symlink fixtures")
+def test_replacement_absolute_program_is_subject_to_the_repository_fence(repo, tmp_path, fresh_git_lookup):
+    from tests.conftest import symlink_or_skip
+
+    marker = tmp_path / "checkout-program-ran"
+    _plant_git(repo / "bin", marker)
+    alias = tmp_path / "owner-bin"
+    alias.mkdir()
+    symlink_or_skip(repo / "bin" / "git", alias / "git")
+    with _bound_ordinary_root(repo):
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": _REAL_GIT_DIR}, replace_env=True, program=str(alias / "git")):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["version"], repo)
+        assert (caught.value.code, caught.value.process_started) == ("invalid_custody", False)
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": ""}, replace_env=True, program=shutil.which("git")):
+            assert gitsafe.run(["version"], repo).stdout.startswith(b"git version ")
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="uses native Windows executable suffix selection")
+def test_replacement_git_uses_scoped_windows_pathext(repo, tmp_path, fresh_git_lookup):
+    host = tmp_path / "host"
+    host.mkdir()
+    exe, shim = host / "git.exe", host / "git.cmd"
+    exe.touch()
+    shim.touch()
+    with _bound_ordinary_root(repo), _temporary_env({"PATH": str(host), "PATHEXT": ".CMD;.EXE"}):
+        assert gitsafe.git_executable(cwd=repo) == str(shim)
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": str(host), "PATHEXT": ".EXE"}, replace_env=True):
+            assert gitsafe.git_executable(cwd=repo) == str(exe)
+        with gitsafe.custody(scratch=tmp_path, env={"PATH": str(host)}, replace_env=True):
+            assert gitsafe.git_executable(cwd=repo) == str(exe)
+        (host / "git.com").touch()
+        with gitsafe.custody(scratch=tmp_path, env={"Path": str(host), "PathExt": ".EXE"}, replace_env=True):
+            assert gitsafe.git_executable(cwd=repo) == str(exe)
+        assert gitsafe.git_executable(cwd=repo) == str(shim)
+
+
+@pytest.mark.parametrize("options", [{}, {"effect_fds": (-1,)}])
+@pytest.mark.usefixtures("strict_program")
+def test_lane_runner_refuses_replacement_custody_before_discovery(tmp_path, monkeypatch, options):
+    def unexpected_discovery(*args, **kwargs):
+        pytest.fail("lane issuance reached Git executable discovery")
+
+    monkeypatch.setattr(gitsafe, "custody_program", unexpected_discovery)
+    with gitsafe.custody(scratch=tmp_path, env={}, replace_env=True):
+        with pytest.raises(gitsafe.GitError) as error:
+            gitsafe.lane_runner(tmp_path, tmp_path, environ={"PATH": _REAL_GIT_DIR}, **options)
+    assert error.value.code == "invalid_custody" and not error.value.process_started
 
 
 @pytest.mark.parametrize("what", ["missing", "commit"])
@@ -1137,7 +1758,7 @@ def test_no_package_module_reaches_gitsafe_private_names():
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel != "aegis_core/gitsafe.py":
+            if rel not in ("aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py", "aegis_core/gitsafe_policy.py"):
                 offenders += _single_reader_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
 
@@ -1214,27 +1835,194 @@ _RUN_ALLOWED = {
 }
 # `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
 # identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
-_RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}}
+_RUN_ALLOWED_IN = {
+    "aegis_core/team_git_snapshot.py": set(),
+    "aegis_core/sync.py": {"remote", "var", "update-ref", "push"},
+    # GM-1 maps refs/remotes/R/B to target B only through the longest configured remote name,
+    # so the approval policy lists remote names (read-only, size-bounded by the caller).
+    "aegis_core/approval_policy.py": {"remote"},
+    # BL-16d: read-only worktree list; test_team.py pins the exact list argv.
+    "aegis_core/team.py": {"worktree"},
+}
 
 
-def _run_subcommand_offenders(rel: str, source: str) -> list:
-    """``gitsafe.run([...])`` and ``gitsafe.run_checked([...])`` calls whose subcommand (after leading
-    ``-c <setting>`` pairs) is not allowed. Wrappers that pass ``list(args)`` (sync._git) are out of this
-    detector's reach."""
-    offenders = []
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("run", "run_checked")
-                and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
-                and node.args and isinstance(node.args[0], ast.List)):
+# This is a spelling/shape guard only. The spawn-boundary runtime classifier
+# enforces strict custody; this check deliberately performs no Python dataflow.
+_STRICT_RUNNERS = {"run", "run_checked", "_run", "execute", "capture", "checked", "output", "text"}
+LANE_MODULES = frozenset({"aegis_core/team_git.py", "aegis_core/team_git_snapshot.py"})
+
+
+def _literal_command(argument):
+    if not isinstance(argument, (ast.List, ast.Tuple)):
+        return None
+    elements = argument.elts
+    position = 0
+    while position < len(elements):
+        node = elements[position]
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return None
+        if node.value == "-c":
+            position += 2
+        elif node.value.startswith("-"):
+            position += 1
+        else:
+            return node.value
+    return None
+
+
+def _lane_transfer_helpers(root):
+    """Only exported, undecorated module functions can transfer a runner."""
+    transfers = set()
+    for relative in LANE_MODULES:
+        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
+        exports = next((ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__"
+                                                    for target in node.targets)), ())
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in exports and not node.decorator_list:
+                arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+                if any(argument.arg in ("runner", "_runner") for argument in arguments):
+                    transfers.add(node.name)
+    return transfers
+
+
+def _run_subcommand_offenders(rel, source, *, root=ROOT):
+    tree, offenders = ast.parse(source), []
+    if rel in LANE_MODULES:
+        transfers = _lane_transfer_helpers(root)
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_lane_operation"), None)
+        wrapper = next((n for n in entry.body if isinstance(n, ast.FunctionDef) and n.name == "wrapped"), None) if entry else None
+        store_type = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GitStore"), None)
+        enter = next((n for n in store_type.body if isinstance(n, ast.FunctionDef) and n.name == "__enter__"), None) if store_type else None
+        require = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_require_runner"), None)
+        allowed = {"gitsafe": {"MERGE_TREE_MIN_VERSION", "GitError"},
+                   "gitsafe_run": set()}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run"):
+                offenders.append(f"{rel}:{node.lineno} bare Git import")
+            if isinstance(node, ast.Import) and any(a.name in ("aegis_core.gitsafe", "aegis_core.gitsafe_run") for a in node.names):
+                offenders.append(f"{rel}:{node.lineno} aliased Git import")
+            if isinstance(node, ast.ImportFrom) and node.module == "aegis_core" and any(a.asname for a in node.names if a.name in allowed):
+                offenders.append(f"{rel}:{node.lineno} aliased Git import")
+            if not isinstance(node, ast.Name) or node.id not in allowed or not isinstance(node.ctx, ast.Load):
+                continue
+            parent = parents.get(node)
+            scope = parent
+            scopes = []
+            while scope is not None:
+                if isinstance(scope, ast.FunctionDef):
+                    scopes.append(scope)
+                scope = parents.get(scope)
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                offenders.append(f"{rel}:{node.lineno} forwards unrestricted Git module")
+                continue
+            attribute, context = parent.attr, parents.get(parent)
+            factory = (node.id == "gitsafe" and attribute == "lane_runner" and entry in scopes
+                       and isinstance(context, ast.Call) and context.func is parent)
+            type_check = (node.id == "gitsafe_run" and attribute == "LaneRunner"
+                          and isinstance(context, ast.Call) and isinstance(context.func, ast.Name)
+                          and context.func.id == "isinstance")
+            if attribute not in allowed[node.id] and not factory and not type_check:
+                offenders.append(f"{rel}:{node.lineno} unrestricted Git reference")
+        protected = {"cas", "paths", "publish", "_run"}
+        lane_methods = {"run", "run_checked", "paths", "environment", "read_ref", "cas", "publish",
+                        "read_private_object", "read_private_objects", "private_object_headers"}
+        for module in ("gitsafe.py", "gitsafe_run.py", "gitsafe_policy.py"):
+            protected.update(n.name for n in ast.parse((root / "aegis_core" / module).read_text(encoding="utf-8")).body
+                             if isinstance(n, ast.FunctionDef))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in ("runner", "_runner") and isinstance(node.ctx, ast.Load):
+                parent = parents.get(node)
+                scope = parent
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                call = isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                transfer = call and parent.func.id in transfers
+                type_check = call and parent.func.id == "isinstance" and require is not None and scope is require
+                retain = isinstance(parent, ast.Assign) and enter is not None and scope is enter and ast.unparse(parent.targets[0]) == "self._lane"
+                inject = isinstance(parent, ast.keyword) and parent.arg == "_runner" and wrapper is not None and scope is wrapper
+                if not (isinstance(parent, ast.Attribute) and parent.value is node or transfer or type_check or retain or inject):
+                    offenders.append(f"{rel}:{node.lineno} unproved lane capability escape")
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id in ("runner", "_runner") and node.attr not in lane_methods):
+                offenders.append(f"{rel}:{node.lineno} unissued lane capability access")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type"
+                    and any(isinstance(arg, ast.Name) and arg.id in ("runner", "_runner") for arg in node.args)):
+                offenders.append(f"{rel}:{node.lineno} derives lane constructor")
+            if isinstance(node, ast.Name) and node.id in ("runner", "_runner") and isinstance(node.ctx, (ast.Store, ast.Del)):
+                parent, scope = parents.get(node), parents.get(node)
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                factory_binding = (node.id == "runner" and wrapper is not None and scope is wrapper
+                    and isinstance(parent, ast.Assign) and isinstance(parent.value, ast.IfExp)
+                    and ast.unparse(parent.value.body) == "store._lane"
+                    and isinstance(parent.value.orelse, ast.Call)
+                    and ast.unparse(parent.value.orelse.func) == "gitsafe.lane_runner")
+                if not factory_binding:
+                    offenders.append(f"{rel}:{node.lineno} rebinds lane capability")
+            if not isinstance(node, ast.Attribute) or node.attr not in protected:
+                continue
+            if node.attr == "_run" and isinstance(node.value, ast.Name) and node.value.id in ("store", "self"):
+                continue  # GitStore's own guarded entry; it never accepts a runner.
+            if isinstance(node.value, ast.Name) and node.value.id in allowed:
+                continue  # Module references were checked above.
+            scope = parents.get(node)
+            while scope is not None and not isinstance(scope, ast.FunctionDef):
+                scope = parents.get(scope)
+            receiver = node.value.id if isinstance(node.value, ast.Name) else None
+            body = [] if scope is None else scope.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                body = body[1:]
+            proof = body[0].value if body and isinstance(body[0], ast.Expr) else None
+            checked = (isinstance(proof, ast.Call) and isinstance(proof.func, ast.Name)
+                and proof.func.id == "_require_runner" and len(proof.args) == 1
+                and isinstance(proof.args[0], ast.Name) and proof.args[0].id == receiver)
+            if receiver not in ("runner", "_runner") or not checked:
+                offenders.append(f"{rel}:{node.lineno} unproved runner reference")
+            if node.attr == "cas" and (scope is None or scope.name != "cas_fast_forward" or parents.get(scope) is not tree):
+                offenders.append(f"{rel}:{node.lineno} CAS outside its lane entry")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (isinstance(node.func, ast.Name) and node.func.id == "replace"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "replace"
+                    and (ast.unparse(node.func.value) in ("dataclasses", "dc")
+                         or any(isinstance(arg, ast.Name) and arg.id in ("runner", "_runner") for arg in node.args))):
+                offenders.append(f"{rel}:{node.lineno} replaces lane capability")
+            if isinstance(node, ast.Call) and any(k.arg in ("_env", "env", "scratch") for k in node.keywords):
+                scope = parents.get(node)
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                if not (scope and scope.name == "_run" and parents.get(scope) in tree.body
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                        and all(k.arg != "_env" or isinstance(k.value, ast.Name) and k.value.id == "extra_env" for k in node.keywords)):
+                    offenders.append(f"{rel}:{node.lineno} caller spawn environment")
+        return offenders
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
-        elts = node.args[0].elts
-        while len(elts) > 1 and isinstance(elts[0], ast.Constant) and elts[0].value == "-c":
-            elts = elts[2:]
-        head = elts[0].value if elts and isinstance(elts[0], ast.Constant) else None
-        if isinstance(head, str) and head not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
-            offenders.append(f"{rel}:{node.lineno} runs git {head}")
+        if node.func.attr not in _STRICT_RUNNERS or not isinstance(node.func.value, ast.Name) or node.func.value.id != "gitsafe":
+            continue
+        argument = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg in ("args", "argv")), None)
+        command = _literal_command(argument)
+        if command is not None and command not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
+            offenders.append(f"{rel}:{node.lineno} runs git {command}")
     return offenders
+
+
+@pytest.mark.parametrize("source", [
+    "from dataclasses import replace\ndef operation(_runner):\n _require_runner(_runner)\n replace(_runner, scratch=root).run(['read-tree', '--empty'])",
+    "import dataclasses as dc\ndef operation(_runner):\n _require_runner(_runner)\n dc.replace(_runner, scratch=root).run(['read-tree', '--empty'])",
+    "def outer():\n def cas_fast_forward(_runner):\n  _require_runner(_runner)\n  _runner.cas(ref, new, old)",
+    "def operation(_runner):\n _require_runner(_runner)\n _runner.run(['version'], _env={'GIT_TRACE': root})",
+    "def operation(_runner):\n _require_runner(_runner)\n _runner._run(['version'])",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(_runner._lane_binding)",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(type(_runner)(root,scratch,services,token))",
+    "def operation(_runner):\n _require_runner(_runner)\n getattr(_runner, 'cas')(ref,new,old)",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(_runner)",
+    "def outer():\n def _lane_operation():\n  def wrapped(store):\n   runner = store._lane if store.active else gitsafe.lane_runner(store.repo, store.scratch)\n   return forward(_runner=runner)",
+])
+def test_lane_guard_refuses_environment_replacement_and_nested_cas(source):
+    assert _run_subcommand_offenders("aegis_core/team_git.py", source)
 
 
 def test_gitsafe_run_callers_use_only_allowed_subcommands():
@@ -1249,13 +2037,117 @@ def test_the_subcommand_ratchet_flags_a_worktree_add():
     source = "gitsafe.run(['worktree', 'add', 'x'], root)\ngitsafe.run(['-c', 'a=b', 'worktree', 'add'], root)\n"
     assert _run_subcommand_offenders("aegis_core/x.py", source) == [
         "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
-    assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
-    assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
+    assert not _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], root)")
 
 
-def test_the_subcommand_ratchet_sees_run_checked_too():
-    source = "gitsafe.run_checked(['worktree', 'add'], root, error=E)\ngitsafe.run_checked(['ls-tree', 'HEAD'], root)\n"
-    assert _run_subcommand_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:1 runs git worktree"]
+@pytest.mark.parametrize("source", ["gitsafe.run(args, root)", "g.run(args=argv, cwd=root)",
+    "gitsafe.run_checked(values, root)", "gitsafe_run.execute(argv, root)", "from aegis_core.gitsafe import run"])
+def test_strict_structural_guard_refuses_names_without_resolving_bindings(source):
+    assert _run_subcommand_offenders("aegis_core/team_git.py", source)
+
+
+def _copy_lane_guard_sources(root):
+    for relative in LANE_MODULES | {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py", "aegis_core/gitsafe_policy.py"}:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_lane_guard_refuses_forbidden_form_in_snapshot_copy(tmp_path):
+    _copy_lane_guard_sources(tmp_path)
+    relative = "aegis_core/team_git_snapshot.py"
+    copied = tmp_path / relative
+    source = copied.read_text(encoding="utf-8")
+    test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+    assert not _run_subcommand_offenders(relative, source, root=tmp_path)
+    copied.write_text(source + "\ngitsafe_run.lane_update_ref(root, ref, new, old)\n", encoding="utf-8")
+    assert _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    with pytest.raises(AssertionError, match="unrestricted Git reference"):
+        test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+    copied.write_text(source, encoding="utf-8")
+    assert not _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+
+
+@pytest.mark.parametrize("shape", ["runner", "value", "decorated"])
+def test_lane_guard_transfer_helpers_follow_exports(tmp_path, shape):
+    _copy_lane_guard_sources(tmp_path)
+    relative = "aegis_core/team_git_snapshot.py"
+    copied = tmp_path / relative
+    source = copied.read_text(encoding="utf-8")
+    argument = "value" if shape == "value" else "runner"
+    definition = ("\n@decorator\n" if shape == "decorated" else "\n") + (
+        "def transfer_helper(" + argument + "):\n    _require_runner(" + argument + ")\n")
+    source += definition + "\ntransfer_helper(runner)\n"
+    copied.write_text(source, encoding="utf-8")
+    assert any("unproved lane capability escape" in message
+               for message in _run_subcommand_offenders(relative, source, root=tmp_path))
+    tree = ast.parse(source)
+    export = next(node for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets))
+    lines = source.splitlines(keepends=True)
+    lines[export.lineno - 1:export.end_lineno] = [
+        "__all__ = " + repr(ast.literal_eval(export.value) + ["transfer_helper"]) + "\n"]
+    exported = "".join(lines)
+    copied.write_text(exported, encoding="utf-8")
+    offenders = _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    if shape == "runner":
+        assert not offenders
+    else:
+        assert any("unproved lane capability escape" in message for message in offenders)
+    copied.write_text(source, encoding="utf-8")
+    assert any("unproved lane capability escape" in message
+               for message in _run_subcommand_offenders(relative, source, root=tmp_path))
+
+
+def test_exemption_carrier_is_private_to_central_writer(root=ROOT):
+    owner = {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"}
+    carriers = {"_REF_WRITE", "_STRICT_SERVICES", "_LaneServices", "_strict_services", "_LaneBinding", "_lane_binding", "issue_runner"}
+    violations = []
+    for package in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
+        for path in (root / package).rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if rel in owner:
+                if rel == "aegis_core/gitsafe.py":
+                    assert not any(isinstance(n, ast.keyword) and n.arg == "_grant"
+                                   for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            assert not any((isinstance(n, ast.keyword) and n.arg == "_grant")
+                           or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == "_grant")
+                           for n in ast.walk(tree)), rel
+            for node in ast.walk(tree):
+                if ((isinstance(node, ast.Attribute) and node.attr in carriers)
+                        or (isinstance(node, ast.Name) and node.id in carriers)
+                        or (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in carriers)
+                        or (isinstance(node, ast.ImportFrom) and any(a.name in carriers for a in node.names))):
+                    violations.append((rel, node.lineno))
+            if rel in LANE_MODULES:
+                assert not _run_subcommand_offenders(rel, path.read_text(encoding="utf-8"), root=root)
+                continue
+            for node in ast.walk(tree):
+                assert not (isinstance(node, ast.Attribute) and node.attr in ("LaneRunner", "lane_runner")), (rel, node.lineno)
+                assert not (isinstance(node, ast.ImportFrom) and node.module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run")
+                            and any(a.name in ("LaneRunner", "lane_runner") for a in node.names)), (rel, node.lineno)
+    assert not violations
+    tree = ast.parse((root / "aegis_core/gitsafe_run.py").read_text(encoding="utf-8"))
+    parents = {child: n for n in ast.walk(tree) for child in ast.iter_child_nodes(n)}
+    grants, launches = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        scopes, parent = [], parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.FunctionDef):
+                scopes.append(parent.name)
+            parent = parents.get(parent)
+        if any(k.arg == "_grant" for k in node.keywords):
+            grants.append("cas" in scopes or scopes == ["publish"])
+        if ast.unparse(node.func) == "subprocess.Popen":
+            launches.append(scopes[0])
+    assert grants == [True, True]
+    assert launches == ["capture"]
+
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
@@ -1326,6 +2218,2819 @@ def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(
 
 
 # ── one request's repository facts: memo and layout (R-structure-4) ─────────
+
+def test_layout_empty_output_keeps_one_query_per_scope_and_retries_across_threads(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, local
+    observed = local()
+    gate = Barrier(2, timeout=10)
+    def answer(args, cwd, **kwargs):
+        observed.calls.append(tuple(args))
+        stdout = b".git\n\nfalse\n" + os.fsencode(cwd) + b"\n" if observed.available else b""
+        return subprocess.CompletedProcess(args, 0 if observed.available else 128, stdout, b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    def verify(index):
+        root = tmp_path / ("worker-" + str(index))
+        observed.calls, observed.available = [], False
+        gate.wait()
+        with gitsafe.memo():
+            for _ in range(2):
+                assert gitsafe.layout(root) is None
+        assert len(observed.calls) == 1
+        observed.available = True
+        with gitsafe.memo():
+            for _ in range(2):
+                assert gitsafe.layout(root) == gitsafe.Layout(".git", "", False, os.path.normpath(root))
+        assert len(observed.calls) == 2
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(verify, range(2), timeout=15)) == [True, True]
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t", "\r", "\n"])
+def test_git_path_transport_removes_only_one_final_lf(tmp_path, monkeypatch, suffix):
+    path = " leading" + suffix
+    def answer(args, cwd, **kwargs):
+        return subprocess.CompletedProcess(args, 0, os.fsencode(path) + b"\n", b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    for _ in range(2):
+        if os.name != "nt":  # Windows rejects/normalizes these filesystem names.
+            assert str(gitsafe.git_path(tmp_path, "hooks")) == str(tmp_path / path)
+        assert gitsafe.show_prefix(tmp_path) == path
+
+
+def test_git_path_decoder_bounds_before_decoding_and_refuses_nul():
+    for raw, code, message in (
+        (b"\xff" * 65537, "git_path_limit", "Git path output exceeds its byte limit."),
+        (b"private\0path\n", "git_path_invalid", "Git path framing is invalid."),
+        (b"gitdir:missing-space\n", "git_path_invalid", "Git path framing is invalid."),
+    ):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.path_text(raw, gitfile=raw.startswith(b"gitdir:"))
+        assert (caught.value.code, str(caught.value)) == (code, message)
+    assert gitsafe_run.path_text(b"gitdir:  leading \n", gitfile=True) == " leading "
+    assert gitsafe_run.path_text(b"\n") == ""
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("bad", [b"secret-\xff", b"two\nlines", b"two\n"])
+def test_lane_discovery_paths_refuse_and_retry(tmp_path, monkeypatch, bad):
+    outputs = iter((bad,))
+    def capture(argv, **kwargs):
+        raw = next(outputs, os.fsencode(str(tmp_path / " repository ")))
+        return subprocess.CompletedProcess(argv, 0, raw + b"\n", b"")
+    monkeypatch.setattr(gitsafe_run, "capture", capture)
+    monkeypatch.setattr(gitsafe, "custody_program", lambda *a, **kw: "/trusted/git")
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.lane_runner(tmp_path, tmp_path / "scratch", environ={})
+    assert caught.value.code == ("git_path_encoding" if b"\xff" in bad else "invalid_repository")
+    lane = gitsafe.lane_runner(tmp_path, tmp_path / "scratch", environ={})
+    assert lane.cwd == tmp_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing whitespace in paths")
+def test_git_path_whitespace_roundtrips_across_worktrees_and_threads(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    main = _repo(tmp_path / " main ")
+    (main / "tracked").write_text("data\n")
+    _commit(main)
+    admin = tmp_path / " admin "
+    _git(main, "rev-parse", "--git-dir")
+    _git(main, "init", "--separate-git-dir", str(admin))
+    linked = tmp_path / " linked "
+    _git(main, "worktree", "add", "-q", "--detach", str(linked))
+    def observe(root):
+        for _ in range(2):
+            with gitsafe.memo():
+                assert gitsafe.toplevel(root) == root
+                assert gitsafe.common_dir(root) == admin
+                assert gitsafe.git_path(root, "hooks") == admin / "hooks"
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(pool.map(observe, (main, linked)))
+
+
+@pytest.mark.parametrize("query", ["layout", "fallback", "prefix", "hooks"])
+def test_undecodable_git_paths_refuse_and_retry(tmp_path, monkeypatch, query):
+    bad = True
+    def answer(args, cwd, **kwargs):
+        path = b"secret-\xff" if bad else b" leading "
+        if len(args) == 5:
+            out = path + b"\n\nfalse\n/top\n"
+            if query == "fallback":
+                out += b"extra\n"
+        else:
+            out = path + b"\n"
+        return subprocess.CompletedProcess(args, 0, out, b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    invoke = {"layout": gitsafe.layout, "fallback": gitsafe.layout,
+              "prefix": gitsafe.show_prefix,
+              "hooks": lambda root: gitsafe.git_path(root, "hooks")}[query]
+    with pytest.raises(gitsafe.GitError) as caught:
+        invoke(tmp_path)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_encoding", "Git path is not decodable.")
+    bad = False
+    assert invoke(tmp_path) is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing whitespace in paths")
+@pytest.mark.parametrize("bad", [False, True])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_gitfile_and_commondir_preserve_whitespace_or_refuse(tmp_path, bad):
+    from aegis_core.workspace import hooks
+    root = tmp_path / "root"
+    root.mkdir()
+    admin = root / " admin "
+    admin.mkdir()
+    common = admin / " common "
+    common.mkdir()
+    (root / ".git").write_bytes(b"gitdir:  admin \n")
+    (admin / "commondir").write_bytes(b" common \n" if not bad else b"secret-\xff\n")
+    if bad:
+        with pytest.raises(gitsafe.GitError) as caught:
+            hooks._find_git_dirs(root)
+        assert caught.value.code == "git_path_encoding"
+        (admin / "commondir").write_bytes(b" common \n")
+    for _ in range(2):
+        assert hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("bad_file", ["gitfile", "commondir"])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_path_decoding_refuses_invalid_bytes_and_recovers(tmp_path, bad_file):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.workspace import hooks
+    root = tmp_path / "root"
+    admin = root / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: admin\n")
+    commondir.write_bytes(b"common\n")
+    broken, repaired = ((gitfile, b"gitdir: admin\n") if bad_file == "gitfile"
+                        else (commondir, b"common\n"))
+    broken.write_bytes(b"gitdir: secret-\xff\n" if bad_file == "gitfile" else b"secret-\xff\n")
+    def refused(_):
+        with pytest.raises(gitsafe.GitError) as caught:
+            hooks._find_git_dirs(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_encoding", "Git path is not decodable.")
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(refused, range(2), timeout=10)) == [True, True]
+        broken.write_bytes(repaired)
+        assert list(pool.map(hooks._find_git_dirs, [root, root], timeout=10)) == [
+            (admin, common), (admin, common)]
+
+
+@pytest.mark.parametrize("content", [b"not a gitfile\n", b""])
+def test_hook_non_gitfile_retains_discovery_fallthrough(tmp_path, content):
+    from aegis_core.workspace import hooks
+    (tmp_path / ".git").write_bytes(content)
+    assert hooks._find_git_dirs(tmp_path) == (None, None)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exercises POSIX pathname semantics")
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14"])
+def test_hook_procfs_less_posix_preserves_pathname_fallback(tmp_path, monkeypatch, platform):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    root = tmp_path.resolve() / "checkout"
+    root.mkdir()
+    admin = tmp_path.resolve() / "absent" / "admin"
+    (root / ".git").write_bytes(b"gitdir: ../absent/admin\n")
+
+    assert workspace_hooks._git_dirs_at(root) == (admin, admin)
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+    assert workspace_hooks.resolve_git_hooks_dir(root / "missing") is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exercises POSIX pathname semantics")
+def test_hook_procfs_less_posix_preserves_external_marker_spelling(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform="darwin"))
+    checkout = tmp_path.resolve() / "checkout"
+    checkout.mkdir()
+    metadata = tmp_path.resolve() / "metadata"
+    metadata.mkdir()
+    marker = checkout / ".git"
+    symlink_or_skip(metadata, marker, target_is_directory=True)
+    configured = tmp_path / "hooks local"
+
+    def git_path(root, name):
+        assert (root, name) == (checkout, "hooks")
+        return configured
+
+    monkeypatch.setattr(gitsafe, "git_path", git_path)
+    assert workspace_hooks._find_git_dirs(checkout) == (marker, marker)
+    assert workspace_hooks.resolve_git_hooks_dir(checkout) == configured
+
+
+def test_hook_windows_preserves_pathname_fallback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    root = _clean_real_path(tmp_path) / "checkout"
+    root.mkdir()
+    marker = root / ".git"
+    marker.write_bytes(b"gitdir: ../absent/admin\r\n")
+    admin = root.parent / "absent" / "admin"
+    configured = root / "local hooks"
+
+    def git_path(checkout, name):
+        assert (checkout, name) == (root, "hooks")
+        return configured
+
+    monkeypatch.setattr(gitsafe, "git_path", git_path)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == configured
+    assert workspace_hooks._git_dirs_at(root) == (admin, admin)
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+    marker.unlink()
+    assert workspace_hooks.resolve_git_hooks_dir(root) is None
+
+
+def _clean_real_path(path: Path) -> Path:
+    raw = os.path.realpath(path)
+    if os.name == "nt":
+        if raw.startswith(("\\\\?\\UNC\\", "\\\\?\\unc\\")):
+            raw = "\\\\" + raw[8:]
+        elif raw.startswith("\\\\?\\"):
+            raw = raw[4:]
+    return Path(raw)
+
+
+@pytest.fixture
+def retained_hook_backends(monkeypatch):
+    """Exercise the intermediate descriptor and portable implementations."""
+    monkeypatch.setattr(workspace_hooks, "_uses_linux_metadata", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "_uses_pathname_metadata", lambda: False)
+
+
+@pytest.fixture(params=["descriptor", "portable"])
+def hook_record_backend(request, monkeypatch, tmp_path, retained_hook_backends):
+    from types import SimpleNamespace
+
+    if request.param == "descriptor":
+        if not workspace_hooks.descriptor_supported():
+            pytest.skip("requires descriptor-relative nofollow operations")
+    else:
+        def no_dir_fd_open(path, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is not None:
+                pytest.fail("portable backend attempted a dir_fd open")
+            return os.open(path, flags, mode)
+
+        def no_dir_fd_stat(path, *, dir_fd=None, follow_symlinks=True):
+            if dir_fd is not None:
+                pytest.fail("portable backend attempted a dir_fd stat")
+            return os.stat(path, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(os), "open": no_dir_fd_open, "stat": no_dir_fd_stat}))
+    return _clean_real_path(tmp_path)
+
+
+@pytest.mark.parametrize("record", ["gitfile", "commondir"])
+@pytest.mark.parametrize("case", ["normal", "oversized", "undecodable", "multiline"])
+def test_hook_records_are_bounded_and_retryable(hook_record_backend, monkeypatch, record, case):
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    root = hook_record_backend
+    admin = root / "records" / "admin"
+    common = admin.parent / "shared"
+    admin.mkdir(parents=True)
+    common.mkdir()
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\r\n")
+    commondir.write_bytes(b"../shared\r\n")
+    path, prefix, value = ((gitfile, b"gitdir: ", b"records/admin") if record == "gitfile"
+                           else (commondir, b"", b"../shared"))
+    valid = prefix + value + b"\r\n"
+    if case == "normal":
+        # Git permits a trailing CR/LF run. The exact byte limit is inclusive.
+        path.write_bytes(valid.ljust(MAX_PATH_BYTES, b"\n"))
+    else:
+        data, code, message = {
+            "oversized": (prefix + b"\xff" * (MAX_PATH_BYTES + 1),
+                          "git_path_limit", "Git path output exceeds its byte limit."),
+            "undecodable": (prefix + b"opaque-\xff\n",
+                            "git_path_encoding", "Git path is not decodable."),
+            "multiline": (valid + b"extra\n", "git_path_record_invalid",
+                          "Git path record must contain one nonempty line."),
+        }[case]
+        path.write_bytes(data)
+        oversized = path.stat()
+        limit_expected = case == "oversized"
+
+        def read(fd, amount):
+            if limit_expected and os.path.samestat(os.fstat(fd), oversized):
+                assert record == "gitfile" and amount == len(prefix)
+            return os.read(fd, amount)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        for _ in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(root)
+            assert (caught.value.code, str(caught.value)) == (code, message)
+        path.write_bytes(valid)
+        limit_expected = False
+    assert workspace_hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("parent", ["worktree", "admin"])
+def test_hook_records_refuse_parent_replacement_and_retry(hook_record_backend, monkeypatch, parent):
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    root = outer / "checkout"
+    admin = root / "records" / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"common\n")
+    trigger = (gitfile if parent == "worktree" else commondir).stat()
+    replaced = root if parent == "worktree" else admin.parent
+    moved = replaced.with_name("moved")
+    replacements = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), trigger)
+        os.close(fd)
+        if matches and not replacements:
+            replaced.rename(moved)
+            replaced.mkdir()
+            replacements.append(replaced)
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks._find_git_dirs(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert replacements == [replaced]
+    replaced.rmdir()
+    moved.rename(replaced)
+    assert workspace_hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("failure", ["growth", "io"])
+def test_hook_record_read_failure_closes_leaf_and_recovers(hook_record_backend, monkeypatch, failure):
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    root = hook_record_backend
+    admin = root / "admin"
+    admin.mkdir()
+    (root / ".git").write_bytes(b"gitdir: admin\n")
+    record = admin / "commondir"
+    record.write_bytes(b".\n")
+    seen = record.stat()
+    reads = []
+    inject = True
+
+    def read(fd, amount):
+        if not inject or not os.path.samestat(os.fstat(fd), seen):
+            return os.read(fd, amount)
+        reads.append((fd, amount))
+        if failure == "io":
+            raise OSError("private operating-system text")
+        assert 0 < amount <= 8192
+        return b"x" * amount
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "read": read}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks._find_git_dirs(root)
+    expected = ("git_path_limit", "Git path output exceeds its byte limit.") if failure == "growth" else (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert (caught.value.code, str(caught.value)) == expected
+    if failure == "growth":
+        assert sum(amount for _, amount in reads) == MAX_PATH_BYTES + 1
+    with pytest.raises(OSError):
+        os.fstat(reads[-1][0])
+    inject = False
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+
+
+@pytest.mark.parametrize("read_number", [1, 2])
+def test_hook_refuses_replaced_admin_between_record_reads(hook_record_backend, monkeypatch, read_number):
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    (admin / "commondir").write_bytes(b"common\n")
+    seen = gitfile.stat()
+    moved = admin.with_name("moved")
+    reads = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), seen)
+        os.close(fd)
+        if matches:
+            reads.append(fd)
+            if len(reads) == read_number:
+                admin.rename(moved)
+                admin.mkdir()
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert len(reads) == read_number
+    admin.rmdir()
+    moved.rename(admin)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == common / "hooks"
+
+
+def test_hook_checks_each_gitdir_component_before_parent_step(hook_record_backend, monkeypatch):
+    from conftest import symlink_or_skip
+
+    root = hook_record_backend
+    child = root / "records" / "child"
+    child.mkdir(parents=True)
+    admin = child.parent / "admin"
+    admin.mkdir()
+    alias = child.with_name("alias")
+    symlink_or_skip(child, alias, target_is_directory=True)
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/alias/../admin\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+
+
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("traversal", ["parent-step", "direct-link"])
+def test_hook_resolves_and_rejects_symlinks_across_gitdir_and_commondir(
+        hook_record_backend, monkeypatch, record, traversal):
+    from concurrent.futures import ThreadPoolExecutor
+    from conftest import symlink_or_skip
+
+    root = hook_record_backend
+    child = root / "records" / "child"
+    child.mkdir(parents=True)
+    admin = child.parent / "admin"
+    admin.mkdir()
+    shared = child.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    alias = child.with_name("alias")
+    target = (admin if record == "gitdir" else shared) if traversal == "direct-link" else child
+    symlink_or_skip(target, alias, target_is_directory=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    if record == "gitdir":
+        bad_gitdir = b"records/alias\n" if traversal == "direct-link" else b"records/alias/../admin\n"
+        gitfile.write_bytes(b"gitdir: " + bad_gitdir)
+        commondir.write_bytes(b"../child/../shared\n")
+    else:
+        gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+        bad_common = b"../alias\n" if traversal == "direct-link" else b"../alias/../shared\n"
+        commondir.write_bytes(bad_common)
+
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+    commondir.write_bytes(b"../child/../shared\n")
+    assert workspace_hooks._find_git_dirs(root) == (admin, shared)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+
+
+@pytest.mark.parametrize("read_number", [1, 2])
+def test_hook_refuses_invalid_or_replaced_common_directory_and_recovers(
+        hook_record_backend, monkeypatch, read_number):
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    regular = admin.parent / "not-a-directory"
+    regular.write_bytes(b"plain\n")
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir = admin / "commondir"
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    for invalid in (b"../missing/../shared\n", b"../missing\n", b"../not-a-directory\n"):
+        commondir.write_bytes(invalid)
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    worktree_admin = shared / "worktrees" / "linked"
+    worktree_admin.mkdir(parents=True)
+    gitfile.write_bytes(b"gitdir: records/shared/worktrees/linked\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+
+    commondir.write_bytes(b"../shared\n")
+    seen = commondir.stat()
+    moved = shared.with_name("moved-shared")
+    reads = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), seen)
+        os.close(fd)
+        if matches:
+            reads.append(fd)
+            if len(reads) == read_number and not moved.exists():
+                shared.rename(moved)
+                shared.mkdir()
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert len(reads) == read_number
+    shared.rmdir()
+    moved.rename(shared)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+def _windows_hook_os(backing, state):
+    """Model Win32 drive, UNC, ctime and NTFS junction semantics over tmp_path."""
+    import hashlib
+    from types import SimpleNamespace
+
+    drive_c = backing / "drive_c"
+    drive_d = backing / "drive_d"
+    unc_share = backing / "unc_share"
+    for folder in (drive_c, drive_d, unc_share):
+        folder.mkdir(exist_ok=True)
+
+    def _norm(raw):
+        text = os.fspath(raw)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        return text.replace("/", "\\")
+
+    def _split_win(text):
+        norm = _norm(text)
+        lower = norm.lower()
+        if lower.startswith("\\\\server\\share") and (len(norm) == 14 or norm[14] == "\\"):
+            tail = norm[14:].lstrip("\\")
+            base, root_key = unc_share, "\\\\server\\share"
+        elif len(norm) >= 2 and lower[:2] in ("c:", "d:") and (len(norm) == 2 or norm[2] == "\\"):
+            if len(norm) == 2:
+                raise FileNotFoundError(text)
+            tail = norm[3:].lstrip("\\")
+            base = drive_c if lower[0] == "c" else drive_d
+            root_key = lower[:2].upper()
+        else:
+            raise FileNotFoundError(text)
+        raw_parts = [p for p in tail.split("\\") if p and p != "."]
+        collapsed = []
+        for part in raw_parts:
+            if part == "..":
+                if root_key.startswith("\\\\") and not collapsed:
+                    raise OSError("cannot traverse above UNC share")
+                if collapsed:
+                    collapsed.pop()
+            else:
+                collapsed.append(part)
+        key = root_key + ("\\" + "\\".join(collapsed) if collapsed else "\\")
+        return base, collapsed, key.lower()
+
+    def _resolve_backing(text, *, follow_leaf=True, depth=0):
+        if depth > 16:
+            raise OSError("reparse loop")
+        base, parts, _ = _split_win(text)
+        prefix_root = (
+            "\\\\server\\share"
+            if base is unc_share
+            else ("C:" if base is drive_c else "D:")
+        )
+        built = []
+        for idx, part in enumerate(parts):
+            built.append(part)
+            cand_key = (prefix_root + "\\" + "\\".join(built)).lower()
+            is_last = idx == len(parts) - 1
+            if cand_key in state["reparse_tags"] and (follow_leaf or not is_last):
+                raise OSError("unsupported reparse")
+            if cand_key in state["junctions"] and (follow_leaf or not is_last):
+                target = state["junctions"][cand_key]
+                if target is None:
+                    raise FileNotFoundError(text)
+                remainder = parts[idx + 1 :]
+                next_win = target.rstrip("\\/") + ("\\" + "\\".join(remainder) if remainder else "")
+                return _resolve_backing(next_win, follow_leaf=follow_leaf, depth=depth + 1)
+        host_parts = [
+            ("_u16_" + hashlib.sha256(p.encode("utf-8")).hexdigest()[:16])
+            if len(p.encode("utf-8")) > 200
+            else p
+            for p in parts
+        ]
+        host_path = base.joinpath(*host_parts) if host_parts else base
+        return host_path, (prefix_root + ("\\" + "\\".join(built) if built else "\\")).lower()
+
+    def _wrap_stat(info, *, file_attrs=0, reparse_tag=0, ctime_delta=0, mtime_delta=0):
+        return SimpleNamespace(
+            st_mode=info.st_mode,
+            st_ino=info.st_ino,
+            st_dev=info.st_dev,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns + mtime_delta,
+            st_ctime_ns=info.st_ctime_ns + ctime_delta,
+            st_file_attributes=file_attrs,
+            st_reparse_tag=reparse_tag,
+        )
+
+    def lstat_fn(path):
+        cb = state.get("on_lstat")
+        if cb is not None:
+            cb(_norm(path))
+        host_path, key = _resolve_backing(path, follow_leaf=False)
+        info = os.lstat(host_path)
+        if key in state["reparse_tags"]:
+            tag = state["reparse_tags"][key]
+            mode = (stat.S_IFLNK | 0o777) if tag == 0xA000000C else info.st_mode
+            return _wrap_stat(info, file_attrs=0x400, reparse_tag=tag) if mode == info.st_mode else SimpleNamespace(
+                st_mode=mode, st_ino=info.st_ino, st_dev=info.st_dev, st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                st_file_attributes=0x400, st_reparse_tag=tag)
+        if key in state["junctions"]:
+            return _wrap_stat(info, file_attrs=0x400, reparse_tag=0xA0000003)
+        return _wrap_stat(info)
+
+    def stat_fn(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None:
+            pytest.fail("Windows backend attempted dir_fd stat")
+        if not follow_symlinks:
+            return lstat_fn(path)
+        host_path, _ = _resolve_backing(path, follow_leaf=True)
+        return _wrap_stat(os.stat(host_path))
+
+    def open_fn(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            pytest.fail("Windows backend attempted dir_fd open")
+        host_path, key = _resolve_backing(path, follow_leaf=False)
+        if key in state["junctions"] or key in state["reparse_tags"]:
+            raise OSError("cannot open reparse as regular file")
+        return os.open(host_path, flags, mode)
+
+    def fstat_fn(fd):
+        info = os.fstat(fd)
+        mode = state.get("stamp_mode")
+        if mode == "ctime":
+            return _wrap_stat(info, ctime_delta=1_000_000_000)
+        if mode == "mtime":
+            return _wrap_stat(info, mtime_delta=1_000_000_000)
+        return _wrap_stat(info)
+
+    def close_fn(fd):
+        info = os.fstat(fd)
+        os.close(fd)
+        cb = state.get("on_close")
+        if cb is not None:
+            cb(info)
+
+    def _resolve_win_spelling(text, *, follow_leaf=True, depth=0):
+        if depth > 16:
+            raise OSError("reparse loop")
+        base, parts, _ = _split_win(text)
+        prefix_root = (
+            "\\\\server\\share"
+            if base is unc_share
+            else ("C:" if base is drive_c else "D:")
+        )
+        built = []
+        for idx, part in enumerate(parts):
+            built.append(part)
+            cand_key = (prefix_root + "\\" + "\\".join(built)).lower()
+            is_last = idx == len(parts) - 1
+            if cand_key in state["reparse_tags"] and (follow_leaf or not is_last):
+                raise OSError("unsupported reparse")
+            if cand_key in state["junctions"] and (follow_leaf or not is_last):
+                target = state["junctions"][cand_key]
+                if target is None:
+                    raise FileNotFoundError(text)
+                remainder = parts[idx + 1 :]
+                next_win = target.rstrip("\\/") + ("\\" + "\\".join(remainder) if remainder else "")
+                return _resolve_win_spelling(next_win, follow_leaf=follow_leaf, depth=depth + 1)
+        return prefix_root + ("\\" + "\\".join(built) if built else "\\")
+
+    def realpath_fn(path):
+        norm = _norm(path)
+        if norm.startswith(("\\\\?\\", "\\\\.\\")):
+            return norm
+        try:
+            resolved = _resolve_win_spelling(norm, follow_leaf=True)
+        except OSError:
+            try:
+                _, parts, key = _split_win(norm)
+            except OSError:
+                resolved = norm
+            else:
+                if key.startswith("\\\\server\\share"):
+                    resolved = "\\\\server\\share" + ("\\" + "\\".join(parts) if parts else "\\")
+                else:
+                    resolved = norm[:2].upper() + ("\\" + "\\".join(parts) if parts else "\\")
+        cb = state.get("on_realpath")
+        if cb is not None:
+            cb(norm, resolved)
+        return resolved
+
+    def lexists_fn(path):
+        try:
+            lstat_fn(path)
+            return True
+        except OSError:
+            return False
+
+    def isfile_fn(path):
+        try:
+            return stat.S_ISREG(stat_fn(path).st_mode)
+        except OSError:
+            return False
+
+    def isdir_fn(path):
+        try:
+            return stat.S_ISDIR(stat_fn(path).st_mode)
+        except OSError:
+            return False
+
+    win_path_mod = SimpleNamespace(
+        **{
+            **vars(os.path),
+            "realpath": realpath_fn,
+            "islink": lambda p: _norm(p).lower() in state["reparse_tags"],
+            "lexists": lexists_fn,
+            "isfile": isfile_fn,
+            "isdir": isdir_fn,
+        }
+    )
+    return SimpleNamespace(
+        **{
+            **vars(os),
+            "name": "nt",
+            "sep": "\\",
+            "altsep": "/",
+            "lstat": lstat_fn,
+            "stat": stat_fn,
+            "open": open_fn,
+            "fstat": fstat_fn,
+            "close": close_fn,
+            "path": win_path_mod,
+        }
+    )
+
+
+@pytest.mark.parametrize("platform_name", ["nt", "posix"])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_record_ctime_divergence_and_real_modification(
+        tmp_path, monkeypatch, platform_name):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    if platform_name == "nt":
+        state = {"junctions": {}, "reparse_tags": {}, "stamp_mode": "ctime"}
+        win_os = _windows_hook_os(tmp_path.resolve(), state)
+        checkout_host = tmp_path.resolve() / "drive_c" / "checkout"
+        admin_host = checkout_host / "records" / "admin"
+        shared_host = admin_host.parent / "shared"
+        (shared_host / "hooks").mkdir(parents=True)
+        admin_host.mkdir(parents=True)
+        (checkout_host / ".git").write_bytes(b"gitdir: records/admin\n")
+        (admin_host / "commondir").write_bytes(b"../shared\n")
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", win_os)
+        root_arg = r"C:\checkout"
+        expected_hooks = Path(r"C:\checkout\records\shared\hooks")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root_arg, root_arg], timeout=10)) == [
+                expected_hooks, expected_hooks]
+
+        state["stamp_mode"] = "mtime"
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root_arg)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+        state["stamp_mode"] = "clean"
+        assert workspace_hooks.resolve_git_hooks_dir(root_arg) == expected_hooks
+        return
+
+    root = tmp_path.resolve() / "checkout"
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    targets = [gitfile.stat(), commondir.stat()]
+    posix_state = {"mode": "ctime"}
+
+    def bumped(info, *, mtime_delta=0, ctime_delta=0):
+        return SimpleNamespace(
+            st_mode=info.st_mode,
+            st_ino=info.st_ino,
+            st_dev=info.st_dev,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns + mtime_delta,
+            st_ctime_ns=info.st_ctime_ns + ctime_delta,
+            st_file_attributes=getattr(info, "st_file_attributes", 0),
+        )
+
+    def fstat(fd):
+        info = os.fstat(fd)
+        if any(os.path.samestat(info, item) for item in targets):
+            if posix_state["mode"] == "ctime":
+                return bumped(info, ctime_delta=1_000_000_000)
+            if posix_state["mode"] == "mtime":
+                return bumped(info, mtime_delta=1_000_000_000)
+        return info
+
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+
+    if os.name == "nt":
+        assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+    else:
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    posix_state["mode"] = "mtime"
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+
+    posix_state["mode"] = "clean"
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("mode", [
+    "missing-publication",
+    "missing-dir-fd-open",
+    "missing-dir-fd-stat",
+    "missing-follow-symlinks",
+    "missing-nofollow-flag",
+    "mid-walk-loss",
+])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_read_walk_capability_selection_vs_missing_publication_support(
+        tmp_path, monkeypatch, mode):
+    from concurrent.futures import ThreadPoolExecutor
+    import errno
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    if mode in ("missing-publication", "mid-walk-loss") and not workspace_hooks.descriptor_supported():
+        pytest.skip("requires POSIX read-walk descriptor primitives")
+
+    root = tmp_path.resolve() / "workspace"
+    nested = root / "sub"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    dir_fd_calls = []
+    loss_active = {"fail": True}
+
+    def tracked_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            dir_fd_calls.append(path)
+            if mode == "mid-walk-loss" and loss_active["fail"]:
+                raise OSError(errno.ENOSYS, "capability lost mid-walk")
+            if mode not in ("missing-publication", "mid-walk-loss"):
+                pytest.fail("portable fallback invoked dir_fd open")
+        return os.open(path, flags, mode_bits, dir_fd=dir_fd)
+
+    def tracked_stat(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None and mode not in ("missing-publication", "mid-walk-loss"):
+            pytest.fail("portable fallback invoked dir_fd stat")
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    dir_fd_set = (
+        {os.open, os.stat}
+        if mode == "missing-publication"
+        else (
+            {os.stat}
+            if mode == "missing-dir-fd-open"
+            else ({os.open} if mode == "missing-dir-fd-stat" else os.supports_dir_fd)
+        )
+    )
+    follow_set = set() if mode == "missing-follow-symlinks" else os.supports_follow_symlinks
+    nofollow_flag = 0 if mode == "missing-nofollow-flag" else getattr(os, "O_NOFOLLOW", 0)
+
+    monkeypatch.setattr(
+        workspace_hooks,
+        "os",
+        SimpleNamespace(
+            **{
+                **vars(os),
+                "open": tracked_open,
+                "stat": tracked_stat,
+                "supports_dir_fd": dir_fd_set,
+                "supports_follow_symlinks": follow_set,
+                "O_NOFOLLOW": nofollow_flag,
+            }
+        ),
+    )
+
+    if mode in ("missing-publication", "mid-walk-loss"):
+        assert workspace_hooks.descriptor_supported() is True
+    else:
+        assert workspace_hooks.descriptor_supported() is False
+
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "objects").mkdir(parents=True)
+    (shared / "refs").mkdir()
+    (shared / "hooks").mkdir()
+    admin.mkdir(parents=True)
+    (admin / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    (admin / "commondir").write_bytes(b"../shared\n")
+    gitfile = root / ".git"
+
+    if mode != "mid-walk-loss":
+        assert workspace_hooks.resolve_git_hooks_dir(root) is None
+
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    if mode == "mid-walk-loss":
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        loss_active["fail"] = False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+    if mode in ("missing-publication", "mid-walk-loss"):
+        assert dir_fd_calls
+    else:
+        assert not dir_fd_calls
+
+    gitfile.write_bytes(b"gitdir: " + b"x" * (MAX_PATH_BYTES + 1))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_limit", "Git path output exceeds its byte limit.")
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    assert workspace_hooks._find_git_dirs(nested) == (admin, shared)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("transition", [
+    "child-to-child",
+    "parent-step-both",
+    "abs-gitdir-rel-common",
+    "rel-gitdir-abs-common",
+])
+def test_hook_relative_transitions_bind_verified_parents_without_rewalk(
+        hook_record_backend, monkeypatch, transition):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    checkout = outer / "checkout"
+    checkout.mkdir()
+    ext_admin = outer / "ext_admin"
+    ext_common = outer / "ext_common"
+    in_admin = checkout / "records" / "admin"
+    in_common = in_admin / "common"
+    for folder in (ext_admin, ext_common, in_admin, in_common):
+        (folder / "hooks").mkdir(parents=True)
+
+    gitfile = checkout / ".git"
+    if transition == "child-to-child":
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        (in_admin / "commondir").write_bytes(b"common\n")
+        expected = in_common / "hooks"
+    elif transition == "parent-step-both":
+        gitfile.write_bytes(b"gitdir: ../ext_admin\n")
+        (ext_admin / "commondir").write_bytes(b"../ext_common\n")
+        expected = ext_common / "hooks"
+    elif transition == "abs-gitdir-rel-common":
+        gitfile.write_bytes(b"gitdir: " + os.fsencode(str(ext_admin)) + b"\n")
+        (ext_admin / "commondir").write_bytes(b"../ext_common\n")
+        expected = ext_common / "hooks"
+    else:
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        (in_admin / "commondir").write_bytes(os.fsencode(str(ext_common)) + b"\n")
+        expected = ext_common / "hooks"
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    opened_checkout = []
+    is_descriptor = workspace_hooks.descriptor_supported()
+    if is_descriptor:
+        def counting_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            if path == "checkout":
+                opened_checkout.append(dir_fd)
+            return os.open(path, flags, mode_bits, dir_fd=dir_fd)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "open": counting_open}))
+
+    assert workspace_hooks.resolve_git_hooks_dir(checkout) == expected
+    if is_descriptor and transition in ("child-to-child", "parent-step-both", "rel-gitdir-abs-common"):
+        # Relative targets step from the bound checkout chain rather than re-walking from '/'.
+        assert len(opened_checkout) == 1
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [checkout, checkout], timeout=10)) == [
+            expected, expected]
+
+    # If checkout is replaced while reading .git, a relative gitdir must not enter the decoy path.
+    if is_descriptor and transition == "child-to-child":
+        seen_git = gitfile.stat()
+        moved = outer / "moved-checkout"
+        decoy_touched = []
+        swap_state = {"armed": True}
+
+        def swap_on_read(fd, amount):
+            data = os.read(fd, amount)
+            if swap_state["armed"] and os.path.samestat(os.fstat(fd), seen_git) and not moved.exists():
+                checkout.rename(moved)
+                (checkout / "records" / "admin").mkdir(parents=True)
+                (checkout / "records" / "admin" / "commondir").write_bytes(b"common\n")
+            return data
+
+        def spy_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            if moved.exists() and path == "admin":
+                decoy = (checkout / "records" / "admin").stat()
+                if os.path.samestat(os.fstat(fd), decoy):
+                    decoy_touched.append(True)
+            return fd
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(os), "read": swap_on_read, "open": spy_open}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(checkout)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        assert not decoy_touched
+        swap_state["armed"] = False
+        shutil.rmtree(checkout)
+        moved.rename(checkout)
+        assert workspace_hooks.resolve_git_hooks_dir(checkout) == expected
+
+
+@pytest.mark.parametrize("mutation", [
+    "replace-dot-git",
+    "symlink-dot-git",
+    "dangling-symlink-dot-git",
+    "fifo-dot-git",
+])
+def test_hook_directory_marker_verifies_leaf_and_ancestry_through_return(
+        hook_record_backend, monkeypatch, mutation):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    if mutation == "fifo-dot-git" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO requires POSIX mkfifo")
+
+    root = hook_record_backend / "repo"
+    dot_git = root / ".git"
+    (dot_git / "hooks").mkdir(parents=True)
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    if mutation == "replace-dot-git":
+        moved = root / "moved-git"
+        state = {"count": 0, "armed": True}
+        is_descriptor = workspace_hooks.descriptor_supported()
+
+        def swap_dot_git():
+            if state["armed"] and not moved.exists():
+                dot_git.rename(moved)
+                (dot_git / "hooks").mkdir(parents=True)
+
+        def stat_hook(path, *, dir_fd=None, follow_symlinks=True):
+            info = os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            if is_descriptor and path == ".git" and not follow_symlinks:
+                state["count"] += 1
+                if state["count"] == 1:
+                    swap_dot_git()
+            return info
+
+        def lstat_hook(path):
+            info = os.lstat(path)
+            if not is_descriptor and os.fspath(path) == str(dot_git):
+                state["count"] += 1
+                if state["count"] == 2:
+                    swap_dot_git()
+            return info
+
+        base_os = workspace_hooks.os
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "stat": stat_hook, "lstat": lstat_hook}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        assert moved.exists()
+        state["armed"] = False
+        shutil.rmtree(dot_git)
+        moved.rename(dot_git)
+    else:
+        shutil.rmtree(dot_git)
+        if mutation == "symlink-dot-git":
+            real_git = hook_record_backend / "real-git"
+            (real_git / "hooks").mkdir(parents=True)
+            symlink_or_skip(real_git, dot_git, target_is_directory=True)
+        elif mutation == "dangling-symlink-dot-git":
+            symlink_or_skip(hook_record_backend / "absent-git", dot_git, target_is_directory=True)
+        else:
+            os.mkfifo(dot_git)
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        dot_git.unlink()
+        (dot_git / "hooks").mkdir(parents=True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            dot_git / "hooks", dot_git / "hooks"]
+
+
+@pytest.mark.parametrize("case", [
+    "short-chunks",
+    "short-non-markers",
+    "eof-prefix-marker",
+    "eof-prefix-short",
+    "growth-short-non-marker",
+    "tear-non-marker-to-marker",
+    "eof-body-gitfile",
+    "eof-body-commondir",
+    "growth-within-cap",
+    "exact-cap-and-overflow",
+])
+def test_hook_bounded_reader_verifies_prefix_and_opened_size_across_chunks_and_eof(
+        hook_record_backend, monkeypatch, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    outer = hook_record_backend / "enclosing"
+    (outer / ".git" / "objects").mkdir(parents=True)
+    (outer / ".git" / "refs").mkdir()
+    (outer / ".git" / "hooks").mkdir()
+    (outer / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+
+    root = outer / "checkout"
+    admin = root / "records" / "admin"
+    shared = root / "records" / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    base_os = workspace_hooks.os
+    state = {"active": True, "calls": 0}
+
+    if case == "short-chunks":
+        def chunked_read(fd, amount):
+            return os.read(fd, min(2, amount))
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "read": chunked_read}))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+                shared / "hooks", shared / "hooks"]
+        return
+
+    if case == "short-non-markers":
+        standalone = hook_record_backend / "standalone"
+        standalone.mkdir()
+
+        def tiny_read(fd, amount):
+            return os.read(fd, min(2, amount))
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "read": tiny_read}))
+        for payload in (b"", b"x", b"gitdir:", b"not-a-marker\n", b"z" * (MAX_PATH_BYTES + 9)):
+            gitfile.write_bytes(payload)
+            (standalone / ".git").write_bytes(payload)
+            assert workspace_hooks.resolve_git_hooks_dir(standalone) is None
+            assert workspace_hooks.resolve_git_hooks_dir(root) == outer / ".git" / "hooks"
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+        return
+
+    if case == "exact-cap-and-overflow":
+        for target_file, prefix_bytes, rel_bytes in (
+            (gitfile, b"gitdir: ", b"records/admin"),
+            (commondir, b"", b"../shared"),
+        ):
+            good = prefix_bytes + rel_bytes + b"\n"
+            target_file.write_bytes(good.ljust(MAX_PATH_BYTES, b"\n"))
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+            target_file.write_bytes(prefix_bytes + b"a" * (MAX_PATH_BYTES + 1 - len(prefix_bytes)))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(root)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_limit", "Git path output exceeds its byte limit.")
+            target_file.write_bytes(good)
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+        return
+
+    if case == "eof-prefix-short":
+        gitfile.write_bytes(b"plain")
+    elif case == "growth-short-non-marker":
+        gitfile.write_bytes(b"abc")
+    elif case == "tear-non-marker-to-marker":
+        gitfile.write_bytes(b"not-git: records/admin\n")
+
+    target_stat = (commondir if case in ("eof-body-commondir", "growth-within-cap") else gitfile).stat()
+    open_seen = {"n": 0}
+
+    per_fd = {}
+
+    def faulty_read(fd, amount):
+        if not state["active"] or not os.path.samestat(os.fstat(fd), target_stat):
+            return os.read(fd, amount)
+        call_no = per_fd[fd] = per_fd.get(fd, 0) + 1
+        if case == "tear-non-marker-to-marker":
+            if call_no == 1:
+                open_seen["n"] += 1
+            if open_seen["n"] == 1:
+                return os.read(fd, amount)
+            payload = b"gitdir:  records/admin\n"
+            start = (call_no - 1) * amount
+            return payload[start : start + amount]
+        if case == "eof-prefix-marker":
+            return b"gitd"[:amount] if call_no == 1 else b""
+        if case == "eof-prefix-short":
+            return b"pl"[:amount] if call_no == 1 else b""
+        if case == "growth-short-non-marker":
+            return b"abcd"[:amount] if call_no == 1 else b""
+        if case == "eof-body-gitfile":
+            # Truncated at 'records' (an existing directory) to catch premature body EOF.
+            if call_no == 1:
+                return b"gitdir: "[:amount]
+            if call_no == 2:
+                return b"records"[:amount]
+            return b""
+        if case == "eof-body-commondir":
+            return b".."[:amount] if call_no == 1 else b""
+        if case == "growth-within-cap":
+            return b"../shared\n\n"[:amount] if call_no == 1 else b""
+        return os.read(fd, amount)
+
+    def faulty_close(fd):
+        per_fd.pop(fd, None)
+        os.close(fd)
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+        **{**vars(base_os), "read": faulty_read, "close": faulty_close}))
+    for _ in range(2):
+        per_fd.clear()
+        open_seen["n"] = 0
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    state["active"] = False
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("field", ["st_ino", "st_dev"])
+@pytest.mark.parametrize("site", ["directory", "record"])
+def test_hook_refuses_indeterminate_stat_identities_and_recovers(
+        hook_record_backend, monkeypatch, field, site):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    shared = root / "records" / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    target_info = (admin if site == "directory" else gitfile).stat()
+    state = {"inject": True}
+    base_os = workspace_hooks.os
+
+    def zeroed(info):
+        if state["inject"] and os.path.samestat(info, target_info):
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_ino=0 if field == "st_ino" else info.st_ino,
+                st_dev=0 if field == "st_dev" else info.st_dev,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+                st_ctime_ns=info.st_ctime_ns,
+                st_file_attributes=getattr(info, "st_file_attributes", 0),
+                st_reparse_tag=getattr(info, "st_reparse_tag", 0),
+            )
+        return info
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+        **{
+            **vars(base_os),
+            "lstat": lambda p: zeroed(base_os.lstat(p)),
+            "fstat": lambda fd: zeroed(base_os.fstat(fd)),
+            "stat": lambda p, *, dir_fd=None, follow_symlinks=True: zeroed(
+                base_os.stat(p, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            ),
+        }
+    ))
+
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+
+    state["inject"] = False
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_roots_components_and_junction_identities(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+
+    # 1. POSIX component boundaries (255 vs 256 UTF-8 bytes and component count budget)
+    if os.name != "nt":
+        pos_root = tmp_path.resolve() / "posix_bounds"
+        pos_root.mkdir()
+        ok_utf8 = "\u00e9" * 127 + "a"  # 255 UTF-8 bytes
+        bad_utf8 = "\u00e9" * 128       # 256 UTF-8 bytes
+        (pos_root / ok_utf8 / "hooks").mkdir(parents=True)
+        (pos_root / ".git").write_bytes(b"gitdir: " + os.fsencode(ok_utf8) + b"\n")
+        assert workspace_hooks.resolve_git_hooks_dir(pos_root) == pos_root / ok_utf8 / "hooks"
+        for invalid_posix in (
+            os.fsencode(bad_utf8),
+            b"a" * 256,
+            b"/".join([b"d"] * 513),
+            b"//unc-like/share",
+        ):
+            (pos_root / ".git").write_bytes(b"gitdir: " + invalid_posix + b"\n")
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(pos_root)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+
+    # 2. Windows drive & UNC roots, component boundaries, and junction identities
+    backing = tmp_path.resolve() / "win_vfs"
+    backing.mkdir()
+    state = {"junctions": {}, "reparse_tags": {}, "on_close": None, "on_lstat": None}
+    win_os = _windows_hook_os(backing, state)
+    monkeypatch.setattr(workspace_hooks, "os", win_os)
+
+    drive_c = backing / "drive_c"
+    drive_d = backing / "drive_d"
+    unc = backing / "unc_share"
+
+    # Valid drive checkout -> absolute UNC gitdir -> absolute D: commondir, and UNC checkout
+    (drive_c / "ws" / "checkout").mkdir(parents=True)
+    (unc / "meta" / "admin").mkdir(parents=True)
+    (drive_d / "shared" / "common" / "hooks").mkdir(parents=True)
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: //server/share/meta/admin\n")
+    (unc / "meta" / "admin" / "commondir").write_bytes(b"D:/shared/common\n")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [r"C:\ws\checkout", r"C:\ws\checkout"], timeout=10)) == [
+            Path(r"D:\shared\common\hooks"), Path(r"D:\shared\common\hooks")]
+
+    (unc / "checkout").mkdir(parents=True)
+    (unc / "checkout" / ".git").write_bytes(b"gitdir: ../meta/admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(r"\\server\share\checkout") == Path(r"D:\shared\common\hooks")
+
+    # Component boundary on Windows: 255 UTF-16 units (127 surrogate pairs + 'a') vs 256 (128 pairs)
+    import hashlib
+
+    ok_win_comp = "\U0001f600" * 127 + "a"
+    bad_win_comp = "\U0001f600" * 128
+    ok_host_comp = "_u16_" + hashlib.sha256(ok_win_comp.encode("utf-8")).hexdigest()[:16]
+    (drive_c / "ws" / ok_host_comp / "hooks").mkdir(parents=True)
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(("gitdir: ../" + ok_win_comp + "\n").encode("utf-8"))
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path("C:\\ws\\" + ok_win_comp + "\\hooks")
+
+    (drive_c / "ws" / "nul .git" / "hooks").mkdir(parents=True)
+    for bad_target in (
+        "../" + bad_win_comp,
+        "C:relative_drive",
+        "C:",
+        r"\rooted_without_drive",
+        "/rooted_without_drive",
+        r"\\?\C:\ws\admin",
+        r"\\.\C:\ws\admin",
+        r"\\server",
+        r"\\server\\",
+        r"\\server\\share\admin",
+        r"\\\server\share\admin",
+        r"\\server\..",
+        "admin.",
+        "admin ",
+        r"..\.. \admin",
+        "admin:stream",
+        "CON",
+        "nul.git",
+        "../nul .git",
+        "com1",
+    ):
+        (drive_c / "ws" / "checkout" / ".git").write_bytes(("gitdir: " + bad_target + "\n").encode("utf-8"))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    # 3. Stable Windows directory junctions (including directory .git, gitdir and commondir)
+    (drive_c / "real_dot_git" / "hooks").mkdir(parents=True)
+    (drive_c / "junc_repo" / ".git").mkdir(parents=True)
+    state["junctions"][r"c:\junc_repo\.git"] = r"C:\real_dot_git"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo") == Path(r"C:\junc_repo\.git\hooks")
+
+    # Dangling junction and non-junction reparse tags refuse with git_path_unavailable
+    state["junctions"][r"c:\junc_repo\.git"] = None
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo")
+    assert caught.value.code == "git_path_unavailable"
+    del state["junctions"][r"c:\junc_repo\.git"]
+
+    for bad_tag in (0xA000000C, 0x8000001B):
+        state["reparse_tags"][r"c:\junc_repo\.git"] = bad_tag
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo")
+        assert caught.value.code == "git_path_unavailable"
+    state["reparse_tags"].clear()
+    state["junctions"][r"c:\junc_repo\.git"] = r"C:\real_dot_git"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo") == Path(r"C:\junc_repo\.git\hooks")
+
+    # Stable vs changed junction entry identity and changed junction resolved target identity
+    (drive_c / "target_admin_1").mkdir()
+    (drive_c / "target_admin_2").mkdir()
+    (drive_c / "target_common_1" / "hooks").mkdir(parents=True)
+    (drive_c / "target_common_2" / "hooks").mkdir(parents=True)
+    (drive_c / "target_admin_1" / "commondir").write_bytes(b"../junc_common\n")
+    (drive_c / "target_admin_2" / "commondir").write_bytes(b"../junc_common\n")
+    (drive_c / "ws" / "junc_admin").mkdir()
+    (drive_c / "junc_common").mkdir()
+    state["junctions"][r"c:\ws\junc_admin"] = r"C:\target_admin_1"
+    state["junctions"][r"c:\junc_common"] = r"C:\target_common_1"
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: ../junc_admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+    commondir_stat = (drive_c / "target_admin_1" / "commondir").stat()
+
+    # Case A: Same junction entry inode, resolved target identity changes (in-place retarget)
+    def retarget_on_close(info):
+        if os.path.samestat(info, commondir_stat):
+            state["junctions"][r"c:\junc_common"] = r"C:\target_common_2"
+
+    state["on_close"] = retarget_on_close
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    state["on_close"] = None
+    state["junctions"][r"c:\junc_common"] = r"C:\target_common_1"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+    # Case B: Same resolved target, junction entry inode itself is replaced
+    moved_junc = drive_c / "moved_junc_common"
+
+    def replace_entry_on_close(info):
+        if os.path.samestat(info, commondir_stat) and not moved_junc.exists():
+            (drive_c / "junc_common").rename(moved_junc)
+            (drive_c / "junc_common").mkdir()
+
+    state["on_close"] = replace_entry_on_close
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    state["on_close"] = None
+    (drive_c / "junc_common").rmdir()
+    moved_junc.rename(drive_c / "junc_common")
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native NTFS junctions require Windows")
+def test_hook_windows_native_junctions_preserve_pathname_fallback(tmp_path, monkeypatch):
+    from aegis_core.verification.windows_junction import create_directory_junction
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    base = _clean_real_path(tmp_path)
+    real_git = base / "real_git"
+    real_git.mkdir()
+    repo = base / "checkout"
+    repo.mkdir()
+    marker = repo / ".git"
+    create_directory_junction(real_git, marker)
+    try:
+        assert workspace_hooks._find_git_dirs(repo) == (marker, marker)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == marker / "hooks"
+    finally:
+        marker.rmdir()
+
+    admin = real_git / "worktrees" / "linked"
+    admin.mkdir(parents=True)
+    alias = base / "admin_link"
+    create_directory_junction(admin, alias)
+    try:
+        marker.write_bytes(b"gitdir: " + os.fsencode(alias) + b"\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (alias, alias)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == alias / "hooks"
+
+        marker.write_bytes(b"gitdir: ../admin_link\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (admin, real_git)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == real_git / "hooks"
+
+        (admin / "commondir").write_bytes(b"../..\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (admin, real_git)
+    finally:
+        alias.rmdir()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_preserves_dot_git_gate_and_git_first_precedence(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "parent_repo"
+    (parent / ".git" / "objects").mkdir(parents=True)
+    (parent / ".git" / "refs").mkdir()
+    (parent / ".git" / "hooks").mkdir()
+    (parent / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    sub = parent / "packages" / "child"
+    sub.mkdir(parents=True)
+
+    git_queries = []
+    custom_hooks = parent / ".githooks"
+    custom_hooks.mkdir()
+    state = {"answer": custom_hooks}
+
+    def fake_git_path(root, rel):
+        git_queries.append((root, rel))
+        return state["answer"]
+
+    monkeypatch.setattr(gitsafe, "git_path", fake_git_path)
+
+    # Earlier gate: absent .git returns None immediately without invoking gitsafe.git_path or walking up.
+    assert workspace_hooks.resolve_git_hooks_dir(sub) is None
+    assert git_queries == []
+
+    # Normal Git-first path: when .git is present and Git answers, its core.hooksPath wins.
+    assert workspace_hooks.resolve_git_hooks_dir(parent) == custom_hooks
+    assert git_queries == [(parent, "hooks")]
+
+    # Git-free fallback: when Git returns None, confined pure-Python resolution takes over.
+    state["answer"] = None
+    assert workspace_hooks.resolve_git_hooks_dir(parent) == parent / ".git" / "hooks"
+
+
+def _linked_hook_worktree(base: Path, name: str = "linked") -> tuple[Path, Path, Path, Path]:
+    """Create a real linked repository when Git runs, or an identical Git worktree layout."""
+    main_repo = base / "main_repo"
+    linked = base / name
+    git_prog = shutil.which("git")
+    git_usable = False
+    if git_prog is not None:
+        try:
+            git_usable = subprocess.run(
+                [git_prog, "--version"], capture_output=True, timeout=5
+            ).returncode == 0
+        except OSError:
+            git_usable = False
+    if git_usable:
+        _repo(main_repo)
+        (main_repo / "tracked.txt").write_text("seed\n", encoding="utf-8")
+        _commit(main_repo, "seed")
+        _git(main_repo, "worktree", "add", "--detach", str(linked))
+        real_main = _clean_real_path(main_repo)
+        real_linked = _clean_real_path(linked)
+        common = real_main / ".git"
+        admin = common / "worktrees" / name
+        (common / "hooks").mkdir(exist_ok=True)
+        return real_main, real_linked, admin, common
+    common = main_repo / ".git"
+    admin = common / "worktrees" / name
+    for folder in (common / "objects", common / "refs", common / "hooks", admin, linked):
+        folder.mkdir(parents=True, exist_ok=True)
+    (common / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    (admin / "HEAD").write_bytes(b"0" * 40 + b"\n")
+    (admin / "commondir").write_bytes(b"../..\n")
+    (admin / "gitdir").write_bytes(os.fsencode(str(linked / ".git")) + b"\n")
+    (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(admin)) + b"\n")
+    return main_repo, linked, admin, common
+
+
+@pytest.fixture(params=["directory", "absolute", "relative"])
+def bound_metadata_layout(request, tmp_path, fake_home):
+    if (
+        sys.platform != "linux"
+        or not workspace_hooks.descriptor_supported()
+        or not hasattr(os, "memfd_create")
+        or not Path("/proc/self/fd").is_dir()
+    ):
+        pytest.skip("requires Linux procfs and descriptor-relative reads")
+    base = tmp_path / "shared repo "
+    base.mkdir()
+    main, linked, admin, common = _linked_hook_worktree(base)
+    if request.param == "directory":
+        return main, common, common
+    if request.param == "relative":
+        (linked / ".git").write_bytes(b"gitdir: .././main_repo/.git/worktrees/linked\r\n")
+    return linked, admin, common
+
+
+@contextlib.contextmanager
+def _held_git_metadata(checkout):
+    directory = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        marker = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            yield directory, marker
+        finally:
+            os.close(marker)
+    finally:
+        os.close(directory)
+
+
+_LINUX_METADATA = pytest.mark.skipif(
+    sys.platform != "linux" or not workspace_hooks.descriptor_supported()
+    or not Path("/proc/self/fd").is_dir(), reason="requires the Linux metadata backend",
+)
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("entry", ["hooks", "dirs", "direct"])
+def test_hook_linux_binds_the_public_lookup(tmp_path, fake_home, monkeypatch, entry):
+    main, linked, admin, common = _linked_hook_worktree(tmp_path)
+    _git(main, "config", "core.hooksPath", "chosen hooks")
+    (linked / ".git").write_bytes(b"gitdir: ../main_repo/.git/worktrees/linked\n")
+    bound = gitsafe.bound_git_metadata
+    calls = []
+
+    def observe(checkout_fd, marker_fd, request, **options):
+        calls.append(request)
+        return bound(checkout_fd, marker_fd, request, **options)
+
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", observe)
+    if entry == "hooks":
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == linked / "chosen hooks"
+        assert calls == ["hooks"]
+    else:
+        lookup = workspace_hooks._git_dirs_at if entry == "direct" else workspace_hooks._find_git_dirs
+        assert lookup(linked) == (admin, common)
+        assert calls == ["dirs"]
+
+
+@_LINUX_METADATA
+def test_hook_linux_refuses_restored_ancestor_during_bound_lookup(tmp_path, fake_home, monkeypatch):
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    _git(repo, "config", "core.hooksPath", "chosen hooks")
+    moved = tmp_path / "moved"
+    bound = gitsafe.bound_git_metadata
+    calls = []
+
+    def notify(checkout_fd, marker_fd, query, **options):
+        answer = bound(checkout_fd, marker_fd, query, **options)
+        calls.append(query)
+        parent.rename(moved)
+        moved.rename(parent)
+        return answer
+
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", notify)
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert calls == ["hooks"]
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", bound)
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / "chosen hooks"
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize(("entry", "operand"), [
+    ("hooks", None), ("hooks", "."), ("hooks", "child"),
+    ("dirs", "."), ("dirs", "child"),
+    ("direct", "."), ("direct", "child"),
+])
+def test_hook_linux_refuses_cwd_dependent_lookup(tmp_path, monkeypatch, entry, operand):
+    (tmp_path / "child" / ".git").mkdir(parents=True)
+
+    def unexpected_lookup(*args, **kwargs):
+        pytest.fail("cwd-dependent input reached metadata lookup")
+
+    monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", unexpected_lookup)
+    monkeypatch.setattr(gitsafe_bound, "_Namespace", unexpected_lookup)
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", unexpected_lookup)
+    monkeypatch.setattr(workspace_hooks, "git_discovery_paths", unexpected_lookup)
+    lookup = {
+        "hooks": workspace_hooks.resolve_git_hooks_dir,
+        "dirs": workspace_hooks._find_git_dirs,
+        "direct": workspace_hooks._git_dirs_at,
+    }[entry]
+    args = () if operand is None else (Path(operand),)
+    with _temporary_cwd(tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        lookup(*args)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+@_LINUX_METADATA
+def test_hook_linux_preserves_absolute_discovery_ceiling(tmp_path, fake_home):
+    repo = _repo(tmp_path / "repo")
+    child = repo / "child"
+    child.mkdir()
+    marker = repo / ".git"
+    assert workspace_hooks._find_git_dirs(child) == (marker, marker)
+    with _temporary_env({"GIT_CEILING_DIRECTORIES": str(repo)}):
+        assert workspace_hooks._find_git_dirs(child) == (None, None)
+
+
+@_LINUX_METADATA
+def test_hook_linux_queries_git_for_directory_marker_with_common_dir(tmp_path, fake_home):
+    repo = _repo(tmp_path / "repo")
+    marker = repo / ".git"
+    common = repo / "common"
+    common.mkdir()
+    for name in ("objects", "refs", "config"):
+        (marker / name).rename(common / name)
+    (marker / "commondir").write_text("../common\n", encoding="utf-8")
+    _git(repo, "config", "core.hooksPath", "chosen hooks")
+    assert gitsafe.git_path(repo, "hooks") == repo / "chosen hooks"
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / "chosen hooks"
+
+
+@_LINUX_METADATA
+def test_hook_linux_rechecks_ancestry_before_git_launch(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    moved = tmp_path / "moved"
+    executable = gitsafe.git_executable
+    launches = []
+
+    def lookup(**options):
+        program = executable(**options)
+        parent.rename(moved)
+        moved.rename(parent)
+        return program
+
+    def unexpected_launch(*args, **options):
+        launches.append(True)
+        raise gitsafe.GitError("fixture refused Git launch")
+
+    monkeypatch.setattr(gitsafe, "git_executable", lookup)
+    monkeypatch.setattr(gitsafe_run, "capture", unexpected_launch)
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert launches == []
+
+
+@_LINUX_METADATA
+def test_hook_linux_refuses_gitfile_when_git_is_missing(tmp_path, fake_home, monkeypatch):
+    outer = _repo(tmp_path / "outer")
+    main, linked, admin, common = _linked_hook_worktree(outer)
+    subdir = linked / "subdir"
+    subdir.mkdir()
+    executable = gitsafe.git_executable
+
+    monkeypatch.setattr(gitsafe, "git_executable", lambda **options: None)
+    assert workspace_hooks.resolve_git_hooks_dir(main) == common / "hooks"
+    for resolve, path in (
+        (workspace_hooks.resolve_git_hooks_dir, linked),
+        (workspace_hooks._find_git_dirs, subdir),
+    ):
+        with pytest.raises(gitsafe.GitError) as caught:
+            resolve(path)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.",
+        )
+    monkeypatch.setattr(gitsafe, "git_executable", executable)
+    assert workspace_hooks._find_git_dirs(subdir) == (admin, common)
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("phase", ["first_edge", "directory_fallback"])
+def test_hook_linux_refuses_restored_edges_through_directory_fallback(tmp_path, monkeypatch, phase):
+    from types import SimpleNamespace
+
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    moved = tmp_path / "moved"
+    changes = []
+    executable = gitsafe.git_executable
+    metadata_os = gitsafe_bound.os
+
+    def replace_and_restore():
+        parent.rename(moved)
+        moved.rename(parent)
+        changes.append(True)
+
+    def observe(path, *, dir_fd=None, follow_symlinks=True):
+        result = os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if path == "parent" and dir_fd is not None and not changes:
+            replace_and_restore()
+        return result
+
+    def missing_git(**options):
+        if phase == "directory_fallback":
+            replace_and_restore()
+        return None
+
+    monkeypatch.setattr(gitsafe, "git_executable", missing_git)
+    if phase == "first_edge":
+        monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(**{**vars(os), "stat": observe}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert changes == [True]
+    monkeypatch.setattr(gitsafe, "git_executable", executable)
+    monkeypatch.setattr(gitsafe_bound, "os", metadata_os)
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / ".git" / "hooks"
+
+
+@_LINUX_METADATA
+def test_hook_linux_reuses_descriptors_and_checks_unique_edges(tmp_path, monkeypatch):
+    from collections import Counter
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    root = tmp_path / "tree"
+    parts = ("node",) * 48
+    root.joinpath(*parts).mkdir(parents=True)
+    alias = root / "alias"
+    symlink_or_skip(root, alias, target_is_directory=True)
+    opened = set()
+    stat_calls = Counter()
+
+    def observe(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None:
+            stat_calls[dir_fd, path] += 1
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def open_dir(path, flags, *, dir_fd=None):
+        fd = os.open(path, flags, dir_fd=dir_fd)
+        if flags & os.O_DIRECTORY:
+            info = os.fstat(fd)
+            identity = info.st_dev, info.st_ino
+            assert identity not in opened
+            opened.add(identity)
+        return fd
+
+    monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+        **{**vars(os), "stat": observe, "open": open_dir},
+    ))
+    assert workspace_hooks._find_git_dirs(alias.joinpath(*parts)) == (None, None)
+    marker_calls = [calls for (_, name), calls in stat_calls.items() if name == ".git"]
+    assert len(marker_calls) >= len(parts) + 1
+    assert set(marker_calls) == {2}
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("probe", ["procfs", "filesystem", "overflow"])
+def test_hook_linux_refuses_when_observer_cannot_bind(monkeypatch, tmp_path, probe):
+    import struct
+    from types import SimpleNamespace
+
+    if probe == "procfs":
+        monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", lambda: None)
+    elif probe == "filesystem":
+        monkeypatch.setattr(gitsafe_bound, "_filesystem_supported", lambda *_: False)
+    else:
+        overflow = struct.pack("iIII", -1, 0x4000, 0, 0)
+        monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+            **{**vars(os), "read": lambda *_: overflow},
+        ))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(tmp_path)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+def test_bound_git_metadata_real_git(bound_metadata_layout):
+    checkout, admin, common = bound_metadata_layout
+    with _held_git_metadata(checkout) as handles:
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == common / "hooks"
+        assert gitsafe.bound_git_metadata(*handles, "dirs") == (admin, common)
+        _git(checkout, "config", "core.hooksPath", "hooks local ")
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == checkout / "hooks local "
+
+
+def test_bound_git_metadata_keeps_absolute_hooks_path_spelling(bound_metadata_layout):
+    from conftest import symlink_or_skip
+
+    checkout, _, _ = bound_metadata_layout
+    target = checkout / "hooks target"
+    target.mkdir()
+    alias = checkout / "hooks alias"
+    symlink_or_skip(target, alias, target_is_directory=True)
+    _git(checkout, "config", "core.hooksPath", str(alias))
+    with _held_git_metadata(checkout) as handles:
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == alias
+
+
+def test_bound_git_metadata_survives_or_refuses_marker_substitution(
+    bound_metadata_layout, tmp_path, monkeypatch,
+):
+    checkout, _, _ = bound_metadata_layout
+    held_hooks = checkout / "held hooks"
+    _git(checkout, "config", "core.hooksPath", str(held_hooks))
+    staged = _repo(tmp_path / "alternate")
+    _git(staged, "config", "core.hooksPath", "alternate hooks")
+    marker = checkout / ".git"
+    spare = checkout / "held-marker"
+    other = staged / ".git"
+    if marker.is_file():
+        other = staged / "gitfile"
+        other.write_bytes(b"gitdir: " + os.fsencode(staged / ".git") + b"\n")
+    capture = gitsafe_run.capture
+    observed = []
+
+    def substitute_before_launch(*args, **kwargs):
+        marker.rename(spare)
+        other.rename(marker)
+        try:
+            result = capture(*args, **kwargs)
+            observed.append((result.returncode, result.stdout))
+            return result
+        finally:
+            marker.rename(other)
+            spare.rename(marker)
+
+    with _held_git_metadata(checkout) as handles:
+        monkeypatch.setattr(gitsafe_run, "capture", substitute_before_launch)
+        try:
+            result = gitsafe.bound_git_metadata(*handles, "hooks")
+        except gitsafe.GitError as error:
+            assert (error.code, str(error)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.",
+            )
+        else:
+            assert result == held_hooks
+        assert observed == [(0, os.fsencode(held_hooks) + b"\n")]
+        monkeypatch.setattr(gitsafe_run, "capture", capture)
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == held_hooks
+
+
+def test_bound_git_metadata_refuses_when_procfs_probe_is_unavailable(monkeypatch):
+    monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", lambda: None)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(-1, -1, "hooks")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+@pytest.mark.parametrize("record, code, message", [
+    (b"gitdir: " + b"x" * 65536, "git_path_limit", "Git path output exceeds its byte limit."),
+    (b"gitdir: first\nsecond\n", "git_path_record_invalid", "Git path record must contain one nonempty line."),
+    (b"gitdir: private-\xff\n", "git_path_encoding", "Git path is not decodable."),
+], ids=["oversized", "multiline", "encoding"])
+def test_bound_git_metadata_validates_marker_before_git(bound_metadata_layout, record, code, message, monkeypatch):
+    checkout, _, _ = bound_metadata_layout
+    marker = checkout / ".git"
+    if marker.is_dir():
+        pytest.skip("regular marker diagnostics")
+    marker.write_bytes(record)
+
+    def unexpected_git(*args, **kwargs):
+        pytest.fail("invalid marker reached the Git runner")
+
+    monkeypatch.setattr(gitsafe_run, "capture", unexpected_git)
+    with _held_git_metadata(checkout) as handles, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(*handles, "hooks")
+    assert (caught.value.code, str(caught.value)) == (code, message)
+
+
+def test_bound_git_metadata_closes_copy_on_short_write(bound_metadata_layout, monkeypatch):
+    import errno
+    from types import SimpleNamespace
+
+    checkout, _, _ = bound_metadata_layout
+    if (checkout / ".git").is_dir():
+        pytest.skip("regular marker copy")
+    copies = []
+
+    def create_copy(name, flags):
+        fd = os.memfd_create(name, flags)
+        copies.append(fd)
+        return fd
+
+    monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+        **{**vars(os), "memfd_create": create_copy, "write": lambda fd, data: len(data) - 1},
+    ))
+    with _held_git_metadata(checkout) as handles, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(*handles, "hooks")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert len(copies) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(copies[0])
+    assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("scenario", [
+    "checkout-rename-after-realpath",
+    "checkout-symlink-after-realpath",
+    "descriptor-root-witness",
+    "gitdir-unconfirmed-no-open",
+    "commondir-unconfirmed-no-open",
+    "torn-unlinked-record-before-decode",
+    "ancestor-post-record-swap",
+    "selecting-read-swap-gitdir",
+    "selecting-read-swap-commondir",
+])
+def test_hook_witnesses_target_identity_before_selecting_read_and_open(
+        hook_record_backend, monkeypatch, scenario):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    _main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    expected_hooks = common / "hooks"
+    if shutil.which("git") is not None:
+        try:
+            if subprocess.run(["git", "--version"], capture_output=True, timeout=5).returncode == 0:
+                resolved_via_git = workspace_hooks.resolve_git_hooks_dir(linked)
+                assert resolved_via_git is not None
+                if subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=str(linked), capture_output=True, timeout=5).returncode != 0:
+                    assert _clean_real_path(resolved_via_git) == _clean_real_path(expected_hooks)
+        except OSError:
+            pass
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+
+        base_os = workspace_hooks.os
+        is_descriptor = workspace_hooks.descriptor_supported()
+
+        if scenario == "descriptor-root-witness":
+            if not is_descriptor:
+                pytest.skip("descriptor-root witness exercises descriptor backend")
+            root_str = str(Path("/"))
+            real_root = os.stat(root_str, follow_symlinks=False)
+            armed = {"active": True}
+
+            def fake_stat(path, *, dir_fd=None, follow_symlinks=True):
+                info = base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                if armed["active"] and dir_fd is None and os.fspath(path) == root_str and not follow_symlinks:
+                    return SimpleNamespace(
+                        st_mode=info.st_mode,
+                        st_ino=info.st_ino + 999999,
+                        st_dev=info.st_dev,
+                        st_size=info.st_size,
+                        st_mtime_ns=info.st_mtime_ns,
+                        st_ctime_ns=info.st_ctime_ns,
+                        st_file_attributes=getattr(info, "st_file_attributes", 0),
+                    )
+                return info
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "stat": fake_stat}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert real_root.st_ino != 0
+            armed["active"] = False
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario in ("checkout-rename-after-realpath", "checkout-symlink-after-realpath"):
+            decoy = outer / "decoy_checkout"
+            (decoy / ".git" / "hooks").mkdir(parents=True)
+            moved = outer / "moved_linked"
+            if scenario == "checkout-symlink-after-realpath":
+                probe = outer / "probe_link"
+                symlink_or_skip(decoy, probe, target_is_directory=True)
+                probe.unlink()
+            swapped = {"done": False}
+
+            def swap_after_realpath(path):
+                res = base_os.path.realpath(path)
+                if not swapped["done"] and os.path.normcase(res) == os.path.normcase(str(linked)):
+                    swapped["done"] = True
+                    linked.rename(moved)
+                    if scenario == "checkout-rename-after-realpath":
+                        decoy.rename(linked)
+                    else:
+                        os.symlink(decoy, linked, target_is_directory=True)
+                return res
+
+            patched_path = SimpleNamespace(**{**vars(base_os.path), "realpath": swap_after_realpath})
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "path": patched_path}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert swapped["done"] is True
+            if scenario == "checkout-rename-after-realpath":
+                linked.rename(decoy)
+            else:
+                linked.unlink()
+            moved.rename(linked)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario == "torn-unlinked-record-before-decode":
+            gitfile = linked / ".git"
+            orig_bytes = gitfile.read_bytes()
+            bad_bytes = b"gitdir: " + b"\xff" * (len(orig_bytes) - 9) + b"\n"
+            rec_stat = gitfile.stat()
+            torn_done = {"done": False}
+
+            def unlink_and_tear_read(fd, amount):
+                chunk = base_os.read(fd, amount)
+                if not torn_done["done"] and os.path.samestat(base_os.fstat(fd), rec_stat) and chunk:
+                    torn_done["done"] = True
+                    if os.name != "nt":
+                        gitfile.unlink()
+                        gitfile.write_bytes(orig_bytes)
+                    return bad_bytes[: len(chunk)]
+                return chunk
+
+            def torn_lstat(path):
+                info = base_os.lstat(path)
+                if os.name == "nt" and torn_done["done"] and os.path.samestat(info, rec_stat):
+                    return SimpleNamespace(
+                        st_mode=info.st_mode,
+                        st_ino=info.st_ino + 1,
+                        st_dev=info.st_dev,
+                        st_size=info.st_size,
+                        st_mtime_ns=info.st_mtime_ns,
+                        st_ctime_ns=info.st_ctime_ns,
+                        st_file_attributes=getattr(info, "st_file_attributes", 0),
+                        st_reparse_tag=getattr(info, "st_reparse_tag", 0),
+                    )
+                return info
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+                **{**vars(base_os), "read": unlink_and_tear_read, "lstat": torn_lstat}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario in ("gitdir-unconfirmed-no-open", "commondir-unconfirmed-no-open"):
+            decoy_dir = outer / "unconfirmed_decoy"
+            (decoy_dir / "hooks").mkdir(parents=True)
+            (decoy_dir / "commondir").write_bytes(b".\n")
+            decoy_stat = decoy_dir.stat()
+            target_record = (linked / ".git") if scenario == "gitdir-unconfirmed-no-open" else (admin / "commondir")
+            orig_bytes = target_record.read_bytes()
+            prefix = b"gitdir: " if scenario == "gitdir-unconfirmed-no-open" else b""
+            decoy_bytes = prefix + os.fsencode(str(decoy_dir)) + b"\n"
+            target_record.write_bytes(decoy_bytes)
+            rec_stat = target_record.stat()
+            opened_decoy = []
+            closed_once = {"done": False}
+
+            def spy_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+                fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+                if os.path.samestat(os.fstat(fd), decoy_stat):
+                    opened_decoy.append(path)
+                return fd
+
+            def rewrite_on_first_close(fd):
+                matches = os.path.samestat(os.fstat(fd), rec_stat)
+                base_os.close(fd)
+                if matches and not closed_once["done"]:
+                    closed_once["done"] = True
+                    target_record.write_bytes(orig_bytes)
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+                **{**vars(base_os), "open": spy_open, "close": rewrite_on_first_close}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert opened_decoy == []
+            target_record.write_bytes(orig_bytes)
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario == "ancestor-post-record-swap":
+            nested = linked / "sub" / "leaf"
+            nested.mkdir(parents=True)
+            decoy_common = outer / "decoy_common"
+            (decoy_common / "objects").mkdir(parents=True)
+            (decoy_common / "refs").mkdir()
+            (decoy_common / "hooks").mkdir()
+            (decoy_common / "worktrees" / "linked").mkdir(parents=True)
+            (decoy_common / "worktrees" / "linked" / "HEAD").write_bytes(b"0" * 40 + b"\n")
+            moved_common = outer / "moved_main_git"
+
+            def trigger_swap():
+                if not moved_common.exists():
+                    common.rename(moved_common)
+                    decoy_common.rename(common)
+
+            def swap_isfile(path):
+                if os.fspath(path).endswith("HEAD"):
+                    trigger_swap()
+                return base_os.path.isfile(path)
+
+            def swap_stat(path, *, dir_fd=None, follow_symlinks=True):
+                if os.fspath(path) == "HEAD" or os.fspath(path).endswith(os.sep + "HEAD"):
+                    trigger_swap()
+                return base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            def swap_lstat(path):
+                if os.fspath(path).endswith("HEAD"):
+                    trigger_swap()
+                return base_os.lstat(path)
+
+            patched_path = SimpleNamespace(**{**vars(base_os.path), "isfile": swap_isfile})
+            monkeypatch.setattr(
+                workspace_hooks,
+                "os",
+                SimpleNamespace(**{**vars(base_os), "path": patched_path, "stat": swap_stat, "lstat": swap_lstat}),
+            )
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(nested)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert moved_common.exists()
+            common.rename(decoy_common)
+            moved_common.rename(common)
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks._find_git_dirs(nested) == (admin, common)
+            return
+
+        # selecting-read-swap-gitdir / selecting-read-swap-commondir
+        is_gitdir = scenario == "selecting-read-swap-gitdir"
+        alt_admin = outer / "alt_admin"
+        alt_common = outer / "alt_common"
+        alt_admin.mkdir()
+        (alt_common / "hooks").mkdir(parents=True)
+        (alt_admin / "commondir").write_bytes(os.fsencode(str(alt_common)) + b"\n")
+        decoy_target = outer / "swap_decoy"
+        (decoy_target / "hooks").mkdir(parents=True)
+        (decoy_target / "commondir").write_bytes(os.fsencode(str(alt_common)) + b"\n")
+        (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(alt_admin)) + b"\n")
+        record_file = (linked / ".git") if is_gitdir else (alt_admin / "commondir")
+        victim_dir = alt_admin if is_gitdir else alt_common
+        moved_victim = outer / "moved_victim"
+        rec_stat = record_file.stat()
+        opens = {"n": 0}
+
+        def swap_on_selecting_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            if os.path.samestat(os.fstat(fd), rec_stat):
+                opens["n"] += 1
+                if opens["n"] == 2 and not moved_victim.exists():
+                    victim_dir.rename(moved_victim)
+                    decoy_target.rename(victim_dir)
+            return fd
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "open": swap_on_selecting_open}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(linked)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        victim_dir.rename(decoy_target)
+        moved_victim.rename(victim_dir)
+        monkeypatch.setattr(workspace_hooks, "os", base_os)
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == alt_common / "hooks"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("route", ["git_answer", "fallback"])
+@pytest.mark.parametrize("mutated", ["checkout", "checkout_alias", "gitfile_marker", "dir_marker", "absent_marker"])
+def test_hook_carries_checkout_and_marker_continuity_through_git_and_fallback(
+        hook_record_backend, monkeypatch, route, mutated):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    _main_repo, linked, _admin, common = _linked_hook_worktree(outer)
+    std_repo = outer / "std_repo"
+    (std_repo / ".git" / "hooks").mkdir(parents=True)
+    plain_dir = outer / "plain_dir"
+    plain_dir.mkdir()
+    custom_hooks = outer / "custom_hooks"
+    custom_hooks.mkdir()
+    decoy_hooks = outer / "decoy_hooks"
+    decoy_hooks.mkdir()
+    decoy_checkout = outer / "decoy_checkout"
+    (decoy_checkout / ".git" / "hooks").mkdir(parents=True)
+
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if mutated == "absent_marker":
+            base_os = workspace_hooks.os
+            created = {"done": False}
+
+            def appear_stat(path, *, dir_fd=None, follow_symlinks=True):
+                res = base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                return res
+
+            orig_lstat = base_os.lstat
+            seen_absent = {"n": 0}
+
+            def create_after_absent_lstat(path):
+                try:
+                    return orig_lstat(path)
+                except FileNotFoundError:
+                    if os.fspath(path).endswith(".git") and not created["done"]:
+                        seen_absent["n"] += 1
+                        if seen_absent["n"] == 1:
+                            created["done"] = True
+                            (plain_dir / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                    raise
+
+            def create_after_absent_dir_stat(path, *, dir_fd=None, follow_symlinks=True):
+                try:
+                    return base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                except FileNotFoundError:
+                    if path == ".git" and not follow_symlinks and not created["done"]:
+                        created["done"] = True
+                        (plain_dir / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                    raise
+
+            monkeypatch.setattr(
+                workspace_hooks,
+                "os",
+                SimpleNamespace(
+                    **{
+                        **vars(base_os),
+                        "lstat": create_after_absent_lstat,
+                        "stat": create_after_absent_dir_stat if workspace_hooks.descriptor_supported() else appear_stat,
+                    }
+                ),
+            )
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(plain_dir)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            (plain_dir / ".git").unlink()
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(plain_dir) is None
+            return
+
+        alias_root = outer / "checkout_alias"
+        if mutated == "checkout_alias":
+            symlink_or_skip(linked, alias_root, target_is_directory=True)
+            target_root = alias_root
+        elif mutated == "dir_marker":
+            target_root = std_repo
+        else:
+            target_root = linked
+
+        moved = outer / "continuity_moved"
+        armed = {"active": True}
+
+        def perform_mutation():
+            if armed["active"] and not moved.exists():
+                if mutated == "checkout":
+                    target_root.rename(moved)
+                    (target_root / ".git" / "hooks").mkdir(parents=True)
+                elif mutated == "checkout_alias":
+                    moved.mkdir()
+                    alias_root.unlink()
+                    os.symlink(decoy_checkout, alias_root, target_is_directory=True)
+                elif mutated == "gitfile_marker":
+                    (linked / ".git").rename(moved)
+                    (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                else:
+                    (std_repo / ".git").rename(moved)
+                    (std_repo / ".git" / "hooks").mkdir(parents=True)
+
+        if route == "git_answer":
+            def fake_git_path(root, rel):
+                perform_mutation()
+                return custom_hooks
+
+            monkeypatch.setattr(gitsafe, "git_path", fake_git_path)
+        else:
+            def mutating_which(name, **options):
+                perform_mutation()
+                return None
+
+            monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": mutating_which}))
+
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(target_root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+        armed["active"] = False
+        gitsafe._reset_for_tests()
+        if mutated == "checkout":
+            shutil.rmtree(target_root)
+            moved.rename(target_root)
+        elif mutated == "checkout_alias":
+            shutil.rmtree(moved)
+            alias_root.unlink()
+            os.symlink(linked, alias_root, target_is_directory=True)
+        elif mutated == "gitfile_marker":
+            (linked / ".git").unlink()
+            moved.rename(linked / ".git")
+        else:
+            shutil.rmtree(std_repo / ".git")
+            moved.rename(std_repo / ".git")
+
+        expected = (
+            custom_hooks
+            if route == "git_answer"
+            else ((std_repo / ".git" / "hooks") if mutated == "dir_marker" else (common / "hooks"))
+        )
+        assert workspace_hooks.resolve_git_hooks_dir(target_root) == expected
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_junctions_keep_head_selection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    backing = tmp_path.resolve() / "win_head_junc"
+    backing.mkdir()
+    state = {"junctions": {}, "reparse_tags": {}, "on_close": None, "on_lstat": None}
+    win_os = _windows_hook_os(backing, state)
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "os", win_os)
+    try:
+        drive_c = backing / "drive_c"
+        drive_d = backing / "drive_d"
+
+        # 1. Linked worktree behind a junction with standard '../..' commondir and absent commondir
+        wt_meta = drive_d / "repo" / ".git" / "worktrees" / "wt1"
+        (drive_d / "repo" / ".git" / "objects").mkdir(parents=True)
+        (drive_d / "repo" / ".git" / "refs").mkdir()
+        (drive_d / "repo" / ".git" / "hooks").mkdir()
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "HEAD").write_bytes(b"0" * 40 + b"\n")
+        (wt_meta / "commondir").write_bytes(b"../..\n")
+        (drive_c / "ws" / "checkout").mkdir(parents=True)
+        (drive_c / "ws" / "junc_wt").mkdir(parents=True)
+        state["junctions"][r"c:\ws\junc_wt"] = r"D:\repo\.git\worktrees\wt1"
+        (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: ../junc_wt\n")
+
+        expected_pair = (
+            Path(r"D:\repo\.git\worktrees\wt1"),
+            Path(r"D:\repo\.git"),
+        )
+        assert workspace_hooks._find_git_dirs(Path(r"C:\ws\checkout")) == expected_pair
+        assert workspace_hooks._find_git_dirs(Path(r"C:\ws\checkout\missing_sub")) == expected_pair
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"D:\repo\.git\hooks")
+
+        # Absent commondir under worktrees/ still resolves '../..' from the resolved junction target
+        (wt_meta / "commondir").unlink()
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"D:\repo\.git\hooks")
+        (wt_meta / "commondir").write_bytes(b"../..\n")
+
+        # 2. Checkout itself passed through a Windows junction
+        (drive_c / "alias_checkout").mkdir(parents=True)
+        state["junctions"][r"c:\alias_checkout"] = r"C:\ws\checkout"
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\alias_checkout") == Path(r"D:\repo\.git\hooks")
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_public_entries_return_concrete_native_paths(tmp_path, monkeypatch):
+    from pathlib import PurePath, PurePosixPath, PureWindowsPath
+    from types import SimpleNamespace
+
+    native_cls = type(Path("."))
+    outer = _clean_real_path(tmp_path)
+    _main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    real_git_path = gitsafe.git_path
+    real_pl = gitsafe.pathlookup
+
+    # 1. gitsafe.git_path returning a PurePath still yields a concrete native Path
+    pure_custom = PureWindowsPath(str(common / "hooks")) if os.name == "nt" else PurePosixPath(str(common / "hooks"))
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: pure_custom)
+    via_git = workspace_hooks.resolve_git_hooks_dir(linked)
+    assert isinstance(via_git, Path) and type(via_git) is native_cls
+    monkeypatch.setattr(gitsafe, "git_path", real_git_path)
+
+    # 2. Fallback with Git unavailable on native linked worktree returns concrete native Paths
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        via_fallback = workspace_hooks.resolve_git_hooks_dir(linked)
+        git_dir, common_dir = workspace_hooks._find_git_dirs(linked)
+        for item in (via_fallback, git_dir, common_dir):
+            assert isinstance(item, Path) and type(item) is native_cls and isinstance(item, PurePath)
+        assert (git_dir, common_dir, via_fallback) == (admin, common, common / "hooks")
+
+        # 3. Modeled Windows with Git unavailable also returns concrete native Paths, never PureWindowsPath
+        backing = outer / "win_concrete"
+        backing.mkdir()
+        state = {"junctions": {}, "reparse_tags": {}}
+        win_os = _windows_hook_os(backing, state)
+        (backing / "drive_c" / "repo" / ".git" / "hooks").mkdir(parents=True)
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", win_os)
+        win_hooks = workspace_hooks.resolve_git_hooks_dir(r"C:\repo")
+        win_git, win_common = workspace_hooks._find_git_dirs(Path(r"C:\repo"))
+        for item in (win_hooks, win_git, win_common):
+            assert isinstance(item, Path) and type(item) is native_cls
+        assert str(win_hooks) == r"C:\repo\.git\hooks"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("layout", [
+    "abs-gitdir-rel-common",
+    "abs-both",
+    "revisit-detour",
+    "ancestor-walk",
+    "dir-marker-fallback",
+])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_one_live_descriptor_chain_without_duplicate_reopens(tmp_path, monkeypatch, layout):
+    from types import SimpleNamespace
+
+    outer = _clean_real_path(tmp_path)
+    main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if not workspace_hooks.descriptor_supported():
+            monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+            return
+
+        if layout == "abs-both":
+            (admin / "commondir").write_bytes(os.fsencode(str(common)) + b"\n")
+        elif layout == "revisit-detour":
+            detour = common / "worktrees" / "linked"
+            rel = f"../main_repo/.git/worktrees/{detour.name}/../{detour.name}\n"
+            (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(rel))
+            (admin / "commondir").write_bytes(b"../../worktrees/..\n")
+
+        nested = linked / "a" / "b" / "c"
+        nested.mkdir(parents=True)
+
+        opened_dirs = []
+        live_fds = set()
+        base_os = workspace_hooks.os
+
+        def tracking_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            live_fds.add(fd)
+            if flags & getattr(os, "O_DIRECTORY", 0):
+                st = base_os.fstat(fd)
+                opened_dirs.append((st.st_dev, st.st_ino, path))
+            return fd
+
+        def tracking_close(fd):
+            live_fds.discard(fd)
+            base_os.close(fd)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "open": tracking_open, "close": tracking_close}))
+
+        if layout == "ancestor-walk":
+            assert workspace_hooks._find_git_dirs(nested) == (admin, common)
+        elif layout == "dir-marker-fallback":
+            assert workspace_hooks.resolve_git_hooks_dir(main_repo) == common / "hooks"
+        else:
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+
+        dir_identities = [(dev, ino) for dev, ino, _ in opened_dirs]
+        assert dir_identities
+        assert len(dir_identities) == len(set(dir_identities)), f"duplicate directory reopens: {opened_dirs}"
+        assert live_fds == set()
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_ctime_expectation_follows_native_generation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    outer = _clean_real_path(tmp_path)
+    _main_repo, linked, _admin, common = _linked_hook_worktree(outer)
+    gitfile_stat = (linked / ".git").stat()
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    try:
+        def bumped_fstat(fd):
+            st = os.fstat(fd)
+            if os.path.samestat(st, gitfile_stat):
+                return SimpleNamespace(
+                    st_mode=st.st_mode,
+                    st_ino=st.st_ino,
+                    st_dev=st.st_dev,
+                    st_size=st.st_size,
+                    st_mtime_ns=st.st_mtime_ns,
+                    st_ctime_ns=st.st_ctime_ns + 5_000_000_000,
+                    st_file_attributes=getattr(st, "st_file_attributes", 0),
+                )
+            return st
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "fstat": bumped_fstat}))
+        if os.name == "nt":
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+        else:
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert caught.value.code == "git_path_unavailable"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("modeled", [False, True])
+def test_hook_posix_parser_and_parent_predicate_agree_on_backslash(
+        hook_record_backend, monkeypatch, modeled):
+    from types import SimpleNamespace
+
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if not modeled:
+            if os.name == "nt":
+                pytest.skip("literal backslash in directory names requires POSIX filesystem")
+            root = hook_record_backend / "bs_checkout"
+            records = root / "records"
+            child_bs = records / "child\\"
+            admin_bs = records / "admin\\"
+            decoy_dotdot = records / "child\\.."
+            shared = records / "shared"
+            for folder in (child_bs, admin_bs, decoy_dotdot / "hooks", shared / "hooks"):
+                folder.mkdir(parents=True)
+            (root / ".git").write_bytes(b"gitdir: records/child\\/../admin\\\n")
+            (admin_bs / "commondir").write_bytes(b"../shared\n")
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+            assert workspace_hooks._find_git_dirs(root) == (admin_bs, shared)
+            return
+
+        # Modeled POSIX portable VFS so Windows CI also exercises POSIX backslash component + '..' spelling
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        vfs_dirs = {
+            "/": (1, 10),
+            "/ws": (1, 11),
+            "/ws/checkout": (1, 12),
+            "/ws/checkout/child\\": (1, 13),
+            "/ws/checkout/admin\\": (1, 14),
+            "/ws/checkout/shared": (1, 15),
+            "/ws/checkout/child\\..": (1, 99),
+        }
+        vfs_files = {
+            "/ws/checkout/.git": (1, 20, b"gitdir: child\\/../admin\\\n"),
+            "/ws/checkout/admin\\/commondir": (1, 21, b"../shared\n"),
+        }
+
+        def _collapse_posix(raw_p):
+            text = os.fspath(raw_p)
+            if not text.startswith("/"):
+                raise FileNotFoundError(text)
+            out = []
+            for part in text.split("/"):
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if out:
+                        out.pop()
+                else:
+                    out.append(part)
+            return "/" + "/".join(out)
+
+        def fake_lstat(p):
+            norm = _collapse_posix(p)
+            if norm in vfs_dirs:
+                dev, ino = vfs_dirs[norm]
+                return SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o755, st_dev=dev, st_ino=ino,
+                    st_size=0, st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+            if norm in vfs_files:
+                dev, ino, data = vfs_files[norm]
+                return SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o644, st_dev=dev, st_ino=ino,
+                    st_size=len(data), st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+            raise FileNotFoundError(norm)
+
+        fd_table = {}
+        next_fd = {"n": 500}
+
+        def fake_open(p, flags, mode_bits=0o777, *, dir_fd=None):
+            norm = _collapse_posix(p)
+            if norm not in vfs_files:
+                raise FileNotFoundError(norm)
+            fd = next_fd["n"]
+            next_fd["n"] += 1
+            dev, ino, data = vfs_files[norm]
+            fd_table[fd] = [dev, ino, data, 0]
+            return fd
+
+        def fake_fstat(fd):
+            dev, ino, data, _pos = fd_table[fd]
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_dev=dev, st_ino=ino,
+                st_size=len(data), st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+
+        def fake_read(fd, amount):
+            entry = fd_table[fd]
+            chunk = entry[2][entry[3] : entry[3] + amount]
+            entry[3] += len(chunk)
+            return chunk
+
+        def fake_close(fd):
+            fd_table.pop(fd, None)
+
+        posix_path_mod = SimpleNamespace(
+            **{
+                **vars(os.path),
+                "realpath": _collapse_posix,
+                "islink": lambda _p: False,
+                "lexists": lambda p: _collapse_posix(p) in vfs_dirs or _collapse_posix(p) in vfs_files,
+            }
+        )
+        monkeypatch.setattr(
+            workspace_hooks,
+            "os",
+            SimpleNamespace(
+                **{
+                    **vars(os),
+                    "name": "posix",
+                    "sep": "/",
+                    "altsep": None,
+                    "fsencode": lambda s: s.encode("utf-8"),
+                    "fsdecode": lambda b: b.decode("utf-8"),
+                    "lstat": fake_lstat,
+                    "stat": lambda p, *, dir_fd=None, follow_symlinks=True: fake_lstat(p),
+                    "open": fake_open,
+                    "fstat": fake_fstat,
+                    "read": fake_read,
+                    "close": fake_close,
+                    "path": posix_path_mod,
+                }
+            ),
+        )
+        resolved = workspace_hooks.resolve_git_hooks_dir("/ws/checkout")
+        assert isinstance(resolved, Path) and type(resolved) is type(Path("."))
+        assert resolved.as_posix() == "/ws/checkout/shared/hooks"
+    finally:
+        gitsafe._reset_for_tests()
+
 
 def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
     (repo / "sub").mkdir()
@@ -1422,7 +5127,8 @@ def test_twenty_git_calls_with_one_path_look_git_up_once(tmp_path, monkeypatch, 
     for _ in range(20):
         assert gitsafe.run(["--version"], tmp_path).returncode == 0
     assert asked == ["git"]
-    assert os.path.samefile(gitsafe.git_executable(), shutil.which("git")) and asked == ["git"]
+    # The same non-workspace cwd shares one fence. A bare lookup fences the process cwd instead.
+    assert os.path.samefile(gitsafe.git_executable(cwd=tmp_path), shutil.which("git")) and asked == ["git"]
 
 
 def _copy_git(directory: Path) -> Path:
@@ -1437,15 +5143,16 @@ def _copy_git(directory: Path) -> Path:
 def test_a_new_path_finds_its_own_git_and_a_deleted_git_fails_loudly(tmp_path, monkeypatch, fresh_git_lookup):
     copy = _copy_git(tmp_path / "other")
     monkeypatch.setenv("PATH", str(tmp_path / "other"))
-    assert gitsafe.git_executable() == str(copy)
-    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    cwd = _foreign_cwd(tmp_path)
+    assert gitsafe.git_executable(cwd=cwd) == str(copy)
+    assert gitsafe.run(["--version"], cwd).returncode == 0
     saved = copy.read_bytes()
     copy.unlink()
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
-        gitsafe.run(["--version"], tmp_path)
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+        gitsafe.run(["--version"], cwd)
     copy.write_bytes(saved)
     copy.chmod(0o755)
-    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    assert gitsafe.run(["--version"], cwd).returncode == 0
 
 
 def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp_path, monkeypatch,
@@ -1455,9 +5162,617 @@ def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp
     monkeypatch.chdir(tmp_path / "repo")
     assert gitsafe.run(["--version"], tmp_path).returncode == 0  # cached under the real PATH
     monkeypatch.setenv("PATH", ".")
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["--version"], tmp_path)
     assert not marker.exists()
+
+
+def _worktree(path: Path) -> Path:
+    """A work tree marker only: ordinary resolution must not need git history to find it."""
+    path.mkdir(parents=True, exist_ok=True)
+    gitdir = path / ".git"
+    if not gitdir.exists():
+        gitdir.mkdir()
+    return path
+
+
+def _under(path: str, root: Path) -> bool:
+    candidate, base = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(root))
+    return candidate == base or candidate.startswith(base.rstrip(os.sep) + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def isolated_program_marker_boundary(tmp_path):
+    """Model a clean ancestor namespace; never inherit the developer's dotfiles repo.
+
+    All markers within the real fixture remain visible, including hostile child
+    markers. Only the product's OS reference changes; shared OS functions and
+    owner records are untouched. Pathlookup's own tests retain the real ancestors.
+    """
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    original = pathlookup.os
+    locator = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+
+    def stat(path, *args, **kwargs):
+        fd = kwargs.get("dir_fd")
+        if path == ".git" and fd is not None:
+            parent = os.path.realpath(locator + "/" + str(fd))
+            if not _under(parent, tmp_path):
+                raise FileNotFoundError(2, "fixture marker outside filesystem model")
+        elif os.path.basename(path) == ".git" and not _under(os.path.dirname(path), tmp_path):
+            raise FileNotFoundError(2, "fixture marker outside filesystem model")
+        return os.stat(path, *args, **kwargs)
+
+    def lexists(path):
+        if os.path.basename(path) == ".git" and not _under(os.path.dirname(path), tmp_path):
+            return False
+        return os.path.lexists(path)
+
+    pathlookup.os = SimpleNamespace(**{**vars(os), "stat": stat,
+        "path": SimpleNamespace(**{**vars(os.path), "lexists": lexists}),
+        "supports_dir_fd": {stat if fn is os.stat else fn for fn in os.supports_dir_fd},
+        "supports_follow_symlinks": {stat if fn is os.stat else fn for fn in os.supports_follow_symlinks}})
+    try:
+        yield
+    finally:
+        pathlookup.os = original
+
+
+def _foreign_cwd(root: Path) -> Path:
+    """A real read-only cwd whose enclosing fence does not contain our fixture."""
+    import tempfile
+    from aegis_core import pathlookup
+    for candidate in (ROOT, Path(sys.executable).parent, Path(tempfile.gettempdir()), Path("/usr")):
+        if not candidate.is_dir():
+            continue
+        fence = pathlookup.git_fence(candidate) or str(candidate.resolve())
+        if not _under(str(root), Path(fence)):
+            return candidate
+    raise AssertionError("fixture requires a cwd outside its enclosing checkout")
+
+
+@contextlib.contextmanager
+def _outside_programs(cwd: Path):
+    """Host program fixtures live outside the entire enclosing checkout."""
+    import tempfile
+    from aegis_core import pathlookup
+    fence = pathlookup.git_fence(cwd) or str(cwd.resolve())
+    parent = Path(tempfile.gettempdir()) if _under(str(ROOT), Path(fence)) else ROOT / ".pytest_cache"
+    assert not _under(str(parent), Path(fence)), "fixture needs an outside program directory"
+    parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gitsafe-ruling-", dir=parent) as directory:
+        yield Path(directory)
+
+
+@contextlib.contextmanager
+def _temporary_env(updates):
+    """Restore PATH (and any other keys) without a new monkeypatch fixture site."""
+    previous = {name: os.environ.get(name) for name in updates}
+    missing = {name for name in updates if name not in os.environ}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if name in missing:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextlib.contextmanager
+def _temporary_cwd(path):
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def test_ordinary_read_skips_an_in_workspace_git_then_retries(tmp_path, fresh_git_lookup):
+    """Empty cache: cwd's work tree is excluded, a miss refuses, and a later outside git runs."""
+    ws = _worktree(tmp_path / "ws")
+    (ws / "sub").mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        proc = gitsafe.run(["--version"], ws / "sub")
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+    with _temporary_env({"PATH": str(ws / "bin")}):
+        with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+            gitsafe.run(["--version"], ws)
+    assert not marker.exists()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        retried = gitsafe.run(["--version"], ws)
+    assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "gitfile", "symlink"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["host-probe", "forced-fallback"])
+def test_ordinary_child_markers_cannot_shrink_the_workspace_fence(tmp_path, fresh_git_lookup, kind, fallback):
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    sub = ws / "sub"
+    sub.mkdir()
+    if kind == "directory":
+        (sub / ".git").mkdir()
+    elif kind == "gitfile":
+        (sub / ".git").write_text("gitdir: " + str(ws / ".git") + "\n", encoding="utf-8")
+    else:
+        symlink_or_skip(ws / ".git", sub / ".git", target_is_directory=True)
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    if fallback:
+        pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], sub)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert not marker.exists(), "child-controlled Git metadata narrowed the executable fence"
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+
+
+def test_ordinary_cache_primed_for_another_root_does_not_run_the_workspace_git(tmp_path, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    other = _foreign_cwd(ws)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        primed = gitsafe.git_executable(cwd=other)
+        assert os.path.samefile(primed, planted)
+        proc = gitsafe.run(["--version"], ws)
+        assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+        assert not marker.exists()
+        assert not _under(gitsafe.git_executable(cwd=ws), ws)
+
+
+def test_child_marker_cache_priming_and_removal_keep_the_outer_fence(tmp_path, monkeypatch, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    asked = _counting_which(monkeypatch)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        for present in (True, False, True):
+            if not present:
+                (child / ".git").rmdir()
+            elif not (child / ".git").exists():
+                (child / ".git").mkdir()
+            result = gitsafe.run(["--version"], child)
+            assert not marker.exists()
+            assert result.stdout.startswith(b"git version")
+    assert asked == ["git"]
+
+
+def test_equivalent_fence_spellings_share_the_same_cache_partition(tmp_path):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    program = shutil.which("git")
+    cache = pathlookup.GitCache()
+    original, probe = pathlookup.os, pathlookup.descriptor_fence_supported
+
+    def realpath(path):
+        value = os.path.realpath(path)
+        return value if value == os.sep else value + os.sep
+
+    pathlookup.os = SimpleNamespace(**{**vars(original), "path": SimpleNamespace(
+        **{**vars(original.path), "realpath": realpath})})
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        cache.for_cwd(ws)[("fixture",)] = program
+        pathlookup.os = original
+        assert cache.for_cwd(ws).get(("fixture",)) == program
+    finally:
+        pathlookup.os = original
+        pathlookup.descriptor_fence_supported = probe
+
+
+@pytest.mark.parametrize("kind", ["pure", "workspace", "protocol", "bytes"])
+def test_ordinary_pathlike_cwd_keeps_the_workspace_fence(tmp_path, fresh_git_lookup, kind):
+    from pathlib import PurePath
+    from aegis_core.workspace.base import Workspace
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    class NamedPath(os.PathLike):
+        def __fspath__(self):
+            return str(ws)
+
+        def __str__(self):
+            return str(ws)
+
+    class BytesPath(os.PathLike):
+        def __fspath__(self):
+            return os.fsencode(str(ws))
+
+        def __str__(self):
+            return str(ws)
+
+    cwd = {"pure": PurePath(ws), "workspace": Workspace(ws), "protocol": NamedPath(),
+           "bytes": BytesPath()}[kind]
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        result = gitsafe.run(["--version"], cwd)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("case", ["wrong-return", "large", "nul", "components", "unsupported"])
+def test_malformed_pathlike_cwd_has_a_typed_refusal(tmp_path, fresh_git_lookup, case):
+    values = {"wrong-return": 42, "large": "x" * 16385, "nul": "bad\0path",
+              "components": os.sep + os.sep.join(["component"] * 513)}
+
+    class MalformedPath(os.PathLike):
+        def __fspath__(self):
+            return values[case]
+
+    cwd = 123 if case == "unsupported" else MalformedPath()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["--version"], cwd)
+    assert caught.value.code == "ERR_AEGIS"
+    assert "123" not in str(caught.value)
+
+
+@pytest.mark.parametrize("case", ["type", "os", "value", "runtime"])
+def test_pathlike_fspath_exception_propagates_unchanged(tmp_path, fresh_git_lookup, case):
+    failures = {"type": TypeError, "os": OSError, "value": ValueError, "runtime": RuntimeError}
+
+    class MalformedPath(os.PathLike):
+        def __fspath__(self):
+            raise failures[case]("private-path-protocol-diagnostic")
+
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        with pytest.raises(failures[case], match="^private-path-protocol-diagnostic$"):
+            gitsafe.run(["--version"], MalformedPath())
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["host-probe", "forced-fallback"])
+@pytest.mark.parametrize("inside", [True, False], ids=["inside-workspace", "owner-prefix"])
+def test_ordinary_cwd_alias_cannot_discard_its_enclosing_fence(tmp_path, monkeypatch, fresh_git_lookup, fallback, inside):
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    alias = (ws if inside else tmp_path) / "jump"
+    asked = _counting_which(monkeypatch)
+    probe = pathlookup.descriptor_fence_supported
+    if fallback:
+        pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            for target in ((_foreign_cwd(ws) if inside else ws), ws):
+                if alias.exists():
+                    alias.unlink()
+                symlink_or_skip(target, alias, target_is_directory=True)
+                result = gitsafe.run(["--version"], alias)
+                assert not marker.exists(), "cwd alias discarded the enclosing workspace"
+                assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert asked == ["git"]
+
+
+def test_ordinary_refusal_reports_enclosing_checkout_and_retries(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": str(ws / "bin")}):
+        for _attempt in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["--version"], child)
+            assert caught.value.code == "ERR_AEGIS"
+            assert "enclosing checkout" in str(caught.value)
+            canonical = sanitize_display(pathlookup.git_fence(ws), max_len=None)
+            expected = sanitize_display(redact_insight_text(canonical, max_len=len(canonical)), max_len=256)
+            assert str(caught.value).endswith(expected)
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        assert gitsafe.run(["--version"], child).stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_marker_replacement_between_fence_and_lookup_cannot_narrow_it(tmp_path, fresh_git_lookup):
+    from threading import Event, Thread
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    ready, replaced, failures = Event(), Event(), []
+    real = pathlookup.which
+
+    def replace():
+        if not ready.wait(5):
+            failures.append("lookup did not reach the boundary")
+            return
+        try:
+            (child / ".git").rename(child / ".git-old")
+            (child / ".git").write_text("gitdir: " + str(ws / ".git") + "\n", encoding="utf-8")
+        except OSError:
+            failures.append("marker replacement failed")
+        finally:
+            replaced.set()
+
+    def lookup(name, *args, **kwargs):
+        ready.set()
+        assert replaced.wait(5), "replacement did not complete"
+        return real(name, *args, **kwargs)
+
+    worker = Thread(target=replace)
+    pathlookup.which = lookup
+    worker.start()
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], child)
+    finally:
+        ready.set()
+        worker.join(10)
+        pathlookup.which = real
+    assert not worker.is_alive() and not failures
+    assert not marker.exists()
+    assert result.stdout.startswith(b"git version")
+
+
+def test_ordinary_exclusion_follows_the_call_cwd_not_the_process_cwd(tmp_path, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    (ws / "sub").mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    other = tmp_path / "other"
+    other.mkdir()
+    with _temporary_cwd(other), _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        proc = gitsafe.run(["--version"], ws / "sub")
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_ordinary_read_skips_an_outside_alias_into_the_workspace(tmp_path, fresh_git_lookup):
+    from conftest import symlink_or_skip
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    with _outside_programs(ws) as outside:
+        alias = outside / "alias-bin"
+        symlink_or_skip(ws / "bin", alias, target_is_directory=True)
+        symlink_or_skip(planted, outside / planted.name)
+        with _temporary_env({"PATH": os.pathsep.join((str(alias), str(outside), _REAL_GIT_DIR))}):
+            proc = gitsafe.run(["--version"], ws)
+            assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+            assert not marker.exists()
+            resolved = gitsafe.git_executable(cwd=ws)
+    assert not _under(resolved, ws)
+    assert os.path.samefile(resolved, real_git)
+
+
+def test_cached_outside_alias_retargeted_into_workspace_is_not_run(tmp_path, fresh_git_lookup):
+    from conftest import symlink_or_skip
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    with _outside_programs(ws) as outside:
+        alias = outside / Path(real_git).name
+        symlink_or_skip(real_git, alias)
+        with _temporary_env({"PATH": os.pathsep.join((str(outside), _REAL_GIT_DIR))}):
+            assert os.path.samefile(gitsafe.git_executable(cwd=ws), alias)
+            alias.unlink()
+            symlink_or_skip(planted, alias)
+            result = gitsafe.run(["--version"], ws)
+            assert result.returncode == 0 and result.stdout.startswith(b"git version")
+            assert not marker.exists()
+            alias.unlink()
+            symlink_or_skip(real_git, alias)
+            assert gitsafe.run(["--version"], ws).stdout.startswith(b"git version")
+
+
+def test_in_fence_directory_alias_cannot_be_retargeted_before_spawn(tmp_path, fresh_git_lookup):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    alias = ws / "host-git"
+    symlink_or_skip(_REAL_GIT_DIR, alias, target_is_directory=True)
+    original = gitsafe.subprocess
+
+    def launch(argv, **options):
+        alias.unlink()
+        symlink_or_skip(ws / "bin", alias, target_is_directory=True)
+        return subprocess.run(argv, **options)
+
+    gitsafe.subprocess = SimpleNamespace(**{**vars(subprocess), "run": launch})
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(alias), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], ws)
+    finally:
+        gitsafe.subprocess = original
+    assert not marker.exists()
+    assert result.stdout.startswith(b"git version")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent traversal follows directory symlinks")
+def test_ordinary_parent_traversal_cannot_hide_a_mutable_workspace_component(tmp_path, fresh_git_lookup):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "host-bin", marker)
+    outside = tmp_path / "host-bin"
+    outside.mkdir()
+    program = Path(shutil.which("git"))
+    symlink_or_skip(program, outside / program.name)
+    first, changed = tmp_path / "outside" / "deep", ws / "inside" / "deep"
+    first.mkdir(parents=True)
+    changed.mkdir(parents=True)
+    alias = ws / "pivot"
+    symlink_or_skip(first, alias, target_is_directory=True)
+    entry = str(alias) + os.sep + ".." + os.sep + ".." + os.sep + "host-bin"
+    original = gitsafe.subprocess
+
+    def launch(argv, **options):
+        alias.unlink()
+        symlink_or_skip(changed, alias, target_is_directory=True)
+        return subprocess.run(argv, **options)
+
+    gitsafe.subprocess = SimpleNamespace(**{**vars(subprocess), "run": launch})
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((entry, _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], ws)
+    finally:
+        gitsafe.subprocess = original
+    assert not marker.exists(), "parent traversal hid a mutable workspace component"
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+
+
+def test_cache_primed_before_workspace_symlink_retarget_is_skipped(tmp_path, fresh_git_lookup):
+    """A cached outside symlink is dropped once its target walks through the fence and back out."""
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    decoy = ws / "decoy"
+    decoy.mkdir()
+    with _outside_programs(ws) as outside:
+        alias = outside / Path(real_git).name
+        symlink_or_skip(real_git, alias)
+        with _temporary_env({"PATH": os.pathsep.join((str(outside), _REAL_GIT_DIR))}):
+            primed = gitsafe.git_executable(cwd=ws)
+            assert os.path.samefile(primed, alias)
+            alias.unlink()
+            ups = len(decoy.parts) - 1
+            target = os.path.join(str(decoy), *([os.pardir] * ups), *Path(real_git).parts[1:])
+            symlink_or_skip(target, alias)
+            assert os.path.normcase(os.path.realpath(alias)) == os.path.normcase(os.path.realpath(real_git))
+            assert os.path.normcase(str(ws)) in os.path.normcase(target)
+            found = gitsafe.git_executable(cwd=ws)
+            assert found != str(alias)
+            assert os.path.samefile(found, real_git)
+            assert pathlookup._provenance_inside(str(alias), pathlookup.git_fence(ws))
+            result = gitsafe.run(["--version"], ws)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_discovery_failure_in_subdirectory_refuses_before_spawn(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    sub = ws / "sub"
+    sub.mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("untrusted-discovery-diagnostic")
+
+    descriptors, lexical = pathlookup._fence_descriptors, pathlookup._fence_lexical
+    pathlookup._fence_descriptors = unavailable
+    pathlookup._fence_lexical = unavailable
+    try:
+        with _temporary_env({"PATH": str(ws / "bin")}):
+            with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+                gitsafe.run(["--version"], sub)
+    finally:
+        pathlookup._fence_descriptors, pathlookup._fence_lexical = descriptors, lexical
+    assert not marker.exists()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        assert gitsafe.run(["--version"], sub).stdout.startswith(b"git version")
+
+
+def test_ordinary_exclusion_holds_when_descriptor_probe_is_false(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            proc = gitsafe.run(["--version"], ws)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_fence_discovery_oserror_refuses_with_git_error(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    def boom(*args, **kwargs):
+        raise OSError("discovery failed")
+
+    opening, lexical = pathlookup._open_directory, pathlookup._fence_lexical
+    pathlookup._open_directory = boom
+    pathlookup._fence_lexical = boom
+    try:
+        with _temporary_env({"PATH": str(ws / "bin")}):
+            with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+                gitsafe.run(["--version"], ws)
+    finally:
+        pathlookup._open_directory, pathlookup._fence_lexical = opening, lexical
+    assert not marker.exists()
+
+
+def test_concurrent_roots_do_not_serve_each_others_workspace_git(tmp_path, fresh_git_lookup):
+    from threading import Barrier, Thread
+    ws_a, ws_b = _worktree(tmp_path / "a"), _worktree(tmp_path / "b")
+    marker_a, marker_b = tmp_path / "PWNED-A", tmp_path / "PWNED-B"
+    _plant_git(ws_a / "bin", marker_a)
+    _plant_git(ws_b / "bin", marker_b)
+    barrier, found, errors = Barrier(8), [], []
+
+    def resolve(root):
+        try:
+            barrier.wait(10)
+            found.append((root, gitsafe.git_executable(cwd=root)))
+        except Exception as exc:
+            errors.append(exc)
+
+    with _temporary_env({"PATH": os.pathsep.join((str(ws_a / "bin"), str(ws_b / "bin"), _REAL_GIT_DIR))}):
+        workers = [Thread(target=resolve, args=(root,)) for root in (ws_a, ws_b) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(15)
+    assert not errors and not any(worker.is_alive() for worker in workers)
+    assert not marker_a.exists() and not marker_b.exists()
+    assert found and all(not _under(path, root) for root, path in found)
+
+
+def test_ordinary_resolution_closes_fence_descriptors(tmp_path, fresh_git_lookup):
+    if not os.path.isdir("/proc/self/fd"):
+        pytest.skip("descriptor leak check needs /proc/self/fd")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        before = len(os.listdir("/proc/self/fd"))
+        proc = gitsafe.run(["--version"], ws)
+        after = len(os.listdir("/proc/self/fd"))
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+    assert before == after
 
 
 # ── scrubbed(): evidence ignores the caller's local GIT_* variables (R-trust-19) ──
@@ -1609,3 +5924,4207 @@ def test_read_blob_refuses_a_cat_file_header_whose_size_is_not_a_number(repo: Pa
 def test_read_blob_still_reads_a_blob_and_answers_none_for_a_missing_path(repo: Path):
     assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
     assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None
+@pytest.mark.parametrize("kind, revision", [("blob", "HEAD:a.py"), ("commit", "HEAD")])
+def test_declared_object_kind_batches_with_size_and_hash_checks(repo, kind, revision):
+    oid = _git(repo, "rev-parse", revision).strip()
+    expected = subprocess.run(["git", "cat-file", kind, oid], cwd=repo,
+                              capture_output=True, check=True).stdout
+    assert gitsafe.blob_sizes(repo, [oid], kind=kind) == {oid: len(expected)}
+    assert gitsafe.read_blobs(repo, [oid, oid], kind=kind) == {oid: expected}
+
+
+def test_commit_iterator_sizes_before_chunked_captures_and_deduplicates(repo, monkeypatch):
+    commits = [_git(repo, "rev-parse", "HEAD").strip()]
+    for index in range(3):
+        _git(repo, "commit", "--allow-empty", "-qm", f"commit {index}")
+        commits.append(_git(repo, "rev-parse", "HEAD").strip())
+    sizes = {oid: int(_git(repo, "cat-file", "-s", oid)) for oid in commits}
+    budget = max(sizes.values()) * 2
+    calls = []
+    real = gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[0] == "cat-file":
+            requested = kw["stdin"].decode("ascii").splitlines()
+            calls.append((args[1], requested))
+            if args[1] == "--batch":
+                assert calls[0] == ("--batch-check", commits)
+                assert sum(sizes[oid] for oid in requested) <= budget or len(requested) == 1
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    objects = dict(gitsafe.iter_objects(repo, commits + commits, kind="commit", byte_budget=budget))
+    assert list(objects) == commits
+    assert {oid: len(data) for oid, data in objects.items()} == sizes
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("header", ["{oid} blob 3", "{oid} commit -1", "{oid} commit 6x",
+                                    "{oid} missing", "{other} commit 3", "{oid} commit " + "9" * 5000],
+                         ids=["wrong-kind", "negative", "nondigit", "missing", "wrong-oid", "huge-decimal"])
+def test_commit_iterator_refuses_bad_preflight_before_content(repo, monkeypatch, header):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    calls = []
+
+    def forged(args, *a, **kw):
+        calls.append(args)
+        reply = header.format(oid=oid, other="1" * 40).encode("ascii") + b"\n"
+        return subprocess.CompletedProcess(args, 0, reply, b"")
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        list(gitsafe.iter_objects(repo, [oid], kind="commit"))
+    assert calls == [["cat-file", "--batch-check"]]
+
+
+@pytest.mark.parametrize("malformation", ["wrong-kind", "wrong-oid", "wrong-size", "hash", "delimiter", "trailing", "short"])
+def test_declared_commit_reader_refuses_corrupt_frames(repo, monkeypatch, malformation):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    data = subprocess.run(["git", "cat-file", "commit", oid], cwd=repo,
+                          capture_output=True, check=True).stdout
+    header = f"{oid} commit {len(data)}\n".encode("ascii")
+    frame = header + data + b"\n"
+    if malformation == "wrong-kind":
+        frame = frame.replace(b" commit ", b" blob ", 1)
+    elif malformation == "wrong-oid":
+        frame = b"1" * len(oid) + frame[len(oid):]
+    elif malformation == "wrong-size":
+        frame = f"{oid} commit {len(data) + 1}\n".encode("ascii") + data + b"\n"
+    elif malformation == "hash":
+        frame = header + b"X" + data[1:] + b"\n"
+    elif malformation == "delimiter":
+        frame = frame[:-1] + b"X"
+    elif malformation == "trailing":
+        frame += b"untrusted extra frame"
+    else:
+        frame = frame[:-2]
+    _answering(monkeypatch, frame)
+    with pytest.raises(gitsafe.GitError, match="^git (cannot read object|returned content for)"):
+        gitsafe.read_blobs(repo, [oid], kind="commit")
+
+
+@pytest.mark.parametrize("bad_oid", ["HEAD", "-x", "a\nprivate-input", "\N{SNOWMAN}", 123, []])
+def test_batch_reader_refuses_invalid_request_without_spawning(repo, monkeypatch, bad_oid):
+    def forbidden(*a, **kw):
+        pytest.fail("invalid request reached git")
+
+    monkeypatch.setattr(gitsafe, "run", forbidden)
+    for read in (gitsafe.read_blobs, gitsafe.blob_sizes):
+        with pytest.raises(gitsafe.GitError, match="^invalid object id$"):
+            read(repo, [bad_oid])
+
+
+def test_commit_iterator_reads_lone_object_above_budget_and_releases_capture(repo, monkeypatch):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    captured = []
+    real = gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[:2] == ["cat-file", "--batch"]:
+            captured.append(kw["stdin"])
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    objects = list(gitsafe.iter_objects(repo, [oid], kind="commit", byte_budget=1))
+    assert len(objects) == 1 and objects[0][0] == oid and len(objects[0][1]) > 1
+    assert captured == [oid.encode("ascii") + b"\n"]
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "private-budget"])
+def test_commit_iterator_refuses_invalid_budget_before_git(repo, monkeypatch, budget):
+    def forbidden(*a, **kw):
+        pytest.fail("invalid budget reached git")
+
+    monkeypatch.setattr(gitsafe, "run", forbidden)
+    with pytest.raises(gitsafe.GitError, match="^byte budget must be a positive integer$"):
+        list(gitsafe.iter_objects(repo, [], byte_budget=budget))
+
+
+def test_commit_iterator_verifies_sha256_objects_when_git_supports_them(tmp_path, monkeypatch):
+    repo = tmp_path / "sha256"
+    repo.mkdir()
+    initialized = subprocess.run(["git", "init", "-q", "--object-format=sha256"], cwd=repo, capture_output=True)
+    if b"unknown option" in initialized.stderr or b"unknown hash algorithm" in initialized.stderr:
+        pytest.skip("git does not support SHA-256 repositories")
+    assert initialized.returncode == 0, initialized.stderr
+    _git(repo, "commit", "--allow-empty", "-qm", "SHA-256 commit")
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    assert len(oid) == 64
+    expected = subprocess.run(["git", "cat-file", "commit", oid], cwd=repo, capture_output=True, check=True).stdout
+    assert list(gitsafe.iter_objects(repo, [oid], kind="commit")) == [(oid, expected)]
+    forged = f"{oid} commit {len(expected)}\n".encode("ascii") + b"X" + expected[1:] + b"\n"
+    _answering(monkeypatch, forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git returned content for {oid} that does not match the object id$"):
+        gitsafe.read_blobs(repo, [oid], kind="commit")
+@pytest.mark.parametrize("extra_record", [True, False], ids=["extra-record", "missing-terminator"])
+def test_commit_iterator_refuses_malformed_preflight_framing_before_capture(repo, monkeypatch, extra_record):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    size = int(_git(repo, "cat-file", "-s", oid))
+    header = f"{oid} commit {size}".encode("ascii")
+    calls = []
+
+    def forged(args, *a, **kw):
+        calls.append(args)
+        assert args == ["cat-file", "--batch-check"], "malformed preflight reached content capture"
+        out = (header + b"\n") * 2 if extra_record else header
+        return subprocess.CompletedProcess(args, 0, out, b"")
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        list(gitsafe.iter_objects(repo, [oid], kind="commit"))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("payload", [None, b"payload"], ids=["devnull", "input"])
+def test_transport_extraction_preserves_legacy_default_argv_and_kwargs(repo, monkeypatch, payload):
+    from types import SimpleNamespace
+    seen = []
+    def record(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 7, b"out\n", b"err\n")
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(
+        run=record, DEVNULL=-321, TimeoutExpired=subprocess.TimeoutExpired))
+    result = gitsafe.run(["version"], repo, timeout=2.5, stdin=payload)
+    assert (result.returncode, result.stdout, result.stderr) == (7, b"out\n", b"err\n")
+    argv, kwargs = seen[0]
+    assert argv == [gitsafe.git_executable(), *gitsafe._HARDENING, "version"]
+    assert {key: value for key, value in kwargs.items() if key != "env"} == {
+        "cwd": str(repo), "input": payload, "stdin": -321 if payload is None else None,
+        "capture_output": True, "timeout": 2.5, "check": False}
+    expected = dict(os.environ)
+    expected.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1",
+                    GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1", LC_ALL="C")
+    assert kwargs["env"] == expected
+
+
+def test_legacy_facade_keeps_its_process_namespace_timeout_type(repo, monkeypatch):
+    from types import SimpleNamespace
+    class NamespaceTimeout(Exception):
+        pass
+    def timeout(*args, **kwargs):
+        raise NamespaceTimeout()
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(
+        run=timeout, DEVNULL=subprocess.DEVNULL, TimeoutExpired=NamespaceTimeout))
+    with pytest.raises(gitsafe.GitError, match="^git version timed out after 2.5s$"):
+        gitsafe.run(["version"], repo, timeout=2.5)
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["exact-ceiling", "overflow"])
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_custody_capture_ceiling_on_each_stream(repo, tmp_path, extra, stream):
+    # hash-object --stdin emits a fixed-size OID; config's unknown key emits no
+    # output, so use a real controlled process at the subprocess boundary.
+    payload = b"x" * (128 + extra)
+    code = "import os; os.write(" + ("1" if stream == "stdout" else "2") + ", " + repr(payload) + ")"
+    with gitsafe.custody(scratch=tmp_path, stdout_limit=128, stderr_limit=128):
+        if extra:
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                    stdin=None, timeout=2, error=gitsafe.GitError)
+            assert caught.value.code == "git_output_limit"
+        else:
+            result = gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                        stdin=None, timeout=2, error=gitsafe.GitError)
+            assert (result.stdout if stream == "stdout" else result.stderr) == payload
+
+
+def test_custody_timeout_has_fixed_code_and_context_restores(repo, tmp_path):
+    with gitsafe.custody(scratch=tmp_path):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.capture([sys.executable, "-c", "import time; time.sleep(5)"], cwd=repo,
+                                env=dict(os.environ), stdin=None, timeout=0.1, error=gitsafe.GitError)
+        assert caught.value.code == "git_timeout"
+        assert str(caught.value) == "git custody timed out"
+    assert not gitsafe_run.custody_active()
+    assert gitsafe.run(["version"], repo).stdout.startswith(b"git version")
+
+
+@pytest.mark.parametrize("case", ["success", "overflow", "timeout"])
+def test_windows_pipe_capture_uses_blocking_reads_and_keeps_limits(repo, tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    def fixed_poll(*args):
+        pytest.fail("custody used fixed pipe polling")
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "sleep": fixed_poll}))
+    code = "import os; os.write(1, b'x' * " + ("129" if case == "overflow" else "128") + ")"
+    if case == "timeout":
+        code = "import time; time.sleep(5)"
+    with gitsafe.custody(scratch=tmp_path, stdout_limit=128):
+        if case == "success":
+            result = gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                        stdin=None, timeout=2, error=gitsafe.GitError)
+            assert result.stdout == b"x" * 128
+        else:
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                    stdin=None, timeout=0.1 if case == "timeout" else 2, error=gitsafe.GitError)
+            assert caught.value.code == ("git_timeout" if case == "timeout" else "git_output_limit")
+
+
+def test_windows_pipe_reader_start_failure_is_typed_and_input_free(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    class UnavailableThread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            raise RuntimeError("hostile-payload")
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    monkeypatch.setattr(gitsafe_run, "Thread", UnavailableThread)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo)
+    assert caught.value.code == "git_failed"
+    assert "hostile-payload" not in str(caught.value)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("kind", ["blob", "tree", "commit"])
+def test_private_object_reader_keeps_objects_private_and_enforces_size(repo, tmp_path, kind):
+    scratch = tmp_path / "private"
+    scratch.mkdir(mode=0o700)
+    objects = scratch / "objects"
+    objects.mkdir(mode=0o700)
+    env = {"GIT_OBJECT_DIRECTORY": str(objects),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / ".git/objects")}
+    blob = gitsafe.run(["hash-object", "-w", "--stdin"], repo, stdin=b"private tree child", _env=env).stdout.decode().strip()
+    data = {"blob": b"private", "tree": b"100644 child\0" + bytes.fromhex(blob), "commit": (
+        b"tree " + _git(repo, "rev-parse", "HEAD^{tree}").strip().encode() +
+        b"\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nprivate\n")}[kind]
+    oid = gitsafe.run(["hash-object", "-w", "-t", kind, "--stdin"], repo, stdin=data, _env=env).stdout.decode().strip()
+    lane = gitsafe.lane_runner(repo, scratch)
+    assert lane.read_private_object(repo, oid, kind=kind, max_bytes=len(data)) == data
+    if data:
+        with pytest.raises(gitsafe.GitError) as caught:
+            lane.read_private_object(repo, oid, kind=kind, max_bytes=len(data)-1)
+        assert caught.value.code == "git_object_limit"
+    absent = gitsafe.run(["cat-file", "-e", oid], repo)
+    assert absent.returncode != 0
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_private_batch_reads_mixed_objects_and_preflights_aggregate_limit(repo, tmp_path, monkeypatch):
+    lane = gitsafe.lane_runner(repo, tmp_path)
+    oids = [_git(repo, "rev-parse", rev).strip() for rev in ("HEAD", "HEAD^{tree}", "HEAD:a.py")]
+    expected = {oid: (kind, lane.read_private_object(repo, oid, kind=kind, max_bytes=10000))
+                for oid, kind in zip(oids, ("commit", "tree", "blob"))}
+    total = sum(len(data) for kind, data in expected.values())
+    calls, real = [], gitsafe_run.capture
+    def record(args, *rest, **kwargs):
+        calls.append(list(args[args.index("cat-file"):]))
+        return real(args, *rest, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "capture", record)
+    assert lane.read_private_objects(repo, oids, max_bytes=total, max_object_bytes=10000) == expected
+    assert calls == [["cat-file", "--batch-check"], ["cat-file", "--batch"]]
+    calls.clear()
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.read_private_objects(repo, oids, max_bytes=total - 1, max_object_bytes=10000)
+    assert caught.value.code == "git_object_limit"
+    assert calls == [["cat-file", "--batch-check"]]
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("failure", ["large-size", "wrong-kind", "missing", "trailing", "hash"])
+def test_private_batch_refuses_malformed_frames_without_echo(repo, tmp_path, monkeypatch, failure):
+    lane = gitsafe.lane_runner(repo, tmp_path)
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    real = gitsafe_run.capture
+    calls = []
+    def corrupt(args, *rest, **kwargs):
+        command = list(args[args.index("cat-file"):])
+        calls.append(command)
+        result = real(args, *rest, **kwargs)
+        if command == ["cat-file", "--batch-check"]:
+            if failure == "large-size":
+                result.stdout = oid.encode() + b" blob " + b"9" * 21 + b"\n"
+            elif failure == "wrong-kind":
+                result.stdout = oid.encode() + b" hostile-payload 1\n"
+            elif failure == "missing":
+                result.stdout = oid.encode() + b" missing\n"
+        elif command == ["cat-file", "--batch"]:
+            result.stdout = result.stdout + b"hostile-payload" if failure == "trailing" else result.stdout.replace(b"a = 1", b"a = 2")
+        return result
+    monkeypatch.setattr(gitsafe_run, "capture", corrupt)
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.read_private_objects(repo, [oid], max_bytes=10000, max_object_bytes=10000)
+    assert caught.value.code == "invalid_object"
+    assert str(caught.value) == "invalid private object"
+    if failure in ("large-size", "wrong-kind", "missing"):
+        assert calls == [["cat-file", "--batch-check"]]
+
+
+def test_single_attempt_ref_update_and_legacy_defaults(repo, tmp_path, monkeypatch):
+    real_run = gitsafe.run
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    attempts = []
+    def unknown(args, cwd, **kwargs):
+        if "update-ref" in args:
+            attempts.append(args)
+            raise gitsafe.GitError("git custody timed out", code="git_timeout")
+        return real_run(args, cwd, **kwargs)
+    monkeypatch.setattr(gitsafe, "run", unknown)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.update_ref(repo, "refs/aegis/once", oid, None, single_attempt=True)
+    assert caught.value.code == "ref_update_unknown" and len(attempts) == 1
+    monkeypatch.setattr(gitsafe, "run", real_run)
+    assert gitsafe.update_ref(repo, "refs/aegis/legacy", oid, None) is None
+    assert gitsafe.read_ref(repo, "refs/aegis/legacy") == oid
+
+
+def test_custody_queries_preserve_refusals_and_legacy_fallback(repo, tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("never echo this input", code="privacy_refused")
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    for query in (gitsafe.common_dir, gitsafe.toplevel, gitsafe.git_version):
+        with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+            query(repo)
+        assert caught.value.code == "privacy_refused"
+        assert query(repo) is None
+
+
+def test_expired_input_preparation_never_starts_a_process(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    ticks = iter((0, 1, 1, 1, 1))
+    def unexpected(*args, **kwargs):
+        pytest.fail("expired request started a process")
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: next(ticks)}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([sys.executable], cwd=repo, env=dict(os.environ), stdin=b"input", timeout=0.1,
+                            error=gitsafe.GitError)
+    assert caught.value.code == "git_timeout"
+
+
+def test_capture_closes_both_pipes_even_when_one_close_raises(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    events, streams = [], []
+    class Pipe:
+        def __init__(self, name):
+            self.name = name
+            self.fd, write = os.pipe()
+            os.close(write)
+            self.closed = False
+        def fileno(self):
+            return self.fd
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                events.append(self.name)
+                os.close(self.fd)
+                if self.name == "stdout":
+                    raise OSError("must not echo cleanup input")
+    class Child:
+        def __init__(self, *args, **kwargs):
+            self.stdout, self.stderr = Pipe("stdout"), Pipe("stderr")
+            streams.extend((self.stdout, self.stderr))
+            self.returncode = 0
+        def wait(self, **kwargs):
+            return 0
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": Child}))
+    try:
+        with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.capture([sys.executable], cwd=repo, env=dict(os.environ), stdin=None, timeout=2,
+                                error=gitsafe.GitError)
+        observed = tuple(events)
+        assert caught.value.code == "git_cleanup_failed"
+        assert observed == ("stdout", "stderr")
+        assert "input" not in str(caught.value)
+    finally:
+        for stream in streams:
+            if not stream.closed:
+                stream.close()
+
+
+def test_custody_checked_bridge_cannot_downgrade_or_echo_a_refusal(repo, tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("private input never displayed", code="privacy_refused")
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run_checked(["version"], repo, error=ValueError)
+    assert caught.value.code == "privacy_refused"
+    # Outside custody, the same explicitly requested legacy conversion remains.
+    with pytest.raises(ValueError, match="^private input never displayed$"):
+        gitsafe.run_checked(["version"], repo, error=ValueError)
+
+
+# GM-4c: effect custody is explicit and the caller retains ownership of its fd.
+@pytest.fixture
+def effect_lock(tmp_path):
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    import fcntl
+    with (tmp_path / "effect.lock").open("w+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
+        gitops_fds.receipt_fds(stream.fileno(), error=gitops_fds.AegisError)
+        yield stream.fileno()
+
+
+def _effect_call(site, repo, scratch, fd, *, payload=b"", options=None):
+    """Exercise every facade/runner entry, without mocking a process boundary."""
+    kw = {"effect_fds": (fd,)}
+    if options:
+        kw.update(options)
+    if site == "run":
+        return gitsafe.run(["version"], repo, stdin=payload, **kw, worktree_root=repo)
+    if site == "execute":
+        return gitsafe_run.execute(["version"], repo, executable=gitsafe.git_executable,
+            legacy_runner=gitsafe.subprocess.run, error=gitsafe.GitError, environ=os.environ,
+            timeout=5, stdin=payload, hardening=gitsafe._HARDENING, env=None, tty=False, **kw, worktree_root=repo)
+    if site == "capture":
+        with gitsafe.custody(scratch=scratch, worktree_root=repo):
+            return gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo,
+                env=dict(os.environ), stdin=payload, timeout=5, error=gitsafe.GitError, **kw, worktree_root=repo)
+    lane = gitsafe.lane_runner(repo, scratch, effect_fds=kw["effect_fds"], worktree_root=repo)
+    if site == "publish":
+        (scratch / "objects").mkdir(exist_ok=True)
+        return lane.publish(payload, **kw)
+    return lane.run(["version"], **kw)
+
+
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX descriptor inheritance validation")
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+@pytest.mark.parametrize("bad", ["closed", "pipe", "negative", "bool", "many"])
+def test_effect_descriptor_refused_before_any_spawn(repo, tmp_path, monkeypatch, site, bad):
+    from types import SimpleNamespace
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        stream = stack.enter_context((tmp_path / "lock").open("w+b"))
+        fd = stream.fileno()
+        os.set_inheritable(fd, bad != "noninheritable")
+        fds = (fd,)
+        if bad == "closed":
+            stream.close()
+        elif bad == "pipe":
+            read, write = os.pipe()
+            stack.callback(os.close, read)
+            stack.callback(os.close, write)
+            os.set_inheritable(read, True)
+            fds = (read,)
+        elif bad == "negative":
+            fds = (-1,)
+        elif bad == "bool":
+            fds = (True,)
+        elif bad == "many":
+            fds = (fd, fd)
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid descriptor reached a subprocess")
+        monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": unexpected}))
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            _effect_call(site, repo, tmp_path, fd, options={"effect_fds": fds})
+        assert caught.value.code == "invalid_effect_descriptor"
+        assert str(caught.value) == "Git operation effect descriptor refused."
+        assert caught.value.next_action and caught.value.process_started is False
+
+
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+def test_effect_unsupported_platform_is_a_pre_spawn_refusal(repo, tmp_path, monkeypatch, site):
+    monkeypatch.setattr(gitops_fds, "descriptor_supported", lambda: False)
+    with pytest.raises(gitsafe.GitError) as caught:
+        _effect_call(site, repo, tmp_path, 17)
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+def test_effect_pipes_and_receipt_ownership_survive_retry(repo, tmp_path, effect_lock, site):
+    import struct
+    import hashlib
+    payload = b"PACK" + struct.pack("!II", 2, 0)
+    payload += hashlib.sha1(payload).digest()
+    for _ in range(2):
+        result = _effect_call(site, repo, tmp_path, effect_lock, payload=payload if site == "publish" else b"input")
+        assert result.returncode == 0
+        assert result.stderr == b""
+        if site != "publish":
+            assert result.stdout.startswith(b"git version ")
+        os.fstat(effect_lock)
+        assert not os.get_inheritable(effect_lock)
+
+
+def _effect_survivor_program():
+    """Trusted shim launches real Git; named pipes supply readiness and stdin."""
+    return '''import os, stat, subprocess
+ready = os.open(os.environ["GM4_READY"], os.O_WRONLY)
+source = os.open(os.environ["GM4_INPUT"], os.O_RDONLY)
+fd = int(os.environ["GM4_FD"])
+try:
+    inherited = (fd,) if stat.S_ISREG(os.fstat(fd).st_mode) else ()
+except OSError:
+    inherited = ()
+if os.environ.get("GM4_REAL_REMOTE"):
+    from pathlib import Path
+    Path(os.environ["GM4_PARENT_FILE"]).write_text(str(os.getppid()), encoding="ascii")
+def launch(source):
+    return subprocess.Popen([os.environ["GM4_GIT"], "cat-file", "--batch"],
+        cwd=os.environ["GM4_REPO"], stdin=source, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, pass_fds=inherited,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+p = launch(source)
+from pathlib import Path
+Path(os.environ["GM4_WORKER_FILE"]).write_text(str(p.pid), encoding="ascii")
+os.write(ready, b"R")
+p.wait(timeout=20)
+'''
+
+
+def _child_readiness_failure(child, reason):
+    """Snapshot bounded stderr without waiting for an exited or stalled child."""
+    status = child.poll()
+    raw = bytearray()
+    if child.stderr is not None:
+        fd = child.stderr.fileno()
+        blocking = os.get_blocking(fd)
+        try:
+            os.set_blocking(fd, False)
+            while len(raw) < 65536:
+                try:
+                    chunk = os.read(fd, min(4096, 65536 - len(raw)))
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                raw.extend(chunk)
+        finally:
+            os.set_blocking(fd, blocking)
+    stderr = gitsafe_run.sanitize_display(gitsafe_run.redact_insight_text(
+        gitsafe_run.sanitize_display(raw.decode("utf-8", "replace"), max_len=None), max_len=65536), max_len=4096)
+    return f"{reason}; owner exit status={status if status is not None else 'running'}; stderr={stderr or '<empty>'}"
+
+
+def _wait_for_child_ready(child, ready_fd, timeout, reason):
+    """Report an early child exit immediately, or a bounded readiness timeout."""
+    import select
+    deadline = time.monotonic() + timeout
+    while True:
+        if child.poll() is not None:
+            pytest.fail(_child_readiness_failure(child, reason))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(_child_readiness_failure(child, reason))
+        if select.select([ready_fd], [], [], min(remaining, 0.1))[0]:
+            return
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX nonblocking pipe readiness")
+@pytest.mark.parametrize("state", ["exited", "stalled"])
+def test_owner_readiness_reports_status_and_available_stderr(tmp_path, state):
+    import select
+    read, write = os.pipe()
+    child = None
+    try:
+        code = "import os,sys;os.write(2,b'fixture failure\\n');os.write(1,b'R');" + (
+            "sys.exit(23)" if state == "exited" else "sys.stdin.buffer.read(1)")
+        child = subprocess.Popen([sys.executable, "-I", "-c", code], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert select.select([child.stdout], [], [], 5)[0], _child_readiness_failure(child, "diagnostic fixture did not start")
+        assert os.read(child.stdout.fileno(), 1) == b"R"
+        if state == "exited":
+            child.wait(timeout=5)
+        status = "23" if state == "exited" else "running"
+        with pytest.raises(pytest.fail.Exception, match="owner exit status=" + status + "; stderr=fixture failure"):
+            _wait_for_child_ready(child, read, 0, "fixture readiness failed")
+        assert os.get_blocking(child.stderr.fileno())
+    finally:
+        os.close(read)
+        os.close(write)
+        if child is not None:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX nonblocking stderr descriptor")
+def test_owner_readiness_stderr_is_bounded_canonicalized_and_redacted(tmp_path):
+    from types import SimpleNamespace
+    token = "ghp_" + "A" * 36
+    with (tmp_path / "stderr").open("w+b") as stream:
+        child = subprocess.run([sys.executable, "-I", "-c", "import os;os.write(2," + repr(
+            ("gh\x1b[31mp_" + "A" * 36 + "\x1b[0m\n" + "x" * 100000).encode()) + ");raise SystemExit(23)"],
+            stderr=stream, timeout=5, check=False)
+        stream.seek(0)
+        message = _child_readiness_failure(SimpleNamespace(poll=lambda: child.returncode, stderr=stream), "fixture failed")
+        assert "owner exit status=23" in message and "redacted" in message.lower()
+        assert token not in message and "\x1b" not in message and "\n" not in message
+        assert message.endswith("...") and len(message) <= 4200
+        assert stream.tell() == 65536 and os.get_blocking(stream.fileno())
+
+
+@pytest.mark.parametrize("cache_state", ["empty", "populated"])
+def test_owner_native_fixture_without_a_compiler_skips_before_child(tmp_path, monkeypatch, cache_state):
+    from types import SimpleNamespace
+    monkeypatch.setattr("tests.unit.core.test_gitsafe._NATIVE_STUB", {})
+    if cache_state == "populated":
+        strict_program_guard(native_fixture=True)
+        _native_program(tmp_path / "cached-native", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: True)
+    which = shutil.which
+    monkeypatch.setattr("tests.helpers_team_git.shutil", SimpleNamespace(**{**vars(shutil),
+        "which": lambda name: None if name == "cc" else which(name)}))
+    def forbidden(*args, **kwargs):
+        pytest.fail("missing fixture compiler started an owner child")
+    monkeypatch.setattr("tests.unit.core.test_gitsafe.subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    with pytest.raises(pytest.skip.Exception, match="native strict-effect fixture needs an installed C compiler"):
+        _assert_effect_survives_owner(tmp_path, tmp_path, "run")
+
+
+def _owner_test_environment(tmp_path, *, ambient=None, **values):
+    """Readiness fixtures supply their own environment, including an empty HOME."""
+    home = tmp_path / "owner-home"
+    home.mkdir(exist_ok=True)
+    source = os.environ if ambient is None else ambient
+    return {"PATH": source.get("PATH", os.defpath), "HOME": str(home),
+            "TMPDIR": str(tmp_path), "LC_ALL": "C", **values}
+
+
+def _assert_effect_survives_owner(tmp_path, repo, site, *, reconciliation=None, cleanup_event=None, environ=None):
+    """No sleeps: pipe readiness, process exit and a blocking flock supply all latches."""
+    strict_program_guard(native_fixture=site != "remote_git")
+    from aegis_core import team_gitops
+    if not team_gitops.descriptor_supported() or not gitops_fds.descriptor_supported():
+        pytest.skip("descriptor-relative journal requires POSIX no-follow operations")
+    import select
+    if site == "remote_git" and not hasattr(os, "pidfd_open"):
+        pytest.skip("remote-helper death latch requires Linux pidfds")
+    from threading import Event, Thread
+    import fcntl
+    template = tmp_path / "native-template"
+    if site != "remote_git":
+        _native_program(template, "#!/bin/sh\nexit 0\n")
+    script = tmp_path / "effect-child"
+    script.write_text("#!" + sys.executable + "\n" + _effect_survivor_program(), encoding="utf-8")
+    script.chmod(0o700)
+    ready_path, input_path = tmp_path / "ready.fifo", tmp_path / "input.fifo"
+    os.mkfifo(ready_path)
+    os.mkfifo(input_path)
+    common = tmp_path / "common"
+    common.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    import hashlib
+    lock = common / "aegis" / ("gitops-effect-" + hashlib.sha256(b"request-1").hexdigest() + ".lock")
+    owner_code = 'import inspect, os, sys\nsys.path.insert(0, sys.argv[1])\nfrom aegis_core import gitsafe, gitsafe_run, ghcli\nfrom tests.unit.core.test_gitsafe import _native_program\nimport fcntl\nrepo, scratch, script, site, lock = sys.argv[2:]\nfrom aegis_core.team_gitops import GitOpsJournal\nfrom pathlib import Path\nreceipt = GitOpsJournal(Path(lock).parent.parent).record_intent(op="push", lane="lane-1", request_id="request-1",\n    actor="session-1", expected_old="a" * 40, expected_new="b" * 40)\nfd, = receipt.inheritable_fds()\nos.set_inheritable(fd, False)\nos.environ["GM4_FD"] = str(fd)\nfrom pathlib import Path\nshim = Path(script)\nbody = shim.read_text(encoding="utf-8")\nfixed = {k: v for k, v in os.environ.items() if k.startswith("GM4_")}\nshim.write_text(body.split("\\n", 1)[0] + "\\nimport os\\nos.environ.update(" + repr(fixed) + ")\\n" + body.split("\\n", 1)[1], encoding="utf-8")\nkw = {"effect_fds": (fd,)} if "effect_fds" in inspect.signature(gitsafe.run).parameters else {}\nif site == "remote_git":\n    helper = Path(script).with_name("git-remote-aegisguard")\n    helper.write_text(shim.read_text(encoding="utf-8"), encoding="utf-8")\n    helper.chmod(0o700)\n    os.environ["PATH"] = str(helper.parent) + os.pathsep + os.environ["PATH"]\n    gitsafe.run(["-c", "protocol.aegisguard.allow=always", "push", "aegisguard::target", "HEAD:refs/heads/test"],\n        repo, _environ=dict(os.environ), _env={"GIT_ALLOW_PROTOCOL": "aegisguard"}, **kw, worktree_root=repo)\nelif site in ("gh", "gh_injected"):\n    _native_program(Path(script).with_name("gh"), shim.read_text(encoding="utf-8"))\n    runner = ghcli.default_gh_runner\n    if site == "gh_injected" and kw:\n        runner = ghcli.effect_runner(runner, kw["effect_fds"], worktree_root=repo)\n        kw = {}\n    runner(["api", "user"], env={**os.environ, "GH_TOKEN": "fixture-public-token"}, **kw, worktree_root=repo)\nelif site == "run":\n    git = Path(script).with_name("git")\n    _native_program(git, shim.read_text())\n    git.chmod(0o700)\n    os.environ["PATH"] = str(git.parent) + os.pathsep + os.environ["PATH"]\n    gitsafe.run(["version"], repo, **kw, worktree_root=repo)\nelif site == "execute":\n    source = shim.read_text(encoding="utf-8")\n    _native_program(shim, source)\n    git = Path(script).with_name("git")\n    _native_program(git, source)\n    git.chmod(0o700)\n    os.environ["PATH"] = str(git.parent) + os.pathsep + os.environ["PATH"]\n    gitsafe_run.execute(["version"], repo, executable=lambda **kwargs: script, legacy_runner=__import__("subprocess").run,\n        error=gitsafe.GitError, environ=os.environ, timeout=20, stdin=None,\n        hardening=gitsafe._HARDENING, env=None, tty=False, **kw, worktree_root=repo)\nelif site == "capture":\n    _native_program(shim, shim.read_text(encoding="utf-8"))\n    with gitsafe.custody(scratch=__import__("pathlib").Path(scratch), worktree_root=repo):\n        gitsafe_run.capture([script, "version"], cwd=repo, env=dict(os.environ), stdin=None,\n            timeout=20, error=gitsafe.GitError, **kw, worktree_root=repo)\nelse:\n    _native_program(shim, shim.read_text(encoding="utf-8"))\n    if site == "lane_runner":\n        gitsafe.custody_program = lambda cwd, **kwargs: script\n    gitsafe.git_executable = lambda **kwargs: script\n    lane = gitsafe.lane_runner(repo, scratch, **(kw if site == "lane_runner" else {}), worktree_root=repo)\n    if site == "publish":\n        lane.publish(b"", **kw)\n    else:\n        lane.run(["version"], **kw)\n'
+    owner_code = owner_code.replace("from tests.unit.core.test_gitsafe import _native_program\n",
+        "from tests.unit.core.test_gitsafe import _native_program, _NATIVE_STUB\n"
+        "from pathlib import Path\n_NATIVE_STUB['binary'] = Path(sys.argv.pop())\n")
+    env = _owner_test_environment(tmp_path, ambient=environ, GM4_READY=str(ready_path), GM4_INPUT=str(input_path),
+        GM4_GIT=gitsafe.git_executable(), GM4_REPO=str(repo), GM4_WORKER_FILE=str(tmp_path / "worker.pid"))
+    if site == "remote_git":
+        env.update(GM4_REAL_REMOTE="1", GM4_PARENT_FILE=str(tmp_path / "effect-parent.pid"))
+    if site in ("gh", "gh_injected"):
+        gh = tmp_path / "gh"
+        gh.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+        gh.chmod(0o700)
+        env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
+    ready_fd = os.open(ready_path, os.O_RDONLY | os.O_NONBLOCK)
+    ready_writer = os.open(ready_path, os.O_WRONLY)
+    input_fd = os.open(input_path, os.O_RDWR)
+    owner = subprocess.Popen([sys.executable, "-I", "-c", owner_code, str(ROOT), str(repo),
+        str(scratch), str(script), site, str(lock), str(template)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    worker_fd = None
+    try:
+        ready = b""
+        while len(ready) < 1:
+            _wait_for_child_ready(owner, ready_fd, 10, "effect child did not signal readiness")
+            ready += os.read(ready_fd, 2)
+        assert b"R" in ready
+        if site == "remote_git":
+            worker_fd = os.pidfd_open(int((tmp_path / "worker.pid").read_text()))
+        os.close(ready_writer)
+        ready_writer = None
+        from aegis_core import team_gitops
+        store = team_gitops.GitOpsJournal(common)
+        observe = store.reconcile if reconciliation is None else lambda *args: reconciliation(store, *args)
+        assert observe("lane-1", lambda _: pytest.fail("live child was observed")) == []
+        owner.kill()
+        owner.wait(timeout=10)
+        if site == "remote_git":
+            import signal
+            os.kill(int((tmp_path / "effect-parent.pid").read_text(encoding="ascii")), signal.SIGKILL)
+            if cleanup_event is not None:
+                cleanup_event(worker_fd, lock)
+        with lock.open("r+b") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                assert worker_fd is not None and select.select([worker_fd], [], [], 0)[0], "custody freed before descendant exit"
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            released = Event()
+            def acquire():
+                fcntl.flock(probe, fcntl.LOCK_EX)
+                released.set()
+            waiter = Thread(target=acquire, daemon=True)
+            waiter.start()
+            os.close(input_fd)
+            input_fd = None
+            assert released.wait(10), "effect/descendant exited but lock remained held"
+            waiter.join(timeout=1)
+        observed = observe("lane-1", lambda _: team_gitops.Observation("a" * 40))
+        assert [row["status"] for row in observed] == ["not_applied"]
+        assert observe("lane-1", lambda _: pytest.fail("terminal intent observed twice")) == []
+    finally:
+        if worker_fd is not None:
+            os.close(worker_fd)
+        if input_fd is not None:
+            os.close(input_fd)
+        if ready_writer is not None:
+            os.close(ready_writer)
+        os.close(ready_fd)
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=10)
+
+
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX descriptor locks, fork and FIFO latch")
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+def test_effect_lock_covers_owner_death(repo, tmp_path, site):
+    ambient = {**os.environ, "GIT_EDITOR": "fixture-host-program", "GIT_PAGER": "fixture-host-program",
+               "PAGER": "fixture-host-program", "GH_PAGER": "fixture-host-program"}
+    _assert_effect_survives_owner(tmp_path, repo, site, environ=ambient)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+@pytest.mark.parametrize("failure", ["enoent", "emfile"])
+def test_effect_failed_spawn_retains_descriptor_and_leaks_nothing(repo, tmp_path, effect_lock, monkeypatch, site, failure):
+    import errno
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo) if site in ("lane_run", "publish") else None
+    before = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+    calls = []
+    def fail(*args, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["pass_fds"][0] == effect_lock and len(kwargs["pass_fds"]) == 5
+        raise OSError(errno.ENOENT if failure == "enoent" else errno.EMFILE, "secret-input")
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": fail}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": fail}))
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            if site == "lane_run":
+                lane.run(["version"], stdin=b"input", effect_fds=(effect_lock,))
+            elif site == "publish":
+                lane.publish(b"input", effect_fds=(effect_lock,))
+            else:
+                _effect_call(site, repo, tmp_path, effect_lock, payload=b"input")
+        assert caught.value.code == "git_failed" and caught.value.process_started is False
+        assert "secret-input" not in str(caught.value)
+        assert not os.get_inheritable(effect_lock)
+        os.fstat(effect_lock)
+        if before is not None:
+            assert set(os.listdir("/proc/self/fd")) == before
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("effect", [False, True], ids=["legacy", "effect"])
+@pytest.mark.parametrize("site", ["capture", "lane_run", "publish", "lane_runner"])
+def test_effect_capture_spawn_golden_and_exactly_one_extra_fd(repo, tmp_path, monkeypatch, effect, site):
+    from types import SimpleNamespace
+    import struct
+    import hashlib
+    if effect or site != "capture":
+        strict_program_guard()
+    if (effect or site != "capture") and not gitops_fds.descriptor_supported():
+        pytest.skip("strict and effect transport require descriptor-bound executables")
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append((argv, kwargs.copy()))
+        return subprocess.Popen(argv, **kwargs)
+    with (tmp_path / "lock").open("w+b") as stream:
+        if effect:
+            gitops_fds.receipt_fds(stream.fileno(), error=gitops_fds.AegisError)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+        kw = {"effect_fds": (stream.fileno(),)} if effect else {}
+        if site == "capture":
+            with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                result = gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo,
+                    env=dict(os.environ), stdin=b"hello", timeout=5, **kw, worktree_root=repo)
+            assert result.returncode == 0
+        else:
+            lane = gitsafe.lane_runner(repo, tmp_path, **kw, worktree_root=repo)
+            if site == "publish":
+                (tmp_path / "objects").mkdir()
+                payload = b"PACK" + struct.pack("!II", 2, 0)
+                payload += hashlib.sha1(payload).digest()
+                assert lane.publish(payload, **kw).returncode == 0
+            else:
+                assert lane.run(["version"], **kw).returncode == 0
+        for argv, kwargs in calls:
+            expected_keys = {"cwd", "env", "stdin", "stdout", "stderr", "start_new_session"}
+            assert set(kwargs) == expected_keys | ({"executable"} if effect or site != "capture" else set()) | ({"pass_fds"} if effect else set())
+            if effect:
+                assert kwargs["pass_fds"][0] == stream.fileno() and len(kwargs["pass_fds"]) == 5
+            assert kwargs["stdout"] == subprocess.PIPE and kwargs["stderr"] == subprocess.PIPE
+            assert kwargs["start_new_session"] == (os.name == "posix")
+            if kwargs["stdin"] != subprocess.DEVNULL:
+                assert kwargs["stdin"].closed
+            if not effect and site == "capture":
+                assert argv == [gitsafe.git_executable(), "version"]
+                assert kwargs["env"] == dict(os.environ)
+        assert len(calls) == (1 if site == "capture" else 5)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX effect descriptor inheritance")
+def test_effect_git_config_queries_preserve_owner_programs_and_disable_automatic_maintenance(repo, tmp_path, effect_lock):
+    # Queries do not execute the named program. Owner selection is permitted;
+    # transport-specific daemon refusal is covered through real push/fetch.
+    for name, attempted, expected in [
+        ("credential.helper", "cache --timeout=999", b"cache --timeout=999\n"),
+        ("core.sshCommand", "ssh -oControlPersist=yes", b"ssh -oControlPersist=yes\n"),
+        ("gc.auto", "1", b"0\n"),
+        ("gc.autoDetach", "true", b"false\n"),
+        ("maintenance.auto", "true", b"false\n"),
+    ]:
+        result = gitsafe.run(["-c", name + "=" + attempted, "config", "--get", name], repo,
+                             effect_fds=(effect_lock,), worktree_root=repo)
+        assert result.returncode == 0 and result.stdout == expected
+    for command in (["gc"], ["maintenance", "start"], ["credential-cache", "--daemon"], ["untrusted-alias"]):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(command, repo, effect_fds=(effect_lock,), worktree_root=repo)
+        assert caught.value.code == "effect_command_refused"
+        assert caught.value.process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_receipt_export_is_usable_without_changing_descriptor_ownership(tmp_path):
+    from aegis_core import team_gitops
+    _repo(tmp_path)
+    if not team_gitops.descriptor_supported() or not gitops_fds.descriptor_supported():
+        pytest.skip("descriptor-relative journal requires POSIX no-follow operations")
+    root = tmp_path / "common"
+    root.mkdir()
+    store = team_gitops.GitOpsJournal(root)
+    with store.record_intent(op="push", lane="lane-1", request_id="request-1", actor="session-1",
+                             expected_old="a" * 40, expected_new="b" * 40) as receipt:
+        fds = receipt.inheritable_fds()
+        assert len(fds) == 1 and not os.get_inheritable(fds[0])
+        assert receipt.inheritable_fds() == fds
+        before = os.fstat(fds[0])
+        result = gitsafe.run(["version"], tmp_path, effect_fds=fds, worktree_root=tmp_path)
+        assert result.returncode == 0 and os.fstat(fds[0]) == before
+        assert store.reconcile("lane-1", lambda _: pytest.fail("live receipt was observed")) == []
+    with pytest.raises(team_gitops.GitOpsError) as caught:
+        receipt.inheritable_fds()
+    assert caught.value.code == "effect_busy"
+
+
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX Git remote-helper descriptor inheritance")
+def test_effect_real_git_remote_helper_keeps_lock_after_git_and_owner_die(repo, tmp_path):
+    _assert_effect_survives_owner(tmp_path, repo, "remote_git")
+
+
+@pytest.mark.parametrize("site", ["run", "execute", "capture"])
+@pytest.mark.parametrize("bad", ["many_args", "long_arg", "nul_arg", "bad_arg", "bad_stdin", "huge_timeout", "nan_timeout"])
+def test_effect_inputs_are_bounded_before_lookup_or_spawn(repo, tmp_path, effect_lock, monkeypatch, site, bad):
+    args, data, timeout = ["version"], None, 5
+    if bad == "many_args":
+        args = ["version"] * 513
+    elif bad == "long_arg":
+        args = ["version", "x" * 16385]
+    elif bad == "nul_arg":
+        args = ["version", "x\0y"]
+    elif bad == "bad_arg":
+        args = ["version", 1]
+    elif bad == "bad_stdin":
+        data = "untrusted-text"
+    elif bad == "huge_timeout":
+        timeout = 10 ** 400
+    elif bad == "nan_timeout":
+        timeout = float("nan")
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid effect input reached executable lookup or spawn")
+    monkeypatch.setattr(gitsafe, "git_executable", unexpected)
+    from types import SimpleNamespace
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        if site == "run":
+            gitsafe.run(args, repo, stdin=data, timeout=timeout, effect_fds=(effect_lock,), worktree_root=repo)
+        elif site == "capture":
+            with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                gitsafe_run.capture(["git", *args], cwd=repo, env=dict(os.environ), stdin=data,
+                    timeout=timeout, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            gitsafe_run.execute(args, repo, executable=unexpected, legacy_runner=unexpected,
+                error=gitsafe.GitError, environ=os.environ, timeout=timeout, stdin=data,
+                hardening=gitsafe._HARDENING, env=None, tty=False, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_command_refused"
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+_IMPORT_PROBE = '\nimport importlib, json, os, subprocess, sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\nmodule, operation, root = sys.argv[2], sys.argv[3], Path(sys.argv[4])\nloaded = importlib.import_module(module)\nassert "aegis_core.gitops_fds" not in sys.modules, "effect module imported eagerly"\nif operation == "effect_success":\n    from aegis_core import gitops_fds\n    with (root / "effect.lock").open("w+b") as held:\n        gitops_fds.receipt_fds(held.fileno(), error=gitops_fds.AegisError)\n        effect = {"effect_fds": (held.fileno(),), "worktree_root": root}\n        if module.endswith(("gitsafe", "gitsafe_run")):\n            subprocess.run([sys.argv[5], "init", "-q", str(root)], check=True, capture_output=True)\n        if module.endswith("gitsafe"):\n            assert loaded.run(["version"], root, **effect).returncode == 0\n        elif module.endswith("gitsafe_run"):\n            from aegis_core import gitsafe, gitops_fds\n            with gitsafe.custody(scratch=root, worktree_root=root):\n                assert loaded.capture([gitsafe.git_executable(), "version"], cwd=root,\n                    env=dict(os.environ), stdin=None, timeout=5, error=gitsafe.GitError, **effect).returncode == 0\n        elif module.endswith("ghcli"):\n            stub = root / "gh"\n            from tests.unit.core.test_gitsafe import _native_program\n            _native_program(stub, "#!" + sys.executable + "\\nprint(\'{}\')\\n", compiler=sys.argv[6])\n            stub.chmod(0o700)\n            (root / "checkout").mkdir()\n            subprocess.run([sys.argv[5], "init", "-q", str(root / "checkout")], check=True, capture_output=True)\n            os.chdir(root / "checkout")\n            effect["worktree_root"] = root / "checkout"\n            assert loaded.default_gh_runner(["api", "user"], env={"PATH": str(root), "TMPDIR": str(root), "GH_TOKEN": "fixture-public-token"}, **effect).returncode == 0\n        else:\n            if not loaded.descriptor_supported():\n                print(json.dumps({"unsupported": True}))\n                sys.exit(0)\n            common = root / "common"\n            common.mkdir()\n            with loaded.GitOpsJournal(common).record_intent(op="push", lane="lane-1", request_id="request-1",\n                    actor="session-1", expected_old="a" * 40, expected_new="b" * 40) as receipt:\n                assert len(receipt.inheritable_fds()) == 1\n    print(json.dumps({"loaded": "aegis_core.gitops_fds" in sys.modules}))\n    sys.exit(0)\nif module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run"):\n    from aegis_core import gitsafe, gitsafe_run\n    if operation != "import":\n        effect = {"effect_fds": (-1,)} if operation == "effect" else {}\n        try:\n            if module.endswith("gitsafe_run"):\n                with gitsafe.custody(scratch=root, worktree_root=root):\n                    gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=root,\n                        env=dict(os.environ), stdin=None, timeout=5, error=gitsafe.GitError, **effect, worktree_root=root)\n            else:\n                assert gitsafe.run(["version"], root, **effect, worktree_root=root).returncode == 0\n        except gitsafe.GitError as error:\n            assert operation == "effect" and error.code in ("invalid_effect_descriptor", "unsupported_effect_platform")\nelif module.endswith("ghcli"):\n    if operation != "import":\n        effect = {"effect_fds": (-1,)} if operation == "effect" else {}\n        try:\n            loaded.default_gh_runner(["api", "user"], **effect)\n        except Exception as error:\n            assert operation == "effect" and error.code in ("invalid_effect_descriptor", "unsupported_effect_platform")\nelse:\n    if operation != "import":\n        if loaded.descriptor_supported():\n            common = root / "common"\n            common.mkdir()\n            with loaded.GitOpsJournal(common).record_intent(op="push", lane="lane-1", request_id="request-1",\n                    actor="session-1", expected_old="a" * 40, expected_new="b" * 40) as receipt:\n                if operation == "effect":\n                    receipt.inheritable_fds()\n        else:\n            receipt = loaded.IntentReceipt({}, False)\n            if operation == "effect":\n                try:\n                    receipt.inheritable_fds()\n                except loaded.GitOpsError:\n                    pass\nprint(json.dumps({"loaded": "aegis_core.gitops_fds" in sys.modules}))\n'
+
+
+@pytest.mark.parametrize("module", ["aegis_core.gitsafe", "aegis_core.gitsafe_run", "aegis_core.ghcli", "aegis_core.team_gitops"])
+@pytest.mark.parametrize("operation", ["import", "ordinary", "effect", "effect_success"])
+def test_effect_support_imports_only_at_explicit_entry(tmp_path, module, operation):
+    import json
+    if operation == "effect_success" and not module.endswith("team_gitops"):
+        strict_program_guard()
+    if operation == "effect_success" and module.endswith("ghcli") and shutil.which("cc") is None:
+        pytest.skip("native gh fixture needs an installed C compiler")
+    if operation in ("effect", "effect_success") and not gitops_fds.descriptor_supported():
+        pytest.skip("successful effect descriptor inheritance requires POSIX pass_fds")
+    child = subprocess.run([sys.executable, "-I", "-c", _IMPORT_PROBE, str(ROOT), module, operation, str(tmp_path), gitsafe.git_executable(), shutil.which("cc") or ""],
+        cwd=tmp_path, env={**os.environ, "PATH": "" if module.endswith("ghcli") else os.environ.get("PATH", "")},
+        capture_output=True, text=True, timeout=20)
+    assert child.returncode == 0, child.stderr
+    result = json.loads(child.stdout)
+    if result.get("unsupported"):
+        pytest.skip("descriptor-relative receipt export requires POSIX no-follow operations")
+    assert result == {"loaded": operation.startswith("effect")}
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_receipt_never_widens_parent_inheritance(tmp_path):
+    from aegis_core import team_gitops
+    _repo(tmp_path)
+    if not team_gitops.descriptor_supported() or not gitops_fds.descriptor_supported():
+        pytest.skip("descriptor-relative receipt export requires POSIX no-follow operations")
+    common = tmp_path / "common"
+    common.mkdir()
+    journal = team_gitops.GitOpsJournal(common)
+    with journal.record_intent(op="push", lane="lane-1", request_id="request-1", actor="session-1",
+                              expected_old="a" * 40, expected_new="b" * 40) as receipt:
+        fds = receipt.inheritable_fds()
+        assert not os.get_inheritable(fds[0])
+        before = os.fstat(fds[0])
+        assert gitsafe.run(["version"], tmp_path, effect_fds=fds, worktree_root=tmp_path).returncode == 0
+        assert not os.get_inheritable(fds[0])
+        assert os.fstat(fds[0]) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_cas_accepts_a_per_call_receipt_after_lane_creation(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo)
+    oid = gitsafe.head_commit(repo)
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append((argv, kwargs.copy()))
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    assert lane.cas("refs/heads/lane/effect", oid, None, effect_fds=(effect_lock,)) == "updated"
+    assert lane.cas("refs/heads/lane/effect", oid, None, effect_fds=(effect_lock,)) == "already"
+    assert calls and all(kwargs["pass_fds"][0] == effect_lock and len(kwargs["pass_fds"]) == 5 for _, kwargs in calls)
+    assert not os.get_inheritable(effect_lock)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX effect descriptor inheritance")
+def test_effect_cas_refuses_invalid_per_call_fd_before_spawn(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo)
+    calls = []
+    def unexpected(*args, **kwargs):
+        calls.append((args, kwargs))
+        pytest.fail("invalid CAS descriptor reached a spawn")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.cas("refs/heads/lane/effect", "a" * 40, None, effect_fds=(-1,))
+    assert caught.value.code == "invalid_effect_descriptor"
+    assert caught.value.process_started is False and calls == []
+
+
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_git_refuses_credential_subcommand_before_spawn(repo, tmp_path, effect_lock, monkeypatch, site):
+    from types import SimpleNamespace
+    def unexpected(*args, **kwargs):
+        pytest.fail("credential effect reached a spawn")
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": unexpected}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        if site == "run":
+            gitsafe.run(["credential", "fill"], repo, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                gitsafe_run.capture([gitsafe.git_executable(), "credential", "fill"], cwd=repo,
+                    env=dict(os.environ), stdin=None, timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "execute", "capture", "lane_run", "publish", "lane_runner"])
+def test_effect_askpass_disabled_at_every_spawn(repo, tmp_path, effect_lock, monkeypatch, site):
+    from types import SimpleNamespace
+    import struct
+    import hashlib
+    _git(repo, "config", "core.askPass", "untrusted-askpass")
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append((list(argv), kwargs.copy()))
+        return subprocess.Popen(argv, **kwargs)
+    def run(argv, **kwargs):
+        calls.append((list(argv), kwargs.copy()))
+        return subprocess.run(argv, **kwargs)
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    pack = b"PACK" + struct.pack("!II", 2, 0)
+    pack += hashlib.sha1(pack).digest()
+    assert _effect_call(site, repo, tmp_path, effect_lock, payload=pack if site == "publish" else b"").returncode == 0
+    assert calls
+    for argv, kwargs in calls:
+        assert "core.askPass=" in argv
+        assert kwargs["env"]["GIT_ASKPASS"] == kwargs["env"]["SSH_ASKPASS"] == ""
+        assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_nested_validation_inherits_per_call_fd(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo)
+    (tmp_path / "objects").mkdir()
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append((list(argv), kwargs.copy()))
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    result = lane.run(["hash-object", "-w", "--stdin", "--path=claim.txt"], stdin=b"content", effect_fds=(effect_lock,))
+    assert result.returncode == 0
+    assert any("config" in argv for argv, _ in calls)
+    assert all(kwargs["pass_fds"][0] == effect_lock and len(kwargs["pass_fds"]) == 5 for _, kwargs in calls)
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_nested_started_timeout_preserves_metadata(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    from threading import Event
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo)
+    (tmp_path / "objects").mkdir()
+    started = Event()
+    read_status = gitops_fds._HolderProcess.read_status
+    def observe(process):
+        read_status(process)
+        if process.started:
+            started.set()
+    monkeypatch.setattr(gitops_fds._HolderProcess, "read_status", observe)
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(monotonic=lambda: 2.0 if started.is_set() else 0.0))
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.run(["hash-object", "-w", "--stdin", "--path=claim.txt"], stdin=b"content", timeout=1, effect_fds=(effect_lock,))
+    assert started.is_set()
+    assert caught.value.code == "git_timeout"
+    assert caught.value.process_started is True
+
+
+@pytest.mark.parametrize("key", ["command", "cmd"])
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_trailer_background_holder_refused_and_reconcile_unblocked(repo, tmp_path, key, site):
+    from aegis_core import team_gitops
+    if not team_gitops.descriptor_supported() or not gitops_fds.descriptor_supported():
+        pytest.skip("descriptor-relative receipt export requires POSIX no-follow operations")
+    import fcntl
+    fifo = tmp_path / "holder.fifo"
+    os.mkfifo(fifo)
+    control = os.open(fifo, os.O_RDWR)
+    marker = tmp_path / "holder-started"
+    helper = tmp_path / "trailer-helper"
+    helper.write_text("#!" + sys.executable + "\nimport os\nfrom pathlib import Path\nr,w=os.pipe()\np=os.fork()\n"
+        + "if p==0:\n os.close(r)\n with open(os.devnull,'r+b',buffering=0) as d:\n  for fd in (0,1,2): os.dup2(d.fileno(),fd)\n"
+        + " s=os.open(" + repr(str(fifo)) + ",os.O_RDONLY)\n os.write(w,b'R')\n os.close(w)\n os.read(s,1)\n os.close(s)\n os._exit(0)\n"
+        + "os.close(w)\nos.read(r,1)\nos.close(r)\nPath(" + repr(str(marker)) + ").write_text('started')\nprint('fixture')\n", encoding="utf-8")
+    helper.chmod(0o700)
+    _git(repo, "config", "trailer.probe." + key, str(helper))
+    common = tmp_path / "common"
+    common.mkdir()
+    journal = team_gitops.GitOpsJournal(common)
+    try:
+        with journal.record_intent(op="commit", lane="lane-1", request_id="request-1", actor="session-1",
+                                  expected_old="a" * 40, expected_new="b" * 40) as receipt:
+            fds = receipt.inheritable_fds()
+            with pytest.raises(gitsafe.GitError) as caught:
+                if site == "run":
+                    gitsafe.run(["interpret-trailers", "--trailer", "probe:x"], repo, stdin=b"subject\n\n", effect_fds=fds, worktree_root=repo)
+                else:
+                    with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                        gitsafe_run.capture([gitsafe.git_executable(), "interpret-trailers", "--trailer", "probe:x"], cwd=repo,
+                            env=dict(os.environ), stdin=b"subject\n\n", timeout=5, error=gitsafe.GitError, effect_fds=fds, worktree_root=repo)
+            assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+            assert not marker.exists()
+    finally:
+        os.write(control, b"E")
+        os.close(control)
+    results = journal.reconcile("lane-1", lambda _: team_gitops.Observation("a" * 40))
+    assert [row["status"] for row in results] == ["not_applied"]
+
+
+def _network_hardening(*extra):
+    return ("-c", "protocol.allow=always", "-c", "core.hooksPath=" + os.devnull,
+            "-c", "core.fsmonitor=false", *extra)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("operation", ["push", "fetch"])
+@pytest.mark.parametrize("source", ["caller", "owner", "default"])
+def test_effect_real_git_ssh_forces_nonpersistent_options(repo, tmp_path, effect_lock, operation, source):
+    import json
+    import shlex
+    if shutil.which("ssh") is None:
+        pytest.skip("needs an installed SSH client")
+    marker, ssh = tmp_path / "ssh.json", tmp_path / "ssh"
+    _native_program(ssh, "#!" + sys.executable + "\nimport json, os, sys\nfrom pathlib import Path\n"
+        + "Path(" + repr(str(marker)) + ").write_text(json.dumps({'argv':sys.argv[1:],'held':os.path.exists('/proc/self/fd/"
+        + str(effect_lock) + "')}))\nsys.exit(1)\n")
+    ssh.chmod(0o700)
+    command = shlex.quote(str(ssh)) + " -oControlPersist=yes -oControlMaster=yes -oControlPath=owner-socket"
+    hardening = _network_hardening()
+    if source == "caller":
+        hardening += ("-c", "core.sshCommand=" + command)
+    elif source == "owner":
+        _git(repo, "config", "core.sshCommand", command)
+    result = gitsafe.run([operation, "git@fixture.invalid:repository", "HEAD"], repo,
+        _hardening=hardening, _env={"GIT_ALLOW_PROTOCOL": "ssh"},
+        _environ={"PATH": str(tmp_path) + os.pathsep + os.environ["PATH"], "HOME": str(tmp_path)},
+        effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode != 0 and marker.exists()
+    record = json.loads(marker.read_text())
+    assert not record["held"]
+    argv = record["argv"]
+    assert argv[:8] == ["-o", "IgnoreUnknown=ForkAfterAuthentication", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no"]
+    assert "ForkAfterAuthentication=no" in argv and "BatchMode=yes" in argv
+    if source != "default":
+        assert "-oControlPersist=yes" in argv  # retained after the forced first values
+    assert not (repo / "owner-socket").exists() and not os.get_inheritable(effect_lock)
+
+
+def _credential_remote(repo, tmp_path, fd):
+    import shlex
+    marker, remote = tmp_path / "remote-started", tmp_path / "remote"
+    remote.write_text("#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nprintf 'protocol=https\\nhost=fixture.invalid\\n\\n' | "
+        + shlex.quote(gitsafe.git_executable()) + " credential fill >/dev/null\nexit 1\n", encoding="utf-8")
+    remote.chmod(0o700)
+    _git(repo, "config", "remote.fixture.url", "ext::" + shlex.quote(str(remote)))
+    helper_marker, helper = tmp_path / "credential.json", tmp_path / "helper"
+    helper.write_text("#!" + sys.executable + "\nimport json, os, sys\nfrom pathlib import Path\n"
+        + "Path(" + repr(str(helper_marker)) + ").write_text(json.dumps({'held':os.path.exists('/proc/self/fd/"
+        + str(fd) + "'),'operation':sys.argv[-1]}))\n"
+        + "sys.stdin.read()\nprint('username=fixture\\npassword=fixture\\n')\n", encoding="utf-8")
+    helper.chmod(0o700)
+    return marker, helper_marker, shlex.quote(str(helper))
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("operation", ["push", "fetch"])
+@pytest.mark.parametrize("source", ["owner_helper", "owner_cache", "caller_cache", "scoped_cache", "reset_cache", "missing"])
+def test_effect_real_git_credentials_keep_helper_or_refuse_cache(repo, tmp_path, effect_lock, operation, source):
+    import json
+    if "not a git command" in subprocess.run([gitsafe.git_executable(), "credential-cache", "-h"], capture_output=True, text=True).stderr:
+        pytest.skip("Git credential-cache is not installed")
+    remote, marker, helper = _credential_remote(repo, tmp_path, effect_lock)
+    cache = "cache --timeout=60 --socket=" + str(tmp_path / "cache" / "socket")
+    hardening = _network_hardening()
+    if source == "owner_helper":
+        _git(repo, "config", "credential.helper", helper)
+    elif source in ("owner_cache", "reset_cache"):
+        _git(repo, "config", "credential.helper", cache)
+        if source == "reset_cache":
+            hardening += ("-c", "credential.helper=", "-c", "credential.helper=" + helper)
+    elif source == "caller_cache":
+        hardening += ("-c", "credential.helper=" + cache)
+    elif source == "scoped_cache":
+        _git(repo, "config", "credential.https://fixture.invalid.helper", cache)
+    for _ in range(2):
+        if source in ("owner_cache", "caller_cache", "scoped_cache"):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run([operation, "fixture", "HEAD"], repo, _hardening=hardening,
+                    _env={"GIT_ALLOW_PROTOCOL": "ext"}, effect_fds=(effect_lock,), worktree_root=repo)
+            assert caught.value.code == "effect_credential_cache_refused"
+            assert caught.value.effect_process_started is False and caught.value.next_action
+            assert not remote.exists() and not marker.exists()
+        else:
+            result = gitsafe.run([operation, "fixture", "HEAD"], repo, _hardening=hardening,
+                _env={"GIT_ALLOW_PROTOCOL": "ext"}, effect_fds=(effect_lock,), worktree_root=repo)
+            assert result.returncode != 0 and remote.exists()
+            if source == "missing":
+                assert result.stderr == b"Git operation missing HTTPS credentials; prompts disabled."
+                assert not marker.exists()
+            else:
+                record = json.loads(marker.read_text())
+                assert not record["held"] and record["operation"] == "get"
+        assert not (tmp_path / "cache").exists() and not os.get_inheritable(effect_lock)
+
+
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_environment_removes_program_selectors(repo, tmp_path, effect_lock, monkeypatch, site):
+    from types import SimpleNamespace
+    injected = {name: "fixture-injection" for name in (
+        "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_SSH",
+        "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_EXEC_PATH", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS",
+        "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS")}
+    injected.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="remote.origin.url", GIT_CONFIG_VALUE_0="injected")
+    source = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), **injected}
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append(kwargs["env"].copy())
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    with gitsafe.custody(scratch=tmp_path, worktree_root=repo), pytest.raises(gitsafe.GitError) as caught:
+        if site == "run":
+            gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env=source,
+                stdin=None, timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "ambient_git_environment" and caught.value.process_started is False
+    assert caught.value.next_action and not calls
+    assert source["GIT_SSH_COMMAND"] == "fixture-injection"  # caller dictionary untouched
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_real_gc_auto_disables_detach_and_threshold(repo, tmp_path, effect_lock):
+    import hashlib
+    import json
+    payloads = []
+    for index in range(10000):
+        data = str(index).encode("ascii")
+        if hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest().startswith("17"):
+            payloads.append(data)
+            if len(payloads) == 3:
+                break
+    assert len(payloads) == 3
+    for data in payloads:
+        subprocess.run([gitsafe.git_executable(), "hash-object", "-w", "--stdin"], cwd=repo, input=data, check=True, capture_output=True)
+    _git(repo, "config", "gc.auto", "1")
+    _git(repo, "config", "gc.autoDetach", "true")
+    before = set((repo / ".git" / "objects" / "pack").glob("*.pack"))
+    result = gitsafe.run(["gc", "--auto"], repo, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and b"Auto packing" not in result.stdout + result.stderr
+    assert set((repo / ".git" / "objects" / "pack").glob("*.pack")) == before
+    assert not (repo / ".git" / "gc.pid").exists()
+    control = subprocess.run([gitsafe.git_executable(), "-c", "core.hooksPath=" + os.devnull,
+        "-c", "gc.autoDetach=false", "gc", "--auto"], cwd=repo, capture_output=True, timeout=10)
+    assert control.returncode == 0 and b"Auto packing" in control.stdout + control.stderr
+    for key, expected in (("gc.auto", b"0\n"), ("gc.autoDetach", b"false\n"), ("maintenance.auto", b"false\n")):
+        assert gitsafe.run(["config", "--get", key], repo, effect_fds=(effect_lock,), worktree_root=repo).stdout == expected
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("failed_call", [2])
+def test_effect_preflight_spawn_failure_keeps_started_metadata_and_fd(repo, tmp_path, effect_lock, monkeypatch, site, failed_call):
+    import errno
+    from types import SimpleNamespace
+    count = []
+    before = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+    def launch(argv, **kwargs):
+        count.append(argv)
+        if len(count) == failed_call:
+            raise OSError(errno.EMFILE, "secret-failure-input")
+        return subprocess.Popen(argv, **kwargs)
+    def fail(*args, **kwargs):
+        raise OSError(errno.EMFILE, "secret-failure-input")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    if site == "run" and failed_call == 4:
+        monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": fail}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        if site == "run":
+            gitsafe.run(["push", "git@fixture.invalid:repository", "HEAD"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                gitsafe_run.capture([gitsafe.git_executable(), "push", "git@fixture.invalid:repository", "HEAD"], cwd=repo,
+                    env=dict(os.environ), stdin=None, timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_failed" and caught.value.process_started is True
+    assert caught.value.effect_process_started is False
+    assert "secret-failure-input" not in str(caught.value)
+    assert not os.get_inheritable(effect_lock)
+    if before is not None:
+        assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("helper,code", [("x" * 16385, "effect_configuration_unavailable"), ("x" * 65537, "git_output_limit")], ids=["helper-size", "capture-size"])
+def test_effect_owner_configuration_limits_refuse_before_effect(repo, tmp_path, effect_lock, helper, code):
+    _git(repo, "config", "credential.helper", helper)
+    marker, _, _ = _credential_remote(repo, tmp_path, effect_lock)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["push", "fixture", "HEAD"], repo, _hardening=_network_hardening(),
+                    _env={"GIT_ALLOW_PROTOCOL": "ext"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == code and caught.value.process_started is True
+    assert not marker.exists() and helper not in str(caught.value)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("command", ["ssh; fixture", "ssh 'unterminated", "ssh\nfixture", "", "ssh -f", "ssh -M", "ssh -S owner-socket", "ssh -nMf"])
+def test_effect_ssh_command_refusal_has_fixed_diagnostic(repo, tmp_path, effect_lock, command):
+    _git(repo, "config", "core.sshCommand", command)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", "git@fixture.invalid:repository", "HEAD"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused"
+    assert caught.value.effect_process_started is False
+    assert str(caught.value) == "Git effect SSH command cannot be confined."
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="POSIX effect descriptors")
+def test_effect_env_argument_replaces_ambient_repository_and_program_selection(repo, tmp_path):
+    _git(repo, "config", "remote.origin.url", "https://github.com/real/repository.git")
+    other = _repo(tmp_path / "other")
+    _git(other, "config", "remote.origin.url", "https://github.com/injected/repository.git")
+    code = "\nimport os, sys\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nwith open(sys.argv[3],'w+b') as held:\n    gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    result=gitsafe.run(['config','--get','remote.origin.url'],sys.argv[2],effect_fds=(held.fileno(),),\n                       _environ={'PATH':sys.argv[4],'HOME':sys.argv[5]}, worktree_root=sys.argv[2])\n    assert result.returncode==0\n    assert result.stdout==b'https://github.com/real/repository.git\\n'\n"
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(tmp_path / "held"), os.environ["PATH"], str(tmp_path)],
+        env={**os.environ, "GIT_DIR": str(other / ".git"), "GIT_SSH_COMMAND": "untrusted-program",
+             "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "remote.origin.url", "GIT_CONFIG_VALUE_0": "injected"},
+        capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0, child.stderr
+
+
+@pytest.mark.parametrize("cwd", [None, 7, "x\0y", "x" * 16385], ids=["none", "integer", "nul", "size"])
+def test_effect_cwd_refuses_before_configuration_parsing(tmp_path, effect_lock, cwd):
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["push", "fixture", "HEAD"], cwd, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=tmp_path)
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_failure_classification_does_not_parse_oversized_diagnostics(repo, tmp_path, effect_lock):
+    _credential_remote(repo, tmp_path, effect_lock)
+    (tmp_path / "remote").write_text("#!" + sys.executable + "\nimport sys\nsys.stderr.buffer.write(b'x'*65537+b'terminal prompts disabled')\nraise SystemExit(1)\n", encoding="utf-8")
+    result = gitsafe.run(["push", "fixture", "HEAD"], repo, _hardening=_network_hardening(),
+                        _env={"GIT_ALLOW_PROTOCOL": "ext"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode != 0 and result.stdout == b""
+    assert result.stderr == b"Git operation effect command failed; observe before recovery."
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("daemonize", [False, True], ids=["closefrom", "double-fork"])
+def test_effect_holder_reaps_fd_closing_descendant_after_owner_and_git_die(repo, tmp_path, effect_lock, site, daemonize):
+    import fcntl
+    import select
+    import signal
+    if not hasattr(os, "pidfd_open"):
+        pytest.skip("owner/git death latch requires Linux pidfds")
+    control, ready = tmp_path / "holder-control", tmp_path / "holder-ready"
+    os.mkfifo(control)
+    os.mkfifo(ready)
+    control_fd = os.open(control, os.O_RDWR | os.O_NONBLOCK)
+    ready_fd = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
+    shim = tmp_path / "ssh"
+    # Real Git starts this transport. It closes all inherited descriptors, just
+    # like OpenSSH, and optionally double-forks into a separate session.
+    _native_program(shim, "#!" + sys.executable + "\n" + f'''
+import os, resource, sys
+from pathlib import Path
+ancestors, pid = [], os.getppid()
+while pid > 1 and Path('/proc/'+str(pid)+'/comm').read_text().strip() in ('git', 'sh', 'bash', 'dash'):
+    ancestors.append(str(pid))
+    pid = int(Path('/proc/'+str(pid)+'/stat').read_text().rsplit(')', 1)[1].split()[1])
+Path({str(tmp_path / 'git.pid')!r}).write_text(' '.join(ancestors))
+os.closerange(3, min(resource.getrlimit(resource.RLIMIT_NOFILE)[0], 1048576))
+if {daemonize!r}:
+    if os.fork(): os._exit(0)
+    os.setsid()
+    if os.fork(): os._exit(0)
+f = os.open({str(control)!r}, os.O_RDONLY)
+r = os.open({str(ready)!r}, os.O_WRONLY)
+Path({str(tmp_path / "worker.pid")!r}).write_text(str(os.getpid()))
+os.write(r, b'R')
+os.close(r)
+os.read(f, 1)
+os.close(f)
+''')
+    shim.chmod(0o700)
+    code = "\nimport os, sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nroot, scratch, shim, lock, site = sys.argv[2:]\nwith open(lock, 'r+b') as held:\n    import fcntl\n    fcntl.flock(held, fcntl.LOCK_SH)\n    gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    kw = dict(effect_fds=(held.fileno(),), timeout=12, _env={'GIT_ALLOW_PROTOCOL':'ssh'},\n        _hardening=('-c', 'protocol.allow=always', '-c', 'core.sshCommand='+shim))\n    if site == 'capture':\n        with gitsafe.custody(scratch=Path(scratch), worktree_root=root):\n            gitsafe.run(['push','git@fixture.invalid:repository','HEAD'],root,**kw, worktree_root=root)\n    else:\n        gitsafe.run(['push','git@fixture.invalid:repository','HEAD'],root,**kw, worktree_root=root)\n"
+    capture_scratch = tmp_path / "capture-scratch"
+    capture_scratch.mkdir()
+    owner = subprocess.Popen([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(capture_scratch), str(shim), str(tmp_path / "effect.lock"), site], env=_owner_test_environment(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    worker_fd = None
+    try:
+        _wait_for_child_ready(owner, ready_fd, 8, "fd-closing SSH did not start")
+        assert os.read(ready_fd, 1) == b"R"
+        worker_fd = os.pidfd_open(int((tmp_path / "worker.pid").read_text()))
+        owner.kill()
+        owner.wait(timeout=3)
+        for pid in (tmp_path / "git.pid").read_text().split():
+            try:
+                process_fd = os.pidfd_open(int(pid))
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    assert select.select([process_fd], [], [], 3)[0], "Git ancestor did not exit"
+                finally:
+                    os.close(process_fd)
+            except ProcessLookupError:
+                pass  # double-fork transport already let real Git exit
+        # Release only the fixture's shared lock; the killed owner exported its own.
+        fcntl.flock(effect_lock, fcntl.LOCK_UN)
+        with (tmp_path / "effect.lock").open("rb") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                assert select.select([worker_fd], [], [], 0)[0], "custody freed before the final descendant exited"
+            os.write(control_fd, b"E")
+            from threading import Event, Thread
+            free = Event()
+            waiter = Thread(target=lambda: (fcntl.flock(probe, fcntl.LOCK_EX), free.set()), daemon=True)
+            waiter.start()
+            assert free.wait(8), "holder failed to reap the final descendant"
+            waiter.join(timeout=1)
+            assert select.select([worker_fd], [], [], 0)[0], "lock freed before descendant exit"
+    finally:
+        os.write(control_fd, b"E")
+        if worker_fd is not None:
+            os.close(worker_fd)
+        os.close(control_fd)
+        os.close(ready_fd)
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=15)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_lookup_uses_supplied_path_outside_checkout(repo, tmp_path, effect_lock, site):
+    hostile = repo / "bin"
+    hostile.mkdir()
+    marker = tmp_path / "hostile-git-ran"
+    fake = hostile / "git"
+    fake.write_text("#!/bin/sh\n: > '" + str(marker) + "'\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o700)
+    safe = {"PATH": os.path.dirname(gitsafe.git_executable()), "HOME": str(tmp_path)}
+    code = "\nimport os, sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nroot, lock, safe_path, site = sys.argv[2:]\n# Warm the ordinary ambient cache with the checkout's fake executable.\ngitsafe.git_executable()\nwith open(lock,'r+b') as held:\n    fds=gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    def run(path):\n        return gitsafe.run(['version'],root,_environ={'PATH':path},effect_fds=fds, worktree_root=root)\n    if site == 'capture':\n        with gitsafe.custody(scratch=Path(root).parent, worktree_root=root):\n            assert run(safe_path).stdout.startswith(b'git version ')\n    else:\n        assert run(safe_path).stdout.startswith(b'git version ')\n    assert run(os.environ['PATH']).stdout.startswith(b'git version ')\n"
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(tmp_path / "effect.lock"), safe["PATH"], site],
+        env={**os.environ, "PATH": str(hostile) + os.pathsep + safe["PATH"]}, capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0, child.stderr
+    assert not marker.exists()
+
+
+def test_strict_executable_platform_probe_has_its_own_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: False)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.custody_program(tmp_path, environ={"PATH": os.path.dirname(gitsafe.git_executable())})
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False and caught.value.effect_process_started is False
+    assert caught.value.next_action
+    # Ordinary owner calls retain their cross-platform process behavior.
+    assert gitsafe.run(["version"], tmp_path, _environ={}).returncode == 0
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("failure", ["open", "spawn"])
+def test_executable_descriptors_close_on_every_failure(repo, tmp_path, effect_lock, monkeypatch, failure):
+    from types import SimpleNamespace
+    import errno
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    lane = gitsafe.lane_runner(repo, scratch, environ={"PATH": os.path.dirname(gitsafe.git_executable())}, worktree_root=repo)
+    opened = []
+    def open_program(*args, **kwargs):
+        if failure == "open": raise OSError(errno.EACCES, "UNTRUSTED_DETAIL")
+        fd = os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    def fail_spawn(*args, **kwargs):
+        raise OSError(errno.EACCES, "UNTRUSTED_DETAIL")
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "open": open_program}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": fail_spawn}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.run(["version"])
+    assert caught.value.code == ("effect_command_refused" if failure == "open" else "git_failed")
+    assert caught.value.process_started is False and "UNTRUSTED_DETAIL" not in str(caught.value)
+    for fd in opened:
+        with pytest.raises(OSError) as closed: os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("command", ["env ssh", "exec ssh", "~/bin/ssh", "ssh -i $HOME/key"])
+def test_effect_nonplain_ssh_refuses_only_ssh_remote(repo, tmp_path, effect_lock, command):
+    _git(repo, "config", "core.sshCommand", command)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", "git@fixture.invalid:repository", "HEAD"], repo,
+                    _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused"
+    assert caught.value.effect_process_started is False and caught.value.next_action
+    result = gitsafe.run(["fetch", str(repo), "HEAD"], repo,
+                        _hardening=_network_hardening(), _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+
+
+def test_effect_receipt_refuses_reused_descriptor_identity(repo, tmp_path, effect_lock):
+    original = (tmp_path / "original-lock").open("w+b")
+    fd = original.fileno()
+    exported = gitops_fds.receipt_fds(fd, error=gitsafe.GitError)
+    original.close()
+    with (tmp_path / "replacement-lock").open("w+b") as replacement:
+        reused = replacement.fileno() != fd
+        if reused:
+            os.dup2(replacement.fileno(), fd)
+        try:
+            gitops_fds.receipt_fds(fd, error=gitsafe.GitError)
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["version"], repo, effect_fds=exported, worktree_root=repo)
+            assert caught.value.code == "invalid_effect_descriptor"
+            assert caught.value.process_started is False
+        finally:
+            if reused:
+                os.close(fd)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("start_delay", [0, 2], ids=["idle", "delayed"])
+def test_effect_timeout_kills_and_reaps_detached_group(repo, tmp_path, effect_lock, monkeypatch, site, start_delay):
+    import signal
+    from types import SimpleNamespace
+    shim, marker = tmp_path / "ssh", tmp_path / "descendant.pid"
+    _native_program(shim, "#!" + sys.executable + "\n" + f'''
+import os, signal, time
+from pathlib import Path
+time.sleep({start_delay})
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+os.closerange(3, 1048576)
+Path({str(marker)!r}).write_text(str(os.getpid()))
+signal.pause()
+''')
+    shim.chmod(0o700)
+    # Startup is not the timeout precondition: the detached daemon must exist.
+    # Pause only this consumer's clock until that event, with a real deadline
+    # so a broken shim still fails. Never change the shared time module.
+    startup_deadline, ready_at = time.monotonic() + 30, []
+    def ready_clock():
+        now = time.monotonic()
+        if not ready_at:
+            if marker.exists():
+                ready_at.append(now)
+            else:
+                assert now < startup_deadline, "timeout fixture never started its detached child"
+                return 0.0
+        return now - ready_at[0]
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": ready_clock}))
+    # The isolated holder owns another deadline. Gate its existing one-second
+    # timeout on the same event, leaving its kill/reap loop byte-identical.
+    timer = "deadline, code, failure, group_killed ="
+    assert gitops_fds._HOLDER_SOURCE.count(timer) == 1
+    readiness = f'''
+startup_deadline = time.monotonic() + 30
+while sys.argv[7] != '-1' and not os.path.exists({str(marker)!r}) and not stopping and time.monotonic() < startup_deadline:
+    time.sleep(0.01)
+'''
+    holder_source = gitops_fds._HOLDER_SOURCE
+    timer_line = next(line for line in holder_source.splitlines() if timer in line)
+    indentation = timer_line[:len(timer_line) - len(timer_line.lstrip())]
+    readiness = readiness.replace("\n", "\n" + indentation)
+    monkeypatch.setattr(gitops_fds, "_HOLDER_SOURCE", holder_source.replace(timer, readiness + timer))
+    import contextlib
+    capture_scratch = tmp_path / "capture-scratch"
+    capture_scratch.mkdir()
+    context = gitsafe.custody(scratch=capture_scratch, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["push", "git@fixture.invalid:repository", "HEAD"], repo,
+            _hardening=_network_hardening("-c", "core.sshCommand=" + str(shim)),
+            _env={"GIT_ALLOW_PROTOCOL": "ssh"}, timeout=1, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_timeout" and caught.value.process_started
+    assert marker.exists(), "timeout fixture never started its detached child"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)
+    # The public operation returned only after the holder reaped the daemon.
+    import fcntl
+    fcntl.flock(effect_lock, fcntl.LOCK_UN)
+    with (tmp_path / "effect.lock").open("rb") as probe:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_ambient_home_keeps_owner_global_helper(repo, tmp_path, effect_lock):
+    import shlex
+    owner_home = tmp_path / "owner-home"
+    owner_home.mkdir()
+    _, helper_marker, helper = _credential_remote(repo, tmp_path, effect_lock)
+    # Only the owner HOME config defines this helper; repository config does not.
+    (owner_home / ".gitconfig").write_text('[credential]\n\thelper = ' + helper + '\n', encoding="utf-8")
+    bare = tmp_path / "bare"
+    _git(repo, "init", "--bare", str(bare))
+    remote = tmp_path / "remote"
+    remote.write_text("#!/bin/sh\nprintf 'protocol=https\\nhost=fixture.invalid\\n\\n' | "
+        + shlex.quote(gitsafe.git_executable()) + " credential fill >/dev/null || exit 1\nexec "
+        + shlex.quote(gitsafe.git_executable()) + " receive-pack " + shlex.quote(str(bare)) + "\n", encoding="utf-8")
+    code = "\nimport os, sys\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nwith open(sys.argv[3], 'r+b') as held:\n    fds=gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    result=gitsafe.run(['push','fixture','HEAD:refs/heads/main'],sys.argv[2],\n        _hardening=('-c','protocol.allow=always'),_env={'GIT_ALLOW_PROTOCOL':'ext'},effect_fds=fds, worktree_root=sys.argv[2])\n    assert result.returncode==0, result.stderr\n"
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(tmp_path / "effect.lock")],
+        env={**os.environ, "HOME": str(owner_home)}, capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0 and helper_marker.exists(), child.stderr
+    assert _git(bare, "rev-parse", "refs/heads/main") == _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_real_openssh_closes_receipt_but_holder_keeps_custody(repo, tmp_path, effect_lock):
+    import fcntl
+    import select
+    import shlex
+    import signal
+    if not hasattr(os, "pidfd_open"):
+        pytest.skip("OpenSSH lifetime latch requires Linux pidfds")
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        pytest.skip("real OpenSSH binary is not installed")
+    latch, ready = tmp_path / "ssh-input", tmp_path / "ssh-ready"
+    os.mkfifo(latch)
+    os.mkfifo(ready)
+    latch_fd = os.open(latch, os.O_RDWR | os.O_NONBLOCK)
+    ready_fd = os.open(ready, os.O_RDWR | os.O_NONBLOCK)
+    proxy = tmp_path / "proxy"
+    proxy.write_text("#!" + sys.executable + "\n" + f'''
+import os
+from pathlib import Path
+Path({str(tmp_path / 'proxy.pid')!r}).write_text(str(os.getpid()))
+f = os.open({str(latch)!r}, os.O_RDONLY)
+r = os.open({str(ready)!r}, os.O_WRONLY)
+os.write(r, b'R')
+os.read(f, 1)
+''', encoding="utf-8")
+    proxy.chmod(0o700)
+    command = shlex.join([ssh, "-F", os.devnull, "-o", "ProxyCommand=" + str(proxy)])
+    code = "\nimport os, sys\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nwith open(sys.argv[3],'r+b') as held:\n    import fcntl\n    fcntl.flock(held,fcntl.LOCK_SH)\n    fds=gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    gitsafe.run(['push','git@fixture.invalid:repository','HEAD'],sys.argv[2],timeout=10,\n        _hardening=('-c','protocol.allow=always','-c','core.sshCommand='+sys.argv[4]),\n        _env={'GIT_ALLOW_PROTOCOL':'ssh'},effect_fds=fds, worktree_root=sys.argv[2])\n"
+    owner = subprocess.Popen([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(tmp_path / "effect.lock"), command], env=_owner_test_environment(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process_fd = None
+    try:
+        _wait_for_child_ready(owner, ready_fd, 6, "real OpenSSH did not start its local proxy")
+        assert os.read(ready_fd, 1) == b"R"
+        proxy_pid = int((tmp_path / "proxy.pid").read_text())
+        process_fd = os.pidfd_open(proxy_pid)
+        # Locate the real SSH ancestor through the local proxy's shell.
+        pid = proxy_pid
+        ssh_identity = os.stat(ssh)
+        while (Path('/proc/' + str(pid) + '/exe').stat().st_dev, Path('/proc/' + str(pid) + '/exe').stat().st_ino) != (ssh_identity.st_dev, ssh_identity.st_ino):
+            pid = int(Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()[1])
+            assert pid > 1
+        receipt_identity = os.fstat(effect_lock)
+        for entry in Path('/proc/' + str(pid) + '/fd').iterdir():
+            try:
+                info = entry.stat()
+            except FileNotFoundError:
+                continue
+            assert (info.st_dev, info.st_ino) != (receipt_identity.st_dev, receipt_identity.st_ino)
+        git_pid = int(Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()[1])
+        owner.kill()
+        owner.wait(timeout=3)
+        # Kill the Git ancestor (a shell may sit between git and ssh).
+        git_identity = os.stat(gitsafe.git_executable())
+        while (Path('/proc/' + str(git_pid) + '/exe').stat().st_dev, Path('/proc/' + str(git_pid) + '/exe').stat().st_ino) != (git_identity.st_dev, git_identity.st_ino):
+            git_pid = int(Path('/proc/' + str(git_pid) + '/stat').read_text().rsplit(')', 1)[1].split()[1])
+            assert git_pid > 1
+        os.kill(git_pid, signal.SIGKILL)
+        fcntl.flock(effect_lock, fcntl.LOCK_UN)
+        with (tmp_path / "effect.lock").open("rb") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                assert select.select([process_fd], [], [], 0)[0], "custody freed before OpenSSH's proxy exited"
+            os.write(latch_fd, b"E")
+            from threading import Event, Thread
+            free = Event()
+            waiter = Thread(target=lambda: (fcntl.flock(probe, fcntl.LOCK_EX), free.set()), daemon=True)
+            waiter.start()
+            assert free.wait(6), "real SSH descendants exited without releasing custody"
+            waiter.join(timeout=1)
+        assert select.select([process_fd], [], [], 0)[0]
+    finally:
+        os.write(latch_fd, b"E")
+        if process_fd is not None:
+            os.close(process_fd)
+        os.close(latch_fd)
+        os.close(ready_fd)
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=12)
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_policy_uses_one_config_read_and_one_deadline(repo, tmp_path, effect_lock):
+    script, marker = tmp_path / "git", tmp_path / "configuration-reads"
+    _native_program(script, "#!" + sys.executable + "\n" + f'''
+import os, sys, time
+from pathlib import Path
+if 'config' in sys.argv:
+    with open({str(marker)!r}, 'a') as stream: stream.write('config\\n')
+    time.sleep(0.65)
+    raise SystemExit(1)
+time.sleep(0.65)
+raise SystemExit(0)
+''')
+    script.chmod(0o700)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["push", str(repo), "HEAD"], repo, timeout=1,
+            _environ={"PATH": str(tmp_path)}, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_timeout" and caught.value.process_started
+    assert marker.read_text().splitlines() == ["config"]
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_default_file_remote_ignores_unrelated_ssh_policy(repo, tmp_path, effect_lock):
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    _git(repo, "config", "remote.fixture.url", str(repo))
+    _git(repo, "config", "branch.main.remote", "fixture")
+    result = gitsafe.run(["fetch"], repo, _hardening=_network_hardening(),
+        _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_ssh_policy_handles_option_values_and_owner_url_rewrites(repo, tmp_path, effect_lock):
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    _git(repo, "config", "url.git@fixture.invalid:.insteadOf", "https://fixture.invalid/")
+    for remote in ("git@fixture.invalid:repository", "https://fixture.invalid/repository"):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["fetch", "--depth", "1", remote, "HEAD"], repo,
+                _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+        assert caught.value.code == "effect_ssh_command_refused" and caught.value.effect_process_started is False
+
+
+@pytest.mark.parametrize("key", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"])
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_supplied_repository_selectors_cannot_redirect(repo, tmp_path, effect_lock, monkeypatch, key, site):
+    from types import SimpleNamespace
+    program = gitsafe.git_executable()
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append(True)
+        pytest.fail("selector reached executable lookup or spawn")
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=forbidden))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    source = {"PATH": os.path.dirname(program), key: "UNTRUSTED_REPOSITORY"}
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        if site == "capture":
+            gitsafe_run.capture([program, "version"], cwd=repo, env=source, stdin=None, timeout=5,
+                error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "ambient_git_environment" and caught.value.process_started is False
+    assert caught.value.next_action and "UNTRUSTED_REPOSITORY" not in str(caught.value) + caught.value.next_action
+    assert calls == []
+
+
+
+@pytest.mark.parametrize("cwd", [".", "../repository", "/tmp/parent/../repository"])
+def test_effect_noncanonical_cwd_has_typed_prespawn_refusal(tmp_path, effect_lock, cwd):
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["push", "fixture", "HEAD"], cwd, effect_fds=(effect_lock,), worktree_root=tmp_path)
+    assert caught.value.code == "invalid_effect_cwd"
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+@pytest.mark.parametrize("args,code", [(None, "effect_command_refused"), (["credential", "fill"], "effect_command_refused"), (["version"], "git_failed")])
+def test_effect_command_validation_precedes_missing_executable(repo, tmp_path, effect_lock, args, code):
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(args, repo, _environ={"PATH": ""}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == code
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+def test_effect_final_environment_limit_precedes_executable_lookup(repo, tmp_path, effect_lock):
+    source = {"PATH": "", **{"REQUEST_" + str(i): "fixture" for i in range(511)}}
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_environment_limit"
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("location", ["checkout", "extra-root"])
+def test_effect_path_fences_checkout_ssh_and_every_declared_write_root(repo, tmp_path, effect_lock, site, location):
+    import contextlib
+    write_root = repo if location == "checkout" else tmp_path / "other-model"
+    hostile, host = write_root / "bin", tmp_path / "host"
+    hostile.mkdir(parents=True)
+    host.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    bad, good = tmp_path / "hostile-ssh", tmp_path / "trusted-ssh"
+    for directory, marker in ((hostile, bad), (host, good)):
+        script = directory / "ssh"
+        _native_program(script, "#!" + sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\nraise SystemExit(1)\n")
+        script.chmod(0o700)
+    source = {"PATH": os.pathsep.join((str(hostile), str(host), os.path.dirname(gitsafe.git_executable()))), "GIT_ALLOW_PROTOCOL": "ssh"}
+    context = gitsafe.custody(scratch=scratch, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context:
+        if site == "capture":
+            result = gitsafe_run.capture([gitsafe.git_executable(), *_network_hardening(), "push", "git@fixture.invalid:repository", "HEAD"],
+                cwd=repo, env=source, stdin=None, timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), write_roots=(write_root,), worktree_root=repo)
+        else:
+            result = gitsafe.run(["push", "git@fixture.invalid:repository", "HEAD"], repo,
+                _hardening=_network_hardening(), _environ=source, _env={"GIT_ALLOW_PROTOCOL": "ssh"}, effect_fds=(effect_lock,), write_roots=(write_root,), worktree_root=repo)
+    assert result.returncode != 0 and good.exists() and not bad.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_strict_facade_uses_supplied_environment_before_discovery(repo, tmp_path, effect_lock):
+    hostile = repo / "bin"
+    hostile.mkdir()
+    source_dir, scratch = repo / "src", tmp_path / "scratch"
+    source_dir.mkdir()
+    scratch.mkdir()
+    marker = tmp_path / "ambient-git"
+    fake = hostile / "git"
+    real = gitsafe.git_executable()
+    _native_program(fake, "#!/bin/sh\n: > '" + str(marker) + "'\nexec '" + real + "' \"$@\"\n")
+    fake.chmod(0o700)
+    code = "\nimport sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nwith open(sys.argv[4],'w+b') as held:\n    fds=gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    with gitsafe.custody(scratch=Path(sys.argv[3]),strict_lane=True, worktree_root=Path(sys.argv[2]).parent):\n        result=gitsafe.run(['version'],sys.argv[2],_environ={'PATH':sys.argv[5]},effect_fds=fds, worktree_root=Path(sys.argv[2]).parent)\n    assert result.returncode==0 and result.stdout.startswith(b'git version ')\n"
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(source_dir), str(scratch), str(tmp_path / "strict-lock"), os.path.dirname(real)],
+        env={**os.environ, "PATH": str(hostile) + os.pathsep + os.environ["PATH"]}, capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0, child.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("operation", ["push", "fetch"])
+@pytest.mark.parametrize("command", ["/usr/bin/env ssh", "/bin/sh -c ssh", "/opt/wrapper -v", "/usr/bin/plink -v", "ssh destination", "ssh -Z", "ssh -o"],
+                         ids=["absolute-env", "shell", "wrapper", "other-client", "positional", "unknown-option", "missing-value"])
+def test_effect_ssh_positive_grammar_refuses_siblings(repo, tmp_path, effect_lock, site, operation, command):
+    import contextlib
+    context = gitsafe.custody(scratch=tmp_path, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run([operation, "git@fixture.invalid:repository", "HEAD"], repo,
+            _hardening=_network_hardening("-c", "core.sshCommand=" + command), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused"
+    assert caught.value.effect_process_started is False and caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("form", ["repo-equals", "repo-spaced", "multiple", "all", "group", "legacy-remotes", "legacy-branches"])
+def test_effect_remote_unsupported_forms_refuse(repo, tmp_path, effect_lock, site, form):
+    import contextlib
+    command = ["fetch", "fixture", "HEAD"]
+    _git(repo, "config", "remote.origin.url", "https://fixture.invalid/repo")
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    if form == "repo-equals":
+        command = ["push", "--repo=git@fixture.invalid:repository", "HEAD"]
+    elif form == "repo-spaced":
+        command = ["push", "--repo", "https://fixture.invalid/repo", "git@fixture.invalid:repository", "HEAD"]
+    elif form == "multiple":
+        command = ["fetch", "--multiple", "fixture"]
+    elif form == "all":
+        command = ["fetch", "--all"]
+    elif form == "group":
+        _git(repo, "config", "remotes.fixture", "origin other")
+    else:
+        parent = repo / ".git" / ("remotes" if form == "legacy-remotes" else "branches")
+        parent.mkdir(exist_ok=True)
+        (parent / "fixture").write_text("URL: ssh://fixture.invalid/repository\n", encoding="utf-8")
+    context = gitsafe.custody(scratch=tmp_path, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(command, repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "unsupported_remote_form"
+    assert caught.value.effect_process_started is False and caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_fetch_policy_uses_first_configured_url(repo, tmp_path, effect_lock):
+    _git(repo, "config", "remote.fixture.url", str(repo))
+    _git(repo, "config", "--add", "remote.fixture.url", "ssh://fixture.invalid/repository")
+    _git(repo, "config", "core.sshCommand", "/usr/bin/env ssh")
+    result = gitsafe.run(["fetch", "fixture", "HEAD"], repo, _hardening=_network_hardening(),
+        _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+
+
+def test_effect_functions_do_not_read_ambient_environment():
+    """All recipe inputs and executable candidates cross the two shared boundaries."""
+    names = ("gitsafe", "gitsafe_run", "gitsafe_policy", "gitops_fds", "ghcli", "team_gitops")
+    sources = {name: (ROOT / "aegis_core" / (name + ".py")).read_text(encoding="utf-8") for name in names}
+    # Allowed sinks and callbacks retain existing custody/platform behavior.
+    sinks = {("gitsafe_run", "capture", "subprocess.Popen"): "bounded capture or isolated holder",
+             ("gitsafe_run", "execute", "legacy_runner"): "ordinary compatibility runner",
+             ("ghcli", "default_gh_runner", "subprocess.run"): "ordinary gh compatibility",
+             ("ghcli", "default_gh_runner", "subprocess.Popen"): "isolated gh holder"}
+    lookups = {("gitsafe", "git_executable"): "facade-owned cached ordinary or strict Git lookup",
+               ("gitsafe", "custody_program"): "facade-owned discovery callback",
+               ("ghcli", "default_gh_runner"): "gh callback to the sole resolver",
+               ("gitops_fds", "_ssh_policy"): "positive SSH grammar then the sole resolver"}
+    # Binding maps and bounded input snapshots are data, not child environments.
+    recipe_functions = {"resolve_base_ref", "issue_runner", "capture", "execute", "environment",
+                        "default_gh_runner", "_gh_command", "prepare_capture", "holder_recipe"}
+    recipe_calls = {"request_environment", "gitsafe_run.request_environment", "transport.environment",
+                    "effect_environment", "gitops_fds.effect_environment", "gitops_fds.prepare_capture",
+                    "gitops_fds.capture_recipe", "_gh_command", "_lane.environment", "environment_layer"}
+    def census(texts):
+        readers, seen_sinks, seen_lookups, errors = set(), set(), set(), []
+        for module, source in texts.items():
+            tree = ast.parse(source)
+            parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+            for node in ast.walk(tree):
+                current, function = node, None
+                while current in parents:
+                    current = parents[current]
+                    if isinstance(current, ast.FunctionDef):
+                        function = current
+                        break
+                if isinstance(node, ast.Assign) and function is not None and function.name in recipe_functions:
+                    targets = {x.id for target in node.targets if isinstance(target, (ast.Name, ast.Tuple, ast.List)) for x in ast.walk(target) if isinstance(x, ast.Name)}
+                    tracked = {"env"} if (module, function.name) == ("gitsafe", "resolve_base_ref") else {"env", "environ", "effective", "base", "prepared"}
+                    if targets & tracked:
+                        value = node.value
+                        variants = (value.body, value.orelse) if isinstance(value, ast.IfExp) else (value,)
+                        for variant in variants:
+                            valid = isinstance(variant, ast.Call) and ast.unparse(variant.func) in recipe_calls
+                            valid |= isinstance(variant, (ast.Name, ast.Tuple)) and isinstance(value, ast.IfExp)
+                            valid |= function.name == "environment" and isinstance(variant, ast.DictComp) and any(isinstance(x, ast.Name) and x.id == "LOCATION_ENV" for x in ast.walk(variant))
+                            if not valid:
+                                errors.append((module, function.name, "environment recipe bypass"))
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr in ("environ", "environb", "getenv"):
+                    # Module-level type(os.environ) stores a type, never request values.
+                    if function is None and isinstance(parents.get(node), ast.Call) and ast.unparse(parents[node].func) == "type":
+                        continue
+                    readers.add((module, function.name if function else None))
+                if not isinstance(node, ast.Call):
+                    continue
+                call = ast.unparse(node.func)
+                if call == "pathlookup.which":
+                    site = (module, function.name if function else None)
+                    seen_lookups.add(site)
+                    ancestor = node
+                    while ancestor in parents and not (isinstance(ancestor, ast.Call) and ast.unparse(ancestor.func).endswith(("find_executable", "transport.resolve"))):
+                        ancestor = parents[ancestor]
+                    if site not in lookups or not isinstance(ancestor, ast.Call) or not ast.unparse(ancestor.func).endswith(("find_executable", "transport.resolve")):
+                        errors.append((module, "lookup bypass"))
+                if call not in ("subprocess.run", "subprocess.Popen", "legacy_runner"):
+                    continue
+                site = (module, function.name if function else None, call)
+                seen_sinks.add(site)
+                if site not in sinks or function is None:
+                    errors.append((module, "spawn bypass"))
+                    continue
+                calls = {ast.unparse(x.func) for x in ast.walk(function) if isinstance(x, ast.Call)}
+                if "request_environment" not in calls:
+                    errors.append((module, "environment bypass"))
+                env = next((kw.value for kw in node.keywords if kw.arg == "env"), None)
+                if call != "subprocess.Popen" and (not isinstance(env, ast.Name) or env.id not in ("env", "effective")):
+                    errors.append((module, "unconstructed environment"))
+                if call == "subprocess.Popen" and not any(kw.arg is None and isinstance(kw.value, ast.Name) and kw.value.id == "options" for kw in node.keywords):
+                    errors.append((module, "holder options bypass"))
+        if readers != {("gitsafe_run", "request_environment")}:
+            errors.append(("readers", sorted(readers)))
+        if seen_sinks != set(sinks) or seen_lookups != set(lookups):
+            errors.append(("sites", seen_sinks, seen_lookups))
+        return errors
+    assert census(sources) == []
+    transport = ast.parse(sources["gitsafe_run"])
+    constructors = [n for n in transport.body if isinstance(n, ast.FunctionDef) and n.name == "request_environment"]
+    resolvers = [n for n in transport.body if isinstance(n, ast.FunctionDef) and n.name == "find_executable"]
+    assert len(constructors) == len(resolvers) == 1
+    services = next(n for n in transport.body if isinstance(n, ast.FunctionDef) and n.name == "transport_services")
+    assert ast.unparse(services.body[0].value) == "_TransportServices(request_environment, find_executable, Environment, merge_inputs)"
+    leaf = ast.parse(sources["gitops_fds"])
+    binder = next(n for n in leaf.body if isinstance(n, ast.FunctionDef) and n.name == "effect_environment")
+    returns = [n for n in ast.walk(binder) if isinstance(n, ast.Return)]
+    assert len(returns) == 1 and ast.unparse(returns[0].value.func) == "transport.environment"
+    policy = ast.parse(sources["gitsafe_policy"])
+    profiles = next(n for n in ast.walk(policy) if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "profile")
+    assert ast.literal_eval(profiles.comparators[0]) == ("ordinary", "strict/effect")
+    holder = ast.parse(gitops_fds._HOLDER_SOURCE)
+    spawns = [n for n in ast.walk(holder) if isinstance(n, ast.Call) and ast.unparse(n.func) == "subprocess.Popen"]
+    assert len(spawns) == 1 and not any(kw.arg == "env" for kw in spawns[0].keywords), "holder inherits the constructed environment; only its directory-fd bindings change"
+    assert not any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os" and n.attr in ("environ", "getenv") for n in ast.walk(holder))
+    extra_reader = {**sources, "ghcli": sources["ghcli"] + "\ndef alternate(): return os.environ\n"}
+    extra_spawn = {**sources, "ghcli": sources["ghcli"] + "\ndef bypass(): subprocess.run(['gh'], env={})\n"}
+    extra_constructor = {**sources, "gitsafe_run": sources["gitsafe_run"].replace("effective = request_environment(", "effective = dict(", 1)}
+    assert census(extra_reader) and census(extra_spawn) and census(extra_constructor)
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_strict_discovery_and_spawn_share_one_validated_source(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    source_dir, scratch = repo / "src", tmp_path / "scratch"
+    source_dir.mkdir()
+    scratch.mkdir()
+    observed = []
+    def launch(argv, **kwargs):
+        observed.append(kwargs["env"])
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    clean = {"PATH": os.path.dirname(gitsafe.git_executable()), "REQUEST_MARKER": "one-request"}
+    with gitsafe.custody(scratch=scratch, strict_lane=True, worktree_root=repo):
+        result = gitsafe.run(["version"], source_dir, _environ=clean, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and len(observed) == 5
+    assert len({id(env.origin) for env in observed}) == 1
+    assert all(env["REQUEST_MARKER"] == "one-request" and env["PATH"] == clean["PATH"] for env in observed)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("operation", ["push", "fetch"])
+@pytest.mark.parametrize("absolute", [False, True], ids=["bare-ssh", "absolute-ssh"])
+def test_effect_ssh_positive_grammar_keeps_allowed_options(repo, tmp_path, effect_lock, site, operation, absolute):
+    import contextlib
+    import json
+    import shlex
+    host, scratch = tmp_path / "host", tmp_path / "scratch"
+    host.mkdir()
+    scratch.mkdir()
+    marker, ssh = host / "argv.json", host / "ssh"
+    _native_program(ssh, "#!" + sys.executable + "\nimport json, sys\nfrom pathlib import Path\nPath(" + repr(str(marker))
+        + ").write_text(json.dumps(sys.argv[1:]))\nraise SystemExit(1)\n")
+    ssh.chmod(0o700)
+    command = shlex.join([str(ssh) if absolute else "ssh", "-vv", "-p", "2222", "-o", "LogLevel=ERROR"])
+    context = gitsafe.custody(scratch=scratch, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context:
+        result = gitsafe.run([operation, "git@fixture.invalid:repository", "HEAD"], repo,
+            _environ={"PATH": str(host) + os.pathsep + os.path.dirname(gitsafe.git_executable())},
+            _env={"GIT_ALLOW_PROTOCOL": "ssh"}, _hardening=_network_hardening("-c", "core.sshCommand=" + command), effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode != 0 and marker.exists()
+    argv = json.loads(marker.read_text())
+    assert argv[:4] == ["-o", "IgnoreUnknown=ForkAfterAuthentication", "-o", "ControlMaster=no"]
+    assert "ControlPath=none" in argv and "ControlPersist=no" in argv
+    assert ["-vv", "-p", "2222", "-o", "LogLevel=ERROR"] == argv[12:17]
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_default_single_remote_matches_git(repo, tmp_path, effect_lock):
+    _git(repo, "config", "remote.only.url", str(repo))
+    _git(repo, "config", "core.sshCommand", "/usr/bin/env ssh")
+    result = gitsafe.run(["fetch"], repo, _hardening=_network_hardening(),
+        _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_holder_spawn_failure_is_definite(repo, tmp_path, effect_lock):
+    before = set(os.listdir("/proc/self/fd"))
+    with gitsafe.custody(scratch=tmp_path, worktree_root=repo), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture(["/nonexistent-claim-check-git", "version"], cwd=repo, env={"PATH": os.path.dirname(gitsafe.git_executable())},
+            stdin=None, timeout=3, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_failed"
+    assert caught.value.process_started is False and caught.value.effect_process_started is False
+    assert caught.value.next_action
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_holder_spawn_failure_keeps_cas_definite(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, worktree_root=repo)
+    commit = _git(repo, "rev-parse", "HEAD").strip()
+    failed = []
+    def launch(argv, **kwargs):
+        if "update-ref" in argv[9:]:
+            argv = list(argv)
+            argv[9] = "/nonexistent-claim-check-git"
+            failed.append(True)
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        lane.cas("refs/heads/lane/definite", commit, None, effect_fds=(effect_lock,))
+    assert failed == [True]
+    assert caught.value.code == "ref_update_failed"
+    assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/lane/definite") == ""
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("location", ["checkout", "extra-root"])
+def test_effect_tmpdir_fenced_in_same_context_as_path(repo, tmp_path, effect_lock, site, location):
+    import json
+    write_root = repo if location == "checkout" else tmp_path / "other-model"
+    write_root.mkdir(exist_ok=True)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    stub = tmp_path / "git"
+    _native_program(stub, "#!" + sys.executable + "\nimport json, os\nprint(json.dumps(os.environ.get('TMPDIR')))\n")
+    stub.chmod(0o700)
+    source = {"PATH": str(tmp_path), "TMPDIR": str(write_root)}
+    if site == "capture":
+        with gitsafe.custody(scratch=scratch, worktree_root=repo):
+            result = gitsafe_run.capture([str(stub), "version"], cwd=repo, env=source,
+                stdin=None, timeout=3, error=gitsafe.GitError, effect_fds=(effect_lock,), write_roots=(write_root,), worktree_root=repo)
+    else:
+        result = gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), write_roots=(write_root,), worktree_root=repo)
+    assert result.returncode == 0 and json.loads(result.stdout) is None
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("issued_with_effect", [False, True])
+def test_effect_nested_validation_shares_request_environment(repo, tmp_path, effect_lock, monkeypatch, issued_with_effect):
+    from types import SimpleNamespace
+    lane = gitsafe.lane_runner(repo, tmp_path, effect_fds=(effect_lock,) if issued_with_effect else None, worktree_root=repo)
+    (tmp_path / "objects").mkdir()
+    observed = []
+    def launch(argv, **kwargs):
+        observed.append(kwargs["env"])
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    result = lane.run(["hash-object", "-w", "--stdin", "--path=claim.txt"], stdin=b"content", effect_fds=(effect_lock,))
+    assert result.returncode == 0 and len(observed) == 2
+    assert len({id(env.origin) for env in observed}) == 1
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_environment_fences_model_owned_alias_before_it_can_be_replaced(repo, tmp_path, effect_lock):
+    import json
+    from conftest import symlink_or_skip
+    host = tmp_path / "host"
+    host.mkdir()
+    alias = repo / "alias"
+    symlink_or_skip(host, alias, target_is_directory=True)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    stub = tmp_path / "git"
+    _native_program(stub, "#!" + sys.executable + "\nimport json, os\nprint(json.dumps([os.environ['PATH'], os.environ.get('TMPDIR')]))\n")
+    stub.chmod(0o700)
+    with gitsafe.custody(scratch=scratch, worktree_root=repo):
+        result = gitsafe_run.capture([str(stub), "version"], cwd=repo,
+            env={"PATH": str(alias), "TMPDIR": str(alias)}, stdin=None, timeout=3,
+            error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and json.loads(result.stdout) == ["", None]
+
+
+@pytest.mark.parametrize("site", ["run", "capture", "lane_runner"])
+@pytest.mark.parametrize("roots", [None, 7, "/untrusted-root", (None,) * 17], ids=["none", "integer", "string", "many"])
+def test_effect_write_roots_refuse_before_expansion(repo, tmp_path, effect_lock, site, roots):
+    with pytest.raises(gitsafe.GitError) as caught:
+        if site == "lane_runner":
+            gitsafe.lane_runner(repo, tmp_path, effect_fds=(effect_lock,), write_roots=roots, worktree_root=repo)
+        elif site == "capture":
+            with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+                gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env={}, stdin=None,
+                    timeout=3, error=gitsafe.GitError, effect_fds=(effect_lock,), write_roots=roots, worktree_root=repo)
+        else:
+            gitsafe.run(["version"], repo, effect_fds=(effect_lock,), write_roots=roots, worktree_root=repo)
+    assert caught.value.code == "effect_environment_unavailable"
+    assert caught.value.process_started is False and caught.value.next_action
+
+
+def test_ordinary_capture_failure_keeps_legacy_start_metadata(repo, tmp_path):
+    with gitsafe.custody(scratch=tmp_path, stdout_limit=1), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env=dict(os.environ), stdin=None,
+            timeout=3, error=gitsafe.GitError)
+    assert caught.value.code == "git_output_limit" and caught.value.process_started is True
+    assert getattr(caught.value, "effect_process_started", None) is None
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_holder_lost_start_acknowledgment_is_unknown_and_closes_fds(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    import select
+    def fail(*args, **kwargs):
+        raise OSError("untrusted status-boundary input")
+    monkeypatch.setattr(gitops_fds, "select", SimpleNamespace(**{**vars(select), "select": fail}))
+    before = set(os.listdir("/proc/self/fd"))
+    with gitsafe.custody(scratch=tmp_path, worktree_root=repo), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env={}, stdin=None,
+            timeout=3, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_failed"
+    assert caught.value.process_started is True and caught.value.effect_process_started is True
+    assert caught.value.next_action.startswith("Observe") and "untrusted" not in str(caught.value)
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("form", ["local", "pushurl"])
+def test_effect_remote_supported_owner_destinations(repo, tmp_path, effect_lock, site, form):
+    import contextlib
+    destination = repo / "destination.git" if form == "local" else tmp_path / "destination.git"
+    _git(repo, "init", "--bare", str(destination))
+    if form == "pushurl":
+        _git(repo, "config", "remote.upload.pushurl", str(destination))
+    target = "destination.git" if form == "local" else "upload"
+    context = gitsafe.custody(scratch=tmp_path, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context:
+        result = gitsafe.run(["push", target, "HEAD:refs/heads/result"], repo, _hardening=_network_hardening(),
+            _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+    assert _git(destination, "rev-parse", "refs/heads/result").strip() == _git(repo, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("record", ["remotes", "branches"])
+def test_effect_legacy_record_precedes_literal_helper_syntax(repo, tmp_path, effect_lock, site, record):
+    import contextlib
+    directory = repo / ".git" / record
+    directory.mkdir(exist_ok=True)
+    (directory / "fixture::record").write_text("URL: git@fixture.invalid:repository\n", encoding="utf-8")
+    context = gitsafe.custody(scratch=tmp_path, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", "fixture::record", "HEAD"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "unsupported_remote_form" and caught.value.effect_process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("operation,key", [("fetch", "remote"), ("push", "pushRemote")])
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_default_remote_uses_full_branch_ref_with_colliding_tag(repo, tmp_path, effect_lock, operation, key, site):
+    import contextlib
+    _git(repo, "tag", "main")
+    _git(repo, "config", "remote.origin.url", str(repo))
+    _git(repo, "config", "remote.selected.url", "git@fixture.invalid:repository")
+    _git(repo, "config", "branch.main." + key, "selected")
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    context = gitsafe.custody(scratch=tmp_path, worktree_root=repo) if site == "capture" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run([operation], repo, _hardening=_network_hardening(), _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused" and caught.value.effect_process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("form", ["flag", "yes", "on-demand"])
+@pytest.mark.parametrize("operation", ["push", "fetch"])
+def test_effect_explicit_recursion_refuses_before_effect(repo, tmp_path, effect_lock, form, operation):
+    _git(repo, "config", "remote.origin.url", str(repo))
+    options = ["--recurse-submodules" + ("=" + form if form != "flag" else "")]
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run([operation, *options, "origin"], repo, _hardening=_network_hardening(),
+            _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "unsupported_remote_form" and caught.value.effect_process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_custody_scope_environment_and_call_precedence(repo, tmp_path, effect_lock):
+    scoped = {"GIT_ALLOW_PROTOCOL": "file", "GIT_AUTHOR_NAME": "Scope", "GIT_AUTHOR_EMAIL": "scope@example.invalid",
+        "GIT_COMMITTER_NAME": "Scope", "GIT_COMMITTER_EMAIL": "scope@example.invalid"}
+    with gitsafe.custody(scratch=tmp_path, env=scoped, worktree_root=repo):
+        result = gitsafe.run(["fetch", str(repo), "HEAD"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+        assert result.returncode == 0
+        tree = _git(repo, "rev-parse", "HEAD^{tree}").strip()
+        result = gitsafe.run(["commit-tree", tree], repo, stdin=b"scoped identity\n",
+            _env={"GIT_AUTHOR_NAME": "Call"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+    body = _git(repo, "cat-file", "-p", result.stdout.decode().strip())
+    assert "author Call <scope@example.invalid>" in body and "committer Scope <scope@example.invalid>" in body
+
+
+@pytest.mark.skipif(not gitops_fds.descriptor_supported() or not hasattr(os, "pidfd_open"), reason="race latch requires Linux subreaper and pidfds")
+def test_effect_reconcile_cleanup_race_is_terminal(repo, tmp_path):
+    import fcntl
+    import select
+    import signal
+    from threading import Event
+    if not hasattr(signal, "pidfd_send_signal"):
+        pytest.skip("cleanup-event injection requires pidfd signalling")
+    reconciled, held = Event(), []
+    def release():
+        while held:
+            held.pop().close()
+    def reconcile(journal, *args):
+        reconciled.set()
+        release()
+        return journal.reconcile(*args)
+    def cleanup(worker_fd, lock):
+        try:
+            signal.pidfd_send_signal(worker_fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        assert select.select([worker_fd], [], [], 6)[0], "descendant exit was not observed"
+        if not reconciled.is_set():
+            stream = lock.open("r+b")
+            held.append(stream)
+            fcntl.flock(stream, fcntl.LOCK_EX)
+    try:
+        _assert_effect_survives_owner(tmp_path, repo, "remote_git", reconciliation=reconcile, cleanup_event=cleanup)
+    finally:
+        release()
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_strict_direct_capture_uses_its_command_environment(repo, tmp_path, effect_lock):
+    argv = [gitsafe.git_executable(), *gitsafe._HARDENING, *gitsafe_run._LANE_OPTIONS, "version"]
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True, worktree_root=repo):
+        result = gitsafe_run.capture(argv, cwd=repo, env={"PATH": os.path.dirname(argv[0])}, stdin=None,
+            timeout=3, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+
+
+@pytest.mark.parametrize("form", ["tty", "hardening"])
+def test_effect_strict_refusal_precedes_any_discovery(repo, tmp_path, effect_lock, monkeypatch, form):
+    from types import SimpleNamespace
+    calls = []
+    def launch(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.Popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    arguments = {"tty": True} if form == "tty" else {"_hardening": gitsafe_run.HARDENING_KEEP_HOOKS_PATH}
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True, worktree_root=repo), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo, effect_fds=(effect_lock,), **arguments, worktree_root=repo)
+    assert caught.value.code == "git_custody_refused" and calls == []
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("url", ["git@fixture.invalid:org/repo::sub", "fixture.invalid:repo::sub", "ssh://fixture.invalid/repo::sub"])
+def test_effect_scp_paths_with_double_colon_still_apply_ssh_policy(repo, tmp_path, effect_lock, url):
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", url, "HEAD"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused" and caught.value.effect_process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_remote_group_normalizes_git_key_case(repo, tmp_path, effect_lock):
+    _git(repo, "config", "remote.MyGroup.url", str(repo))
+    _git(repo, "config", "remotes.MyGroup", "ssh-remote")
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", "MyGroup"], repo, _hardening=_network_hardening(), effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "unsupported_remote_form" and caught.value.effect_process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("operation", ["run", "publish", "cas"])
+def test_effect_existing_lane_resolves_program_at_each_call(repo, tmp_path, effect_lock, operation):
+    hostile = repo / "bin"
+    hostile.mkdir()
+    source = repo / "src"
+    source.mkdir()
+    scratch = tmp_path / "lane-scratch"
+    scratch.mkdir()
+    (scratch / "objects").mkdir()
+    marker = tmp_path / "hostile-effect-git"
+    real = gitsafe.git_executable()
+    stub = hostile / "git"
+    _native_program(stub, "#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+        + "if os.environ.get('GIT_CONFIG_NOSYSTEM')=='1': Path(" + repr(str(marker)) + ").touch()\n"
+        + "os.execv(" + repr(real) + ", [" + repr(real) + ", *sys.argv[1:]])\n")
+    stub.chmod(0o700)
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    code = "\nimport hashlib, os, struct, sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nfrom aegis_core import gitsafe, gitops_fds\nlane=gitsafe.lane_runner(sys.argv[2],sys.argv[3],environ={'PATH':sys.argv[7]}, worktree_root=Path(sys.argv[2]).parent)\nPath(sys.argv[2],'.git').write_bytes(b'')\nwith open(sys.argv[4],'w+b') as held:\n    fds=gitops_fds.receipt_fds(held.fileno(),error=gitsafe.GitError)\n    if sys.argv[5]=='run': assert lane.run(['version'],effect_fds=fds).returncode==0\n    elif sys.argv[5]=='publish':\n        pack=b'PACK'+struct.pack('!II',2,0)\n        assert lane.publish(pack+hashlib.sha1(pack).digest(),effect_fds=fds).returncode==0\n    else: assert lane.cas('refs/heads/lane/clean',sys.argv[6],None,effect_fds=fds)=='updated'\n"
+    result = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(source), str(scratch), str(tmp_path / "lane-lock"), operation, oid, os.path.dirname(real)],
+        env={**os.environ, "PATH": str(hostile) + os.pathsep + os.environ["PATH"]}, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "effect reused the ambient program selected at lane creation"
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_numeric_remote_helper_is_not_scp_ssh(repo, tmp_path, effect_lock):
+    marker = tmp_path / "helper-ran"
+    helper = tmp_path / "git-remote-1git"
+    helper.write_text("#!" + sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n", encoding="utf-8")
+    helper.chmod(0o700)
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    result = gitsafe.run(["fetch", "1git::target"], repo, _hardening=_network_hardening(),
+        _environ={"PATH": str(tmp_path) + os.pathsep + os.path.dirname(gitsafe.git_executable())},
+        _env={"GIT_ALLOW_PROTOCOL": "1git"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert marker.exists() and result.returncode != 0
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("override", [False, True])
+def test_effect_scoped_home_has_call_precedence_and_filters_programs(repo, tmp_path, effect_lock, override):
+    import json
+    stub = tmp_path / "git"
+    _native_program(stub, "#!" + sys.executable + "\nimport json, os\nprint(json.dumps([os.environ['HOME'], os.environ.get('GIT_SSH_COMMAND')]))\n")
+    stub.chmod(0o700)
+    source = {"PATH": str(tmp_path), "HOME": str(tmp_path / "base")}
+    scoped = {"HOME": str(tmp_path / "owner")}
+    call = {"HOME": str(tmp_path / "call")} if override else None
+    with gitsafe.custody(scratch=repo, env=scoped, worktree_root=repo):
+        result = gitsafe.run(["version"], repo, _environ=source, _env=call, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == [str(tmp_path / ("call" if override else "owner")), None]
+
+
+@pytest.mark.parametrize("environment", [[], ["x"], 7, "x"], ids=["empty-list", "list", "integer", "text"])
+def test_effect_strict_environment_refuses_before_merge_or_discovery(repo, tmp_path, effect_lock, environment):
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True, worktree_root=repo), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo, _env=environment, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_custody_refused" and caught.value.process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("setting", ["FALSE", "off", "0"])
+def test_effect_explicit_nonrecursive_fetch_is_supported(repo, tmp_path, effect_lock, setting):
+    _git(repo, "config", "submodule.recurse", setting)
+    result = gitsafe.run(["fetch", "--recurse-submodules=no", str(repo), "HEAD"], repo,
+        _hardening=_network_hardening(), _env={"GIT_ALLOW_PROTOCOL": "file"}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_nonbranch_symbolic_head_does_not_select_branch_remote(repo, tmp_path, effect_lock):
+    _git(repo, "tag", "main")
+    _git(repo, "symbolic-ref", "HEAD", "refs/tags/main")
+    _git(repo, "config", "remote.origin.url", "git@fixture.invalid:repository")
+    _git(repo, "config", "remote.selected.url", str(repo))
+    _git(repo, "config", "branch.refs/tags/main.remote", "selected")
+    shim = tmp_path / "ssh"
+    _native_program(shim, "#!/bin/sh\nexit 1\n")
+    shim.chmod(0o700)
+    _git(repo, "config", "core.sshCommand", "env ssh")
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch"], repo, _hardening=_network_hardening(),
+            _environ={"PATH": str(tmp_path) + os.pathsep + os.path.dirname(gitsafe.git_executable())}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "effect_ssh_command_refused" and caught.value.effect_process_started is False
+
+
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("form", ["missing", "none", "relative", "nonexistent", "outside", "symlink", "custody-mismatch"])
+def test_effect_owner_root_refuses_before_program_lookup(repo, tmp_path, effect_lock, monkeypatch, site, form):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+    root = repo
+    if form == "none": root = None
+    elif form == "relative": root = Path(".")
+    elif form == "nonexistent": root = tmp_path / "absent"
+    elif form == "outside": root = _repo(tmp_path / "other")
+    elif form == "symlink":
+        root = tmp_path / "root-link"
+        symlink_or_skip(repo, root, target_is_directory=True)
+    command = [gitsafe.git_executable(), "version"]
+    observed = []
+    def unexpected(*args, **kwargs):
+        observed.append(True)
+        pytest.fail("invalid root reached lookup or spawn")
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=unexpected))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    kwargs = {} if form == "missing" else {"worktree_root": root}
+    with gitsafe.custody(scratch=tmp_path, **({"worktree_root": _repo(tmp_path / "scope-other")} if form == "custody-mismatch" else {})):
+        with pytest.raises(gitsafe.GitError) as caught:
+            if site == "run":
+                gitsafe.run(["version"], repo, effect_fds=(effect_lock,), **kwargs)
+            else:
+                gitsafe_run.capture(command, cwd=repo, env={}, stdin=None, timeout=3,
+                    error=gitsafe.GitError, effect_fds=(effect_lock,), **kwargs)
+    assert caught.value.code == "effect_environment_unavailable" and caught.value.process_started is False
+    assert caught.value.next_action and observed == []
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+def test_effect_explicit_root_never_trusts_a_subdirectory_marker(repo, tmp_path, effect_lock, site):
+    source = repo / "src"
+    source.mkdir()
+    (source / ".git").write_bytes(b"")
+    hostile = repo / "bin"
+    hostile.mkdir()
+    marker = tmp_path / "model-git-ran"
+    program = hostile / "git"
+    program.write_text("#!" + sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\nprint('git version hostile')\n", encoding="utf-8")
+    program.chmod(0o700)
+    env = {"PATH": str(hostile) + os.pathsep + os.path.dirname(gitsafe.git_executable()), "TMPDIR": str(repo)}
+    with gitsafe.custody(scratch=tmp_path):
+        try:
+            if site == "run": result = gitsafe.run(["version"], source, _environ=env, worktree_root=repo, effect_fds=(effect_lock,))
+            else: result = gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=source, env=env, stdin=None,
+                timeout=3, error=gitsafe.GitError, worktree_root=repo, effect_fds=(effect_lock,))
+        except gitsafe.GitError as error:
+            assert error.code == "effect_environment_unavailable" and error.process_started is False
+        else:
+            assert result.returncode == 0 and b"hostile" not in result.stdout
+    assert not marker.exists()
+
+
+def test_effect_direct_capture_refuses_program_inside_declared_roots(repo, tmp_path, effect_lock):
+    marker = tmp_path / "direct-model-program-ran"
+    program = repo / "git"
+    program.write_text("#!/bin/sh\n: > '" + str(marker) + "'\nprintf 'git version hostile\\n'\n", encoding="utf-8")
+    program.chmod(0o700)
+    with gitsafe.custody(scratch=tmp_path, worktree_root=repo):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.capture([str(program), "version"], cwd=repo,
+                env={"PATH": os.path.dirname(gitsafe.git_executable())}, stdin=None, timeout=3,
+                error=gitsafe.GitError, worktree_root=repo, effect_fds=(effect_lock,))
+    assert caught.value.code == "effect_command_refused"
+    assert caught.value.process_started is False and caught.value.next_action
+    assert not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("replacement", ["root", "cwd", "marker"])
+def test_effect_spawn_is_bound_before_component_replacement(repo, tmp_path, effect_lock, monkeypatch, replacement):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+    source = repo / "src" / "deep"
+    source.mkdir(parents=True)
+    other = _repo(tmp_path / "other")
+    _git(repo, "config", "aegis.rootProbe", "owner-bound")
+    _git(other, "config", "aegis.rootProbe", "foreign")
+    changed = []
+    original = repo if replacement == "root" else repo / "src"
+    displaced = original.with_name(original.name + "-displaced")
+    def launch(argv, **options):
+        if not changed:
+            changed.append(True)
+            if replacement == "marker":
+                (source / ".git").write_text("gitdir: " + str(other / ".git") + "\n", encoding="utf-8")
+            else:
+                original.rename(displaced)
+                symlink_or_skip(other, original, target_is_directory=True)
+        # Record facts while the parent descriptors are still open.
+        assert options["pass_fds"][0] == effect_lock
+        import stat
+        assert [stat.S_ISFIFO(os.fstat(fd).st_mode) for fd in options["pass_fds"]].count(True) == 1
+        assert sum(stat.S_ISDIR(os.fstat(fd).st_mode) for fd in options["pass_fds"]) == 2
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    try:
+        result = gitsafe.run(["config", "--get", "aegis.rootProbe"], source,
+            effect_fds=(effect_lock,), worktree_root=repo)
+        assert result.returncode == 0 and result.stdout == b"owner-bound\n"
+        assert changed == [True]
+    finally:
+        if replacement != "marker" and displaced.exists():
+            if original.is_symlink(): original.unlink()
+            displaced.rename(original)
+
+
+@pytest.mark.parametrize("stage", ["ancestor", "cwd", "gitdir", "record"])
+def test_effect_root_open_failure_is_typed_and_closes_descriptors(repo, tmp_path, effect_lock, monkeypatch, stage):
+    import errno
+    from contextlib import contextmanager
+    from aegis_core import storage_confined
+    from types import SimpleNamespace
+    source = repo / "src"
+    source.mkdir()
+    before = set(os.listdir("/proc/self/fd"))
+    target = {"ancestor": repo.name, "cwd": "src", "gitdir": ".git", "record": "HEAD"}[stage]
+    def fail(path, *args, **kwargs):
+        if path == target: raise OSError(errno.EIO, "untrusted-root-input")
+        return os.open(path, *args, **kwargs)
+    @contextmanager
+    def directory(root, parts):
+        with storage_confined.confined_file(root, parts) as handle:
+            if stage == "ancestor":
+                raise storage_confined.ConfinedFileError("io")
+            yield handle
+    class Record:
+        def __init__(self, parent, name):
+            self.record = storage_confined.ConfinedFile(parent, name)
+        def read_bytes(self, limit):
+            if stage == "record":
+                raise storage_confined.ConfinedFileError("io")
+            return self.record.read_bytes(limit)
+    monkeypatch.setattr(gitops_fds, "os", SimpleNamespace(**{**vars(os), "open": fail}))
+    monkeypatch.setattr(gitops_fds, "storage_confined", SimpleNamespace(
+        confined_file=directory, ConfinedFile=Record, ConfinedFileError=storage_confined.ConfinedFileError))
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["version"], source, worktree_root=repo, effect_fds=(effect_lock,))
+        assert caught.value.code == "effect_environment_unavailable" and caught.value.process_started is False
+        assert "untrusted-root-input" not in str(caught.value) and caught.value.next_action
+        assert set(os.listdir("/proc/self/fd")) == before
+        os.fstat(effect_lock)
+
+
+def _effect_record_layout(repo, record, sibling):
+    _git(repo, "config", "aegis.recordPathProbe", "owner")
+    admin = repo / (" admin " if record == "gitdir" else "admin")
+    _git(repo, "init", "-q", "--separate-git-dir", str(admin))
+    if record == "gitdir":
+        common, path, good = admin, repo / ".git", b"gitdir:  admin \n"
+        neighbor = repo / "admin"
+    else:
+        common = admin / " common "
+        common.mkdir()
+        for name in ("objects", "refs", "config"):
+            (admin / name).rename(common / name)
+        path, good = admin / "commondir", b" common \n"
+        neighbor = admin / "common"
+    path.write_bytes(good)
+    if sibling:
+        _git(repo, "init", "-q", "--bare", str(neighbor))
+        _git(neighbor, "config", "aegis.recordPathProbe", "sibling")
+    assert _git(repo, "config", "--get", "aegis.recordPathProbe") == "owner\n"
+    return admin, common, path, good
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("sibling", [False, True])
+def test_effect_record_paths_preserve_whitespace_and_never_bind_sibling(repo, effect_lock, record, sibling):
+    from concurrent.futures import ThreadPoolExecutor
+    admin, common, _, _ = _effect_record_layout(repo, record, sibling)
+    def observe(_):
+        env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+            worktree_root=repo, transport=gitsafe_run.transport_services())
+        assert env.repository["dirs"] == (str(admin), str(common))
+        assert env["GIT_DIR"] == str(admin)
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(observe, range(2), timeout=10)) == [True, True]
+    for _ in range(2):
+        result = gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+            effect_fds=(effect_lock,), worktree_root=repo)
+        assert result.returncode == 0 and result.stdout == os.fsencode(common) + b"\n"
+        os.fstat(effect_lock)
+        assert not os.get_inheritable(effect_lock)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+def test_effect_record_crlf_paths_match_git(repo, effect_lock, record):
+    admin, common, path, good = _effect_record_layout(repo, record, True)
+    path.write_bytes(good[:-1] + b"\r\n")
+    git_admin = (repo / _git(repo, "rev-parse", "--git-dir").removesuffix("\n")).resolve()
+    git_common = (repo / _git(repo, "rev-parse", "--git-common-dir").removesuffix("\n")).resolve()
+    assert (git_admin, git_common) == (admin.resolve(), common.resolve())
+    env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+        worktree_root=repo, transport=gitsafe_run.transport_services())
+    assert env.repository["dirs"] == (str(git_admin), str(git_common))
+    result = gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+        effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and result.stdout == os.fsencode(git_common) + b"\n"
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("bad", ["undecodable", "nul", "multiline", "embedded-cr", "oversize", "empty"])
+def test_effect_record_refusals_are_fixed_close_fds_and_recover(repo, effect_lock, record, bad):
+    admin, common, path, good = _effect_record_layout(repo, record, True)
+    prefix = b"gitdir: " if record == "gitdir" else b""
+    damaged = {"undecodable": prefix + b"private-\xff\n", "nul": prefix + b"private\0record\n",
+               "multiline": good + b"extra\n", "embedded-cr": prefix + b"private\rrecord\n",
+               "oversize": prefix + b"x" * 16385, "empty": prefix + b"\n"}[bad]
+    path.write_bytes(damaged)
+    before = set(os.listdir("/proc/self/fd"))
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+                effect_fds=(effect_lock,), worktree_root=repo)
+        assert (caught.value.code, str(caught.value), caught.value.process_started) == (
+            "effect_environment_unavailable", "Git operation effect roots unavailable.", False)
+        assert caught.value.next_action
+        assert set(os.listdir("/proc/self/fd")) == before
+        os.fstat(effect_lock)
+    path.write_bytes(good)
+    env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+        worktree_root=repo, transport=gitsafe_run.transport_services())
+    assert env.repository["dirs"] == (str(admin), str(common))
+    assert set(os.listdir("/proc/self/fd")) == before
+    assert not os.get_inheritable(effect_lock)
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_explicit_root_accepts_linked_worktree_and_recorded_lane_root(repo, tmp_path, effect_lock):
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-b", "linked", str(linked))
+    source = linked / "src"
+    source.mkdir()
+    result = gitsafe.run(["rev-parse", "HEAD"], source, worktree_root=linked, effect_fds=(effect_lock,))
+    assert result.returncode == 0 and result.stdout.decode().strip() == _git(repo, "rev-parse", "HEAD").strip()
+    scratch = tmp_path / "lane-scratch"
+    scratch.mkdir()
+    lane = gitsafe.lane_runner(source, scratch, worktree_root=linked, effect_fds=(effect_lock,))
+    assert lane.paths()[1] == linked and lane.run(["version"]).returncode == 0
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_raw_call_requires_root_even_with_a_previous_environment(repo, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    environments = []
+    def launch(argv, **options):
+        environments.append(options["env"])
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    assert gitsafe.run(["version"], repo, worktree_root=repo, effect_fds=(effect_lock,)).returncode == 0
+    assert len(environments) == 1
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo, _environ=environments[0], effect_fds=(effect_lock,))
+    assert caught.value.code == "effect_environment_unavailable" and caught.value.process_started is False
+    assert len(environments) == 1
+
+
+_LANE_UPGRADE_ROOT_PROBE = r'''
+import contextlib, hashlib, struct, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitops_fds
+repo, cwd, scratch, lock, operation, oid, form, hostile = sys.argv[2:]
+roots = [hostile] if form == 'extra-root' else []
+options = {} if form.startswith('missing') else {'worktree_root': repo}
+lane = gitsafe.lane_runner(cwd, scratch, write_roots=roots, **options)
+roots.clear()  # Issuance must retain the caller's original roots independently.
+assert lane.run(['version']).returncode == 0
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    context = gitsafe.custody(scratch=Path(scratch), worktree_root=repo) if form == 'missing-scoped' else contextlib.nullcontext()
+    with context:
+        try:
+            if operation == 'run':
+                assert lane.run(['version'], effect_fds=fds).returncode == 0
+            elif operation == 'publish':
+                pack = b'PACK' + struct.pack('!II', 2, 0)
+                assert lane.publish(pack + hashlib.sha1(pack).digest(), effect_fds=fds).returncode == 0
+            else:
+                assert lane.cas('refs/heads/lane/root-proof', oid, None, effect_fds=fds) == 'updated'
+        except gitsafe.GitError as exc:
+            assert form != 'extra-root', exc.code
+            assert exc.code == 'effect_environment_unavailable' and exc.process_started is False and exc.next_action
+        else:
+            assert form == 'extra-root', 'effect upgrade accepted missing or misleading root provenance'
+'''
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("operation", ["run", "publish", "cas"])
+@pytest.mark.parametrize("form", ["before-marker", "extra-root", "missing", "missing-scoped"])
+def test_effect_lane_retains_custodian_roots_before_issuance(repo, tmp_path, effect_lock, operation, form):
+    source = repo / "src"
+    source.mkdir()
+    if form == "before-marker":
+        (source / ".git").write_text("gitdir: " + str(repo / ".git") + "\n", encoding="utf-8")
+    hostile = (tmp_path / "extra-model") if form == "extra-root" else repo / "bin"
+    hostile.mkdir()
+    marker = tmp_path / "model-program-started"
+    real = gitsafe.git_executable()
+    program = hostile / "git"
+    _native_program(program, "#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+        + "if os.environ.get('GIT_CONFIG_NOSYSTEM') == '1': Path(" + repr(str(marker)) + ").touch()\n"
+        + "os.execv(" + repr(real) + ", [" + repr(real) + ", *sys.argv[1:]])\n")
+    program.chmod(0o700)
+    scratch = tmp_path / "lane-scratch"
+    (scratch / "objects").mkdir(parents=True)
+    child = subprocess.run([sys.executable, "-I", "-c", _LANE_UPGRADE_ROOT_PROBE, str(ROOT), str(repo),
+        str(source if form == "before-marker" else repo), str(scratch), str(tmp_path / "probe-lock"), operation,
+        _git(repo, "rev-parse", "HEAD").strip(), form, str(hostile)],
+        env={**os.environ, "PATH": str(hostile) + os.pathsep + os.path.dirname(real)},
+        capture_output=True, text=True, timeout=20)
+    assert child.returncode == 0, child.stderr
+    assert not marker.exists(), "effect executed a program below the custodian's root or write roots"
+
+
+def _recursive_transport_fixture(tmp_path, setting):
+    sub = _repo(tmp_path / "sub-origin")
+    (sub / "file").write_text("old\n", encoding="utf-8")
+    _commit(sub)
+    origin = _repo(tmp_path / "super-origin")
+    _git(origin, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "dep")
+    _commit(origin)
+    consumer = tmp_path / "consumer"
+    _git(tmp_path, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", str(origin), str(consumer))
+    marker = tmp_path / "submodule-ssh.json"
+    shim = tmp_path / "ssh"
+    _native_program(shim, "#!" + sys.executable + "\nimport json,sys\nfrom pathlib import Path\nPath("
+        + repr(str(marker)) + ").write_text(json.dumps(sys.argv[1:]))\nraise SystemExit(1)\n")
+    shim.chmod(0o700)
+    _git(consumer / "dep", "config", "remote.origin.url", "ssh://fixture.invalid/dependency")
+    _git(consumer / "dep", "config", "core.sshCommand", str(shim))
+    if setting == "push-config":
+        (consumer / "dep" / "file").write_text("new\n", encoding="utf-8")
+        _commit(consumer / "dep")
+        _commit(consumer)
+        _git(consumer, "config", "push.recurseSubmodules", "on-demand")
+        _git(origin, "config", "receive.denyCurrentBranch", "ignore")
+    else:
+        (sub / "file").write_text("new\n", encoding="utf-8")
+        _commit(sub)
+        oid = _git(sub, "rev-parse", "HEAD").strip()
+        _git(origin / "dep", "fetch", "-q", str(sub), "main")
+        _git(origin / "dep", "checkout", "-q", oid)
+        _commit(origin)
+        if setting == "fetch-config": _git(consumer, "config", "fetch.recurseSubmodules", "true")
+        elif setting == "submodule-config": _git(consumer, "config", "submodule.dep.fetchRecurseSubmodules", "true")
+        elif setting == "gitmodules": _git(consumer, "config", "-f", ".gitmodules", "submodule.dep.fetchRecurseSubmodules", "true")
+        elif setting == "generic-config": _git(consumer, "config", "submodule.recurse", "true")
+    return consumer, marker, origin
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("site", ["run", "capture"])
+@pytest.mark.parametrize("setting", ["default-fetch", "fetch-config", "submodule-config", "gitmodules", "generic-config", "push-config"])
+def test_effect_transports_disable_all_submodule_recursion(tmp_path, effect_lock, setting, site):
+    consumer, marker, origin = _recursive_transport_fixture(tmp_path, setting)
+    operation = "push" if setting == "push-config" else "fetch"
+    args = [operation, "origin", "main"]
+    if operation == "push":
+        old = _git(origin, "rev-parse", "refs/heads/main")
+        control = subprocess.run([gitsafe.git_executable(), "-c", "protocol.allow=always", "push",
+            "--recurse-submodules=on-demand", "origin", "main"], cwd=consumer, capture_output=True, timeout=15)
+        assert control.returncode != 0 and marker.exists()
+        assert _git(origin, "rev-parse", "refs/heads/main") == old
+        marker.unlink()
+    source = {"PATH": os.path.dirname(gitsafe.git_executable()), "GIT_ALLOW_PROTOCOL": "file:ssh"}
+    if site == "capture":
+        scratch = tmp_path / "capture"
+        scratch.mkdir()
+        with gitsafe.custody(scratch=scratch, worktree_root=consumer):
+            result = gitsafe_run.capture([gitsafe.git_executable(), *_network_hardening(), *args], cwd=consumer,
+                env=source, stdin=None, timeout=15, error=gitsafe.GitError,
+                effect_fds=(effect_lock,), worktree_root=consumer)
+    else:
+        result = gitsafe.run(args, consumer, _hardening=_network_hardening(), _environ=source,
+            timeout=15, effect_fds=(effect_lock,), worktree_root=consumer)
+    assert not marker.exists(), "effect started the populated SSH submodule transport"
+    assert result.returncode == 0, result.stderr
+    # Explicit recursion after a nonrecursive fetch confirms the SSH fixture.
+    # The push control ran first so tracking-ref updates cannot mask recursion.
+    if operation == "fetch":
+        control = subprocess.run([gitsafe.git_executable(), "-c", "protocol.allow=always", "fetch",
+            "--recurse-submodules=yes", "origin", "main"], cwd=consumer, capture_output=True, timeout=15)
+        assert control.returncode != 0 and marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_lane_write_root_alias_remains_fenced_during_replacement(repo, tmp_path, effect_lock):
+    from conftest import symlink_or_skip
+    old, new = tmp_path / "old-model", tmp_path / "new-model"
+    marker = tmp_path / "alias-program-started"
+    real = gitsafe.git_executable()
+    for root in (old, new):
+        (root / "bin").mkdir(parents=True)
+        script = root / "bin" / "git"
+        _native_program(script, "#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+            + "if os.environ.get('GIT_CONFIG_NOSYSTEM') == '1': Path(" + repr(str(marker)) + ").touch()\n"
+            + "os.execv(" + repr(real) + ", [" + repr(real) + ", *sys.argv[1:]])\n")
+        script.chmod(0o700)
+    alias = tmp_path / "model-alias"
+    symlink_or_skip(old, alias, target_is_directory=True)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    code = r'''
+import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitops_fds
+repo, scratch, alias, replacement, lock = sys.argv[2:]
+lane = gitsafe.lane_runner(repo, scratch, worktree_root=repo, write_roots=(alias,))
+realpath, changed = os.path.realpath, []
+def replace_alias(path, *args, **kwargs):
+    result = realpath(path, *args, **kwargs)
+    if str(path) == alias and not changed:
+        changed.append(True)
+        Path(alias).unlink()
+        Path(alias).symlink_to(replacement, target_is_directory=True)
+    return result
+# Isolated OS boundary: neither the real os module nor the pytest process changes.
+gitops_fds.os = SimpleNamespace(**{**vars(os), 'path': SimpleNamespace(**{**vars(os.path), 'realpath': replace_alias})})
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    assert lane.run(['version'], effect_fds=fds).returncode == 0
+assert changed == [True]
+'''
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(scratch), str(alias), str(new),
+        str(tmp_path / "alias-lock")], env={**os.environ, "PATH": str(alias / "bin") + os.pathsep + os.path.dirname(real)},
+        capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0, child.stderr
+    assert not marker.exists(), "replacing a declared write-root alias escaped its fence"
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_lane_issuance_honors_supplied_environment(repo, tmp_path, effect_lock):
+    hostile = tmp_path / "ambient-model"
+    hostile.mkdir()
+    marker = tmp_path / "ambient-program-started"
+    real = gitsafe.git_executable()
+    script = hostile / "git"
+    _native_program(script, "#!" + sys.executable + "\nimport os,sys\nfrom pathlib import Path\nPath("
+        + repr(str(marker)) + ").touch()\nos.execv(" + repr(real) + ", [" + repr(real) + ", *sys.argv[1:]])\n")
+    script.chmod(0o700)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    code = r'''
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitops_fds
+repo, scratch, hostile, real_path, marker, lock = sys.argv[2:]
+lane = gitsafe.lane_runner(repo, scratch, environ={'PATH':real_path}, write_roots=(hostile,), worktree_root=repo)
+assert not Path(marker).exists(), 'ordinary issuance ignored its supplied environment'
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    assert lane.run(['version'], effect_fds=fds).returncode == 0
+'''
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(scratch), str(hostile),
+        os.path.dirname(real), str(marker), str(tmp_path / "lock")],
+        env={**os.environ, "PATH": str(hostile) + os.pathsep + os.path.dirname(real)},
+        capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0 and not marker.exists(), child.stderr
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("layer,strict", [("source", False), ("scope", False), ("call", False),
+                                        ("source", True), ("ambient", False), ("ambient", True), ("reuse", False), ("reuse", True)])
+def test_effect_base_invariants_override_every_environment_layer(repo, tmp_path, effect_lock, layer, strict):
+    import json
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    code = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitsafe_run, gitops_fds
+repo, scratch, lock, layer, strict, real_path = sys.argv[2:]
+bad = {'LC_ALL':'fr_FR.UTF-8', 'GIT_NO_REPLACE_OBJECTS':'0', 'GIT_OPTIONAL_LOCKS':'1', 'GIT_NO_LAZY_FETCH':'0', 'GIT_TERMINAL_PROMPT':'1'}
+seen, actual = [], []
+def launch(argv, **options):
+    actual.append(options['env'])
+    seen.append({k:options['env'].get(k) for k in gitsafe_run.BASE_ENV})
+    return subprocess.Popen(argv, **options)
+gitsafe_run.subprocess = SimpleNamespace(**{**vars(subprocess), 'Popen':launch})
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    source = None if layer == 'ambient' else {'PATH':real_path, 'GIT_ALLOW_PROTOCOL':'file', **(bad if layer == 'source' else {})}
+    with gitsafe.custody(scratch=Path(scratch), strict_lane=strict == 'True', worktree_root=repo, env=bad if layer == 'scope' else None):
+        result = gitsafe.run(['version'], repo, _environ=source, _env=bad if layer == 'call' else None,
+                             worktree_root=repo, effect_fds=fds)
+        if layer == 'reuse':
+            previous = actual[-1]
+            previous.update(bad)
+            result = gitsafe.run(['version'], repo, _environ=previous, worktree_root=repo, effect_fds=fds)
+    assert result.returncode == 0
+print(json.dumps(seen))
+'''
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(scratch), str(tmp_path / "lock"),
+        layer, str(strict), os.path.dirname(gitsafe.git_executable())],
+        env={**os.environ, "LC_ALL": "fr_FR.UTF-8"}, capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0, child.stderr
+    values = json.loads(child.stdout)
+    assert values
+    fixed = {k: v for k, v in gitsafe_run.BASE_ENV.items() if k != "GIT_ALLOW_PROTOCOL"}
+    assert all(all(env.get(k) == v for k, v in fixed.items()) for env in values)
+    assert all(env["GIT_ALLOW_PROTOCOL"] == ("" if layer == "ambient" else "file") for env in values)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("stage", ["preissued", "fresh", "reuse", "capture", "run", "publish", "cas", "ssh"])
+@pytest.mark.parametrize("form", ["directory-alias", "worktree-file", "write-root-file", "intermediate-file", "intermediate-directory", "intermediate-write-root"])
+def test_program_targets_are_fenced_at_every_git_entry(repo, tmp_path, effect_lock, stage, form):
+    """A PATH directory outside custody cannot launder a model-owned executable."""
+    from conftest import symlink_or_skip
+    source, scratch, write_root = repo / "src", tmp_path / "scratch", tmp_path / "write-root"
+    source.mkdir()
+    scratch.mkdir()
+    write_root.mkdir()
+    target_root = write_root if form in ("write-root-file", "intermediate-write-root") else repo
+    programs = target_root / "programs"
+    programs.mkdir()
+    external = tmp_path / "external-bin"
+    marker = tmp_path / "untrusted-program-ran"
+    name = "ssh" if stage == "ssh" else "git"
+    real = gitsafe.git_executable()
+    target = programs / name
+    target.write_text("#!" + sys.executable + "\nimport os, sys\nfrom pathlib import Path\n"
+        + "Path(" + repr(str(marker)) + ").touch()\n"
+        + ("raise SystemExit(1)\n" if stage == "ssh" else
+           "os.execv(" + repr(real) + ", [" + repr(real) + ", *sys.argv[1:]])\n"), encoding="utf-8")
+    target.chmod(0o700)
+    if form.startswith("intermediate-"):
+        trusted = tmp_path / "trusted-programs"
+        programs.rename(trusted)
+        symlink_or_skip(trusted, programs, target_is_directory=True)
+        if form == "intermediate-directory":
+            symlink_or_skip(programs, external, target_is_directory=True)
+        else:
+            external.mkdir()
+            symlink_or_skip(programs / name, external / name)
+    elif form == "directory-alias":
+        symlink_or_skip(programs, external, target_is_directory=True)
+    else:
+        external.mkdir()
+        symlink_or_skip(target, external / name)
+    if stage == "ssh":
+        _git(repo, "config", "core.sshCommand", "ssh")
+    code = r'''
+import hashlib, os, struct, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitsafe_run, gitops_fds
+repo, source, scratch, write_root, external, lock, stage, real = sys.argv[2:]
+clean = {'PATH':os.path.dirname(real)}
+untrusted = {'PATH':external + os.pathsep + os.path.dirname(real)}
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    try:
+        if stage in ('preissued', 'fresh', 'run', 'publish', 'cas'):
+            lane = gitsafe.lane_runner(source, scratch, environ=untrusted, worktree_root=repo,
+                write_roots=(write_root,), effect_fds=fds if stage == 'fresh' else None)
+            if stage in ('preissued', 'fresh', 'run'): lane.run(['version'], effect_fds=fds)
+            elif stage == 'publish':
+                pack = b'PACK' + struct.pack('!II', 2, 0)
+                lane.publish(pack + hashlib.sha1(pack).digest(), effect_fds=fds)
+            else:
+                oid = gitsafe.run(['rev-parse', 'HEAD'], repo, _environ=clean).stdout.decode().strip()
+                lane.cas('refs/heads/lane/fenced', oid, None, effect_fds=fds)
+        elif stage == 'reuse':
+            previous = gitops_fds.effect_environment(clean, source, error=gitsafe.GitError,
+                worktree_root=repo, roots=(write_root,), base=gitsafe_run.BASE_ENV, transport=gitsafe_run.transport_services())
+            previous['PATH'] = untrusted['PATH']
+            gitsafe.run(['version'], source, _environ=previous, effect_fds=fds,
+                worktree_root=repo, write_roots=(write_root,))
+        elif stage == 'capture':
+            with gitsafe.custody(scratch=Path(scratch)):
+                gitsafe_run.capture([str(Path(external) / 'git'), 'version'], cwd=source,
+                    env=untrusted, stdin=None, timeout=5, error=gitsafe.GitError,
+                    effect_fds=fds, worktree_root=repo, write_roots=(write_root,))
+        else:
+            gitsafe.run(['fetch', 'ssh://fixture.invalid/repository', 'HEAD'], source,
+                _environ=untrusted, effect_fds=fds, worktree_root=repo, write_roots=(write_root,),
+                _hardening=tuple(x for pair in zip(gitsafe_run.DEFAULT_HARDENING[::2], gitsafe_run.DEFAULT_HARDENING[1::2])
+                    if pair[1] not in ('core.sshCommand=false', 'credential.helper=') for x in pair),
+                _env={'GIT_ALLOW_PROTOCOL':'ssh'}, timeout=5)
+    except gitsafe.GitError as exc:
+        assert exc.code in ('effect_command_refused', 'git_custody_refused', 'effect_environment_unavailable'), exc.code
+        assert exc.next_action and not getattr(exc, 'effect_process_started', False)
+        if stage == 'ssh': assert exc.process_started is True
+'''
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(source), str(scratch),
+        str(write_root), str(external), str(tmp_path / "lock"), stage, real],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=20)
+    assert child.returncode == 0, child.stderr
+    assert not marker.exists(), "a fenced executable target was run at " + stage
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_strict_validation_refuses_reconstructed_invariant_override(repo, tmp_path, effect_lock):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    code = r'''
+import subprocess, sys
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitsafe_run, gitops_fds
+repo, scratch, lock, real_path = sys.argv[2:]
+commands = []
+def launch(argv, **options):
+    commands.append(argv)
+    return subprocess.Popen(argv, **options)
+gitsafe_run.subprocess = SimpleNamespace(**{**vars(subprocess), 'Popen':launch})
+ordinary = gitsafe.lane_runner(repo, scratch, worktree_root=repo, environ={'PATH':real_path})
+assert ordinary.run(['version']).returncode == 0
+argv = commands[-1]
+with open(lock, 'w+b') as held:
+    fds = gitops_fds.receipt_fds(held.fileno(), error=gitsafe.GitError)
+    lane = gitsafe.lane_runner(repo, scratch, worktree_root=repo, effect_fds=fds,
+        environ={'PATH':real_path,'LC_ALL':'fr_FR.UTF-8','GIT_NO_REPLACE_OBJECTS':'0'})
+    env = lane.environment(args=('version',))
+    env['LC_ALL'] = 'fr_FR.UTF-8'
+    before = len(commands)
+    try: lane.validate(argv, repo, env, None, None, effect_fds=fds)
+    except gitsafe.GitError as exc: assert exc.code == 'git_custody_refused' and exc.process_started is False
+    else: raise AssertionError('strict comparison accepted a reconstructed invariant override')
+    assert len(commands) == before
+'''
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(scratch), str(tmp_path / "lock"),
+        os.path.dirname(gitsafe.git_executable())], capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0, child.stderr
+
+
+@pytest.mark.parametrize("entry", ["ambient", "supplied", "scope", "call", "capture", "scope-capture"])
+@pytest.mark.parametrize("key", ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"])
+def test_strict_capture_own_bindings_do_not_admit_injected_locations(repo, tmp_path, entry, key):
+    if entry == "capture":
+        strict_program_guard()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    code = r'''
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core import gitsafe, gitsafe_run
+repo, scratch, entry, key, real_path, value = sys.argv[2:]
+try:
+    if entry in ('ambient', 'supplied'):
+        options = {'environ': {'PATH':real_path, key:value}} if entry == 'supplied' else {}
+        gitsafe.lane_runner(repo, scratch, **options)
+    else:
+        with gitsafe.custody(scratch=Path(scratch), strict_lane=True, env={key:value} if entry in ('scope', 'scope-capture') else None):
+            if entry in ('capture', 'scope-capture'):
+                lane = gitsafe.lane_runner(repo, scratch)
+                envelope = lane.environment(args=('version',))
+                if entry == 'capture': envelope[key] = value
+                argv = [gitsafe.custody_program(repo), *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, 'version']
+                gitsafe_run.capture(argv, cwd=repo, env=envelope, stdin=None, timeout=10)
+            else:
+                gitsafe.run(['version'], repo, _env={key:value} if entry == 'call' else None)
+except gitsafe.GitError as exc:
+    expected = 'ambient_git_environment' if entry in ('ambient', 'supplied') else 'git_custody_refused'
+    assert exc.code == expected, (exc.code, expected)
+    assert exc.next_action and value not in str(exc) + exc.next_action
+else:
+    raise AssertionError('untrusted location was accepted as a runner-owned binding')
+'''
+    value = "UNTRUSTED_LOCATION_" + key
+    env = {**os.environ, **({key: value} if entry == "ambient" else {})}
+    child = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT), str(repo), str(scratch), entry, key,
+        os.path.dirname(gitsafe.git_executable()), value], env=env, capture_output=True, text=True, timeout=15)
+    assert child.returncode == 0, child.stderr
+
+
+@pytest.mark.parametrize("stage", ["preissued", "fresh", "reuse", "capture", "run", "publish", "cas", "ssh"])
+@pytest.mark.parametrize("layer", ["source", "ambient", "scope", "reuse", "replace"])
+@pytest.mark.parametrize("key", ["GIT_INDEX_FILE", "GIT_DIR", "GIT_SSH_COMMAND", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_NOSYSTEM", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "BASH_ENV", "NODE_OPTIONS", "PERL5OPT", "RUBYOPT", "OPENSSL_CONF"])
+def test_selector_inputs_refuse_before_git_spawn(repo, tmp_path, effect_lock, monkeypatch, stage, layer, key):
+    from types import SimpleNamespace
+    import contextlib
+    import hashlib
+    import struct
+    scratch = tmp_path / "lane"
+    scratch.mkdir()
+    (scratch / "objects").mkdir()
+    source = {"PATH": os.path.dirname(gitsafe.git_executable()), "REQUEST_MARKER": "retained"}
+    observed = []
+    def launch(argv, **options):
+        observed.append(options["env"])
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    bad = {key: "UNTRUSTED_SELECTOR_VALUE"}
+    if layer in ("reuse", "replace") or stage == "reuse" or layer in ("ambient", "scope") and stage in ("run", "publish", "cas"):
+        strict_program_guard()
+    if layer in ("reuse", "replace") or stage == "reuse":
+        assert gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo).returncode == 0
+        source = observed[-1]
+    if layer == "source":
+        source = {**source, **bad}
+    elif layer == "reuse":
+        source.update(bad)
+    lane = None
+    if layer in ("ambient", "scope") and stage in ("run", "publish", "cas"):
+        lane = gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo)
+    if layer == "ambient":
+        monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": {**os.environ, **bad}}))
+        source = None
+    observed.clear()
+    context = gitsafe.custody(scratch=scratch, env=bad, worktree_root=repo) if layer == "scope" else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        if layer == "replace": source = source.with_vars({**source, **bad}, replace=True)
+        if lane is not None and layer == "ambient":
+            # A transferred capability keeps its supplied request environment;
+            # ambient refusal is checked at a fresh facade entry instead.
+            gitsafe.lane_runner(repo, scratch, worktree_root=repo, effect_fds=(effect_lock,))
+        elif stage in ("preissued", "fresh", "run", "publish", "cas"):
+            lane = lane or gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo,
+                effect_fds=(effect_lock,) if stage == "fresh" else None)
+            if stage == "publish":
+                pack = b"PACK" + struct.pack("!II", 2, 0)
+                lane.publish(pack + hashlib.sha1(pack).digest(), effect_fds=(effect_lock,))
+            elif stage == "cas":
+                lane.cas("refs/heads/lane/refused", "a" * 40, None, effect_fds=(effect_lock,))
+            else:
+                lane.run(["version"], effect_fds=(effect_lock,))
+        elif stage == "capture":
+            with gitsafe.custody(scratch=scratch, env=bad if layer == "scope" else None, worktree_root=repo):
+                gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env=source,
+                    stdin=None, timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            gitsafe.run(["fetch", "ssh://fixture.invalid/repository", "HEAD"] if stage == "ssh" else ["version"],
+                repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code in ("ambient_git_environment", "git_custody_refused")
+    assert caught.value.next_action and not getattr(caught.value, "effect_process_started", False)
+    assert "UNTRUSTED_SELECTOR_VALUE" not in str(caught.value) + caught.value.next_action
+    assert observed == []
+
+
+@pytest.mark.parametrize("stage", ["run", "custody", "strict", "lane", "reuse"])
+@pytest.mark.parametrize("key", ["GIT_INDEX_FILE", "GIT_DIR", "GIT_SSH_COMMAND", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_NOSYSTEM", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "BASH_ENV", "NODE_OPTIONS", "PERL5OPT", "RUBYOPT", "OPENSSL_CONF"])
+def test_per_call_selectors_refuse_before_effect_spawn(repo, tmp_path, effect_lock, monkeypatch, stage, key):
+    if stage in ("lane", "reuse"):
+        strict_program_guard()
+    from types import SimpleNamespace
+    import contextlib
+    source = {"PATH": os.path.dirname(gitsafe.git_executable())}
+    seen = []
+    def launch(argv, **options):
+        seen.append(options["env"])
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    if stage == "reuse":
+        gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        source = seen[-1]
+    lane = gitsafe.lane_runner(repo, tmp_path, environ=source, worktree_root=repo) if stage == "lane" else None
+    seen.clear()
+    context = gitsafe.custody(scratch=tmp_path, strict_lane=stage == "strict", worktree_root=repo) if stage in ("custody", "strict") else contextlib.nullcontext()
+    with context, pytest.raises(gitsafe.GitError) as caught:
+        if lane:
+            lane.run(["version"], _env={key: "UNTRUSTED_CALL"}, effect_fds=(effect_lock,))
+        else:
+            gitsafe.run(["version"], repo, _environ=source, _env={key: "UNTRUSTED_CALL"},
+                        effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_custody_refused" and not seen
+    assert caught.value.next_action and "UNTRUSTED_CALL" not in str(caught.value) + caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_reused_preissued_environment_binds_repository_before_lookup(repo, tmp_path, effect_lock, monkeypatch):
+    from types import SimpleNamespace
+    other = _repo(tmp_path / "other")
+    scratch = tmp_path / "lane"
+    scratch.mkdir()
+    source = gitsafe.lane_runner(repo, scratch, worktree_root=repo).environment(args=("version",))
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append(True)
+        pytest.fail("mismatched issued bindings reached lookup or spawn")
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=forbidden))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], other, _environ=source, effect_fds=(effect_lock,), worktree_root=other)
+    assert caught.value.code == "git_custody_refused" and not calls
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("preissued", [False, True])
+@pytest.mark.parametrize("binding", ["real-index", "shared", "identity"])
+def test_effect_capture_preserves_issued_bindings(repo, tmp_path, effect_lock, binding, preissued):
+    import hashlib
+    import struct
+    scratch = tmp_path / "lane"
+    scratch.mkdir()
+    (scratch / "objects").mkdir()
+    lane = gitsafe.lane_runner(repo, scratch, worktree_root=repo, effect_fds=None if preissued else (effect_lock,))
+    identity = {"GIT_" + role + "_" + field: value for role in ("AUTHOR", "COMMITTER")
+        for field, value in (("NAME", "Capture Owner"), ("EMAIL", "capture@example.invalid"), ("DATE", "1700000000 +0000"))}
+    args = {"real-index": ("ls-files", "--cached", "--others", "--exclude-standard", "-z"),
+            "shared": ("unpack-objects", "-q", "--strict"),
+            "identity": ("commit-tree", _git(repo, "rev-parse", "HEAD^{tree}").strip(), "-p", _git(repo, "rev-parse", "HEAD").strip())}[binding]
+    envelope = lane.environment(identity if binding == "identity" else None, args=args,
+                                real_index=binding == "real-index", shared=binding == "shared")
+    argv = (gitsafe.custody_program(repo, environ=envelope), *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, *args)
+    data = b"capture identity\n" if binding == "identity" else None
+    shared_oid = None
+    if binding == "shared":
+        donor = _repo(tmp_path / "donor")
+        shared_oid = subprocess.run([gitsafe.git_executable(), "hash-object", "-w", "--stdin"], cwd=donor,
+            input=b"shared capture sentinel\n", check=True, capture_output=True).stdout.strip()
+        data = subprocess.run([gitsafe.git_executable(), "pack-objects", "--stdout"], cwd=donor,
+            input=shared_oid + b"\n", check=True, capture_output=True).stdout
+    with gitsafe.custody(scratch=scratch, strict_lane=True, worktree_root=repo):
+        result = gitsafe_run.capture(argv, cwd=repo, env=envelope, stdin=data, timeout=10,
+            error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo,
+            _grant=(argv, str(repo), data) if binding == "shared" else None)
+    assert result.returncode == 0
+    if binding == "real-index":
+        assert result.stdout == subprocess.run([gitsafe.git_executable(), *args], cwd=repo, check=True, capture_output=True).stdout
+    elif binding == "identity":
+        commit = lane.run(["cat-file", "commit", result.stdout.decode().strip()]).stdout.decode()
+        assert "author Capture Owner <capture@example.invalid> 1700000000 +0000" in commit
+        assert "committer Capture Owner <capture@example.invalid> 1700000000 +0000" in commit
+    if binding == "shared":
+        assert envelope["GIT_OBJECT_DIRECTORY"] == str(repo / ".git" / "objects")
+        assert gitsafe.run(["cat-file", "blob", shared_oid.decode()], repo).stdout == b"shared capture sentinel\n"
+        assert not (scratch / "objects" / shared_oid[:2].decode() / shared_oid[2:].decode()).exists()
+    elif binding == "real-index":
+        assert envelope["GIT_INDEX_FILE"] == str(repo / ".git" / "index")
+    else:
+        assert all(envelope[k] == v for k, v in identity.items())
+
+
+@pytest.mark.parametrize("operation", ["hook", "trailers", "export", "sync"])
+def test_ordinary_trusted_caller_environment_goldens(repo, tmp_path, fake_home, monkeypatch, operation):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup as ordinary_fence
+    target = repo
+    sync_repo = None
+    if operation == "sync":
+        from tests import helpers_syncpr as hs
+        parent = tmp_path / "sync"
+        parent.mkdir()
+        sync_repo = hs.make(parent)
+        target = sync_repo.root
+    if operation == "hook":
+        index = tmp_path / "hook-index"
+        shutil.copy2(repo / ".git" / "index", index)
+    snapshot = {**os.environ, "ORDINARY_PROFILE_SENTINEL": "unchanged"}
+    if operation == "hook":
+        snapshot["GIT_INDEX_FILE"] = str(index)
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": snapshot}))
+    lookups, real_which = [], gitsafe.pathlookup.which
+    def lookup(name, **options):
+        lookups.append((name, options))
+        return real_which(name, **options)
+    gitsafe._reset_for_tests()
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=lookup))
+    observed, fences = [], []
+    def launch(argv, **options):
+        fences.append(ordinary_fence.git_fence(options["cwd"]))
+        observed.append((argv, options.copy()))
+        return subprocess.run(argv, **options)
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": launch}))
+    if operation == "hook":
+        assert gitsafe.changed_files(repo, "staged") == []
+    elif operation == "trailers":
+        message = tmp_path / "message"
+        message.write_text("subject\n", encoding="utf-8")
+        assert gitsafe.add_trailer(message, "Signed-off-by: Owner <owner@example.invalid>")
+    elif operation == "export":
+        gitsafe.export_tree(repo, "HEAD", tmp_path / "export")
+        assert (tmp_path / "export" / "a.py").read_bytes() == b"a = 1\n"
+    else:
+        from aegis_core import sync
+        result = sync.sync(target, pr=True, gh_runner=hs.FakeGh(sync_repo.origin))
+        assert result.pr["status"] == "opened"
+    selected = []
+    for argv, options in observed:
+        actual = options["env"]
+        expected = {**snapshot, **gitsafe_run.BASE_ENV}
+        if operation == "trailers":
+            expected.update(GIT_DIR=options["cwd"], GIT_COMMON_DIR=options["cwd"])
+            selected.append(options)
+        elif operation in ("export", "sync") and "GIT_INDEX_FILE" in actual:
+            expected["GIT_INDEX_FILE"] = actual["GIT_INDEX_FILE"]
+            assert not Path(actual["GIT_INDEX_FILE"]).is_relative_to(target)
+            selected.append(options)
+        elif operation == "hook":
+            selected.append(options)
+        if operation == "sync" and "push" in argv:
+            expected["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
+        # Keep actual environment values out of pytest's assertion diagnostics.
+        identical = actual == expected
+        assert identical, "ordinary caller environment bytes changed"
+    assert fences and len(set(fences)) == 1
+    worktree = fences[0]
+    # Ordinary resolution asks for the metadata walk. The environment bytes above stay the golden.
+    expected_lookup = {} if worktree is None else {"outside": worktree, "fence_program": True, "descriptors": False}
+    assert selected and lookups and all(name == "git" and options == expected_lookup for name, options in lookups)
+
+
+def test_strict_resolver_binds_windows_extensions_to_effective_environment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    model = tmp_path / "model"
+    model.mkdir()
+    source = gitsafe_run.request_environment({"PATH": str(tmp_path), "PATHEXT": ".EXE"},
+        profile="strict/effect", root=model)
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt", "pathsep": ";"}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.find_executable({}, source, lambda env: str(tmp_path / "git.PY"), error=gitsafe.GitError)
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("change", ["delete", "replace"])
+def test_reused_environment_removes_deleted_input_fields(repo, effect_lock, monkeypatch, change):
+    from types import SimpleNamespace
+    observed = []
+    def launch(argv, **options):
+        observed.append(options["env"])
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    source = {"PATH": os.path.dirname(gitsafe.git_executable()), "REQUEST_MARKER": "remove-me", "GIT_ALLOW_PROTOCOL": "file"}
+    assert gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo).returncode == 0
+    source = observed[-1]
+    if change == "delete":
+        del source["REQUEST_MARKER"]
+        del source["GIT_ALLOW_PROTOCOL"]
+    else:
+        source = source.with_vars({"PATH": source["PATH"]}, replace=True)
+    assert gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo).returncode == 0
+    assert "REQUEST_MARKER" not in observed[-1] and observed[-1]["GIT_ALLOW_PROTOCOL"] == ""
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_effect_environment_repository_provenance_is_immutable(repo, effect_lock, monkeypatch):
+    from types import SimpleNamespace, MappingProxyType
+    observed = []
+    def launch(argv, **options):
+        observed.append(options["env"])
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    gitsafe.run(["version"], repo, _environ={"PATH": os.path.dirname(gitsafe.git_executable())},
+                effect_fds=(effect_lock,), worktree_root=repo)
+    assert isinstance(observed[-1].repository, MappingProxyType)
+    with pytest.raises(TypeError):
+        observed[-1].repository["dirs"] = ()
+    with pytest.raises(AttributeError):
+        observed[-1]._proof = {}
+
+
+def test_effect_refuses_native_loader_code_before_the_holder_starts(repo, tmp_path, effect_lock):
+    import json
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("native loader regression needs an installed C compiler")
+    marker = tmp_path / "loader-ran"
+    code, library = repo / "loader.c", repo / "loader.so"
+    code.write_text('#include <stdio.h>\n__attribute__((constructor)) static void marker(void) {FILE *f=fopen('
+        + json.dumps(str(marker)) + ',"w");if(f){fputs("ran",f);fclose(f);}}\n', encoding="utf-8")
+    subprocess.run([compiler, "-shared", "-fPIC", str(code), "-o", str(library)], check=True, capture_output=True, timeout=20)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo, _environ={"PATH": os.path.dirname(gitsafe.git_executable()), "LD_PRELOAD": str(library)},
+                    effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "ambient_git_environment" and caught.value.process_started is False
+    assert not marker.exists(), "model-owned native code ran before the subreaper could take custody"
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="descriptor-bound executable resolution requires Linux procfs")
+@pytest.mark.parametrize("entry", ["lookup", "fresh", "capture", "retarget"])
+def test_strict_without_receipt_fences_the_recorded_root(repo, tmp_path, entry):
+    from conftest import symlink_or_skip
+    source, scratch, external = repo / "sub", tmp_path / "scratch", tmp_path / "external"
+    source.mkdir()
+    scratch.mkdir()
+    external.mkdir()
+    evil, marker = repo / "evil-git", tmp_path / "executed"
+    evil.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n", encoding="utf-8")
+    evil.chmod(0o700)
+    real = gitsafe.git_executable()
+    symlink_or_skip(real if entry == "retarget" else evil, external / "git")
+    env = {"PATH": str(external)}
+    lane = gitsafe.lane_runner(source, scratch, environ=env, worktree_root=repo) if entry == "retarget" else None
+    if lane:
+        (external / "git").unlink()
+        symlink_or_skip(evil, external / "git")
+    with pytest.raises(gitsafe.GitError) as caught:
+        if entry == "lookup":
+            gitsafe.custody_program(repo, environ=env)
+        elif entry == "fresh":
+            gitsafe.lane_runner(source, scratch, environ=env, worktree_root=repo)
+        elif entry == "retarget":
+            lane.run(["version"])
+        else:
+            with gitsafe.custody(scratch=scratch, strict_lane=True, worktree_root=repo):
+                gitsafe_run.capture([str(external / "git"), *gitsafe_run.DEFAULT_HARDENING,
+                    *gitsafe_run._LANE_OPTIONS, "version"], cwd=source, env=env, stdin=None, timeout=5)
+    assert caught.value.code == "effect_command_refused"
+    assert caught.value.process_started is False
+    assert not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.skipif(not gitops_fds.descriptor_supported(), reason="descriptor-bound executable resolution requires Linux procfs")
+@pytest.mark.parametrize("entry", ["lane", "capture"])
+@pytest.mark.parametrize("key", ["GIT_DIR", "GIT_PAGER"])
+def test_explicit_strict_environment_never_inspects_ambient(repo, tmp_path, monkeypatch, entry, key):
+    from types import SimpleNamespace
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = {"PATH": os.path.dirname(gitsafe.git_executable())}
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": {key: "untrusted"}}))
+    if entry == "lane":
+        lane = gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo)
+        result = lane.run(["version"])
+    else:
+        with gitsafe.custody(scratch=scratch, strict_lane=True, worktree_root=repo):
+            result = gitsafe_run.capture([gitsafe.git_executable(), *gitsafe_run.DEFAULT_HARDENING,
+                *gitsafe_run._LANE_OPTIONS, "version"], cwd=repo, env=source, stdin=None, timeout=5)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+
+
+@pytest.mark.parametrize("replace", [False, True])
+@pytest.mark.parametrize("key", ["GIT_ASKPASS", "GIT_DIR", "GIT_CONFIG_NOSYSTEM"])
+def test_envelope_edits_refuse_even_matching_transport_values(repo, effect_lock, key, replace):
+    envelope = gitops_fds.effect_environment({"PATH": os.path.dirname(gitsafe.git_executable())}, repo,
+        worktree_root=repo, error=gitsafe.GitError, transport=gitsafe_run.transport_services())
+    with pytest.raises(gitsafe.GitError) as caught:
+        envelope.with_vars({key: envelope[key]}, replace=replace)
+    assert caught.value.code == "git_custody_refused" and caught.value.process_started is False
+
+
+@pytest.mark.parametrize("source_kind,target_kind", [(a, b) for a in ("git", "lane", "gh") for b in ("git", "lane", "gh") if a != b])
+def test_envelope_kind_cannot_cross_a_public_boundary(repo, tmp_path, effect_lock, source_kind, target_kind):
+    from aegis_core import ghcli
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = gitsafe_run.request_environment({"PATH": os.path.dirname(gitsafe.git_executable()),
+        "GH_TOKEN": "fixture-token"}, profile="strict/effect", root=repo, kind=source_kind)
+    with pytest.raises(gitsafe.GitError) as caught:
+        if target_kind == "git":
+            gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        elif target_kind == "lane":
+            gitsafe.lane_runner(repo, scratch, environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        else:
+            ghcli._EFFECT_RUNNER(["api", "user"], cwd=repo, env=source, effect_fds=(effect_lock,), worktree_root=repo)
+    assert caught.value.code == "git_custody_refused" and caught.value.process_started is False
+
+
+@pytest.mark.parametrize("source", [None, {}, {"PATH": "/owner/bin"}])
+def test_ordinary_git_lookup_retains_plain_environment_fence(tmp_path, monkeypatch, source):
+    from types import SimpleNamespace
+    seen = []
+    def which(name, **options):
+        seen.append((name, options))
+        return sys.executable
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=which))
+    gitsafe._reset_for_tests()
+    try:
+        assert gitsafe.git_executable(environ=source, cwd=tmp_path) == sys.executable
+        expected = {"outside": os.path.normcase(os.path.realpath(tmp_path)), "fence_program": True, "descriptors": False} if source is None else {"path": source.get("PATH", os.defpath), "outside": tmp_path}
+        assert seen == [("git", expected)]
+    finally:
+        gitsafe._reset_for_tests()
+
+
+def test_alternating_roots_look_git_up_once_per_fence(tmp_path, monkeypatch, fresh_git_lookup):
+    """A miss drops only that fence's partition, so the other root stays cached."""
+    from types import SimpleNamespace
+    left, right = _worktree(tmp_path / "left"), _worktree(tmp_path / "right")
+    calls = []
+
+    def which(name, **options):
+        calls.append(os.path.normcase(str(options.get("outside"))))
+        return sys.executable
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=which))
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert gitsafe.git_executable(cwd=right) == sys.executable
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert calls == [os.path.normcase(str(left)), os.path.normcase(str(right))]
+    gitsafe._reset_for_tests()
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert calls[-1] == os.path.normcase(str(left))
+
+
+@pytest.mark.usefixtures("strict_program")
+@posix_only
+@pytest.mark.parametrize("effect", [False, True])
+@pytest.mark.parametrize("interpreter", [False, True])
+def test_executable_is_pinned_before_the_spawn_boundary(repo, tmp_path, effect_lock, monkeypatch, effect, interpreter):
+    from conftest import symlink_or_skip
+    from threading import Event, Thread
+    from types import SimpleNamespace
+    trusted, external, scratch = tmp_path / "trusted", tmp_path / "external", tmp_path / "scratch"
+    for directory in (trusted, external, scratch): directory.mkdir()
+    real = gitsafe.git_executable()
+    symlink_or_skip(real, trusted / "git")
+    symlink_or_skip(sys.executable, trusted / "python")
+    relay = tmp_path / "relay"
+    symlink_or_skip(trusted, relay, target_is_directory=True)
+    symlink_or_skip(relay / "git", external / "git")
+    symlink_or_skip(relay / "python", external / "python")
+    marker, evil = tmp_path / "evil-ran", repo / "evil"
+    evil.mkdir()
+    (evil / "git").write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n", encoding="utf-8")
+    (evil / "git").chmod(0o700)
+    (evil / "python").write_bytes((evil / "git").read_bytes())
+    (evil / "python").chmod(0o700)
+    lane = gitsafe.lane_runner(repo, scratch, environ={"PATH": str(external)}, worktree_root=repo)
+    if interpreter: monkeypatch.setattr(gitops_fds, "sys", SimpleNamespace(**{**vars(sys), "executable": str(external / "python")}))
+    ready, swapped = Event(), Event()
+    def swap():
+        if ready.wait(10):
+            relay.unlink()
+            relay.symlink_to(evil, target_is_directory=True)
+            swapped.set()
+    worker = Thread(target=swap)
+    worker.start()
+    def launch(argv, **options):
+        ready.set()
+        assert swapped.wait(10), "link swap did not complete at the spawn boundary"
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    try:
+        result = lane.run(["version"], effect_fds=(effect_lock,) if effect else None)
+        assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+    finally:
+        ready.set()
+        worker.join(10)
+    assert not worker.is_alive() and not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("entry", ["raw", "capture", "fresh", "run", "publish", "cas"])
+def test_holder_interpreter_is_fenced_at_every_git_entry(repo, tmp_path, effect_lock, monkeypatch, entry):
+    from types import SimpleNamespace
+    import hashlib
+    import struct
+    interpreter, marker = repo / "python", tmp_path / "holder-code-ran"
+    interpreter.write_text("#!" + sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    source = {"PATH": os.path.dirname(gitsafe.git_executable())}
+    lane = gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo) if entry in ("run", "publish", "cas") else None
+    monkeypatch.setattr(gitops_fds, "sys", SimpleNamespace(**{**vars(sys), "executable": str(interpreter)}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        if entry == "raw":
+            gitsafe.run(["version"], repo, _environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        elif entry == "capture":
+            with gitsafe.custody(scratch=scratch):
+                gitsafe_run.capture([gitsafe.git_executable(), "version"], cwd=repo, env=source, stdin=None,
+                    timeout=5, error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+        elif entry == "fresh":
+            gitsafe.lane_runner(repo, scratch, environ=source, effect_fds=(effect_lock,), worktree_root=repo)
+        elif entry == "run":
+            lane.run(["version"], effect_fds=(effect_lock,))
+        elif entry == "publish":
+            pack = b"PACK" + struct.pack("!II", 2, 0)
+            lane.publish(pack + hashlib.sha1(pack).digest(), effect_fds=(effect_lock,))
+        else:
+            lane.cas("refs/heads/lane/holder", _git(repo, "rev-parse", "HEAD").strip(), None, effect_fds=(effect_lock,))
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+    assert not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_config_read_never_rewrites_a_policy_shaped_ssh_command(repo, tmp_path, effect_lock):
+    import shlex
+    ssh = tmp_path / "ssh"
+    ssh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ssh.chmod(0o700)
+    command = shlex.join([str(ssh), "-o", "IgnoreUnknown=ForkAfterAuthentication", "-o", "ControlMaster=no",
+        "-o", "ControlPath=none", "-o", "ControlPersist=no", "-o", "ForkAfterAuthentication=no", "-o", "BatchMode=yes"])
+    result = gitsafe.run(["config", "--get", "core.sshCommand"], repo,
+        _hardening=_network_hardening("-c", "core.sshCommand=" + command),
+        _environ={"PATH": os.path.dirname(gitsafe.git_executable())}, effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and result.stdout == (command + "\n").encode()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("program", ["git", "gh", "ssh"])
+@pytest.mark.parametrize("dispatch", ["absolute", "path"])
+@pytest.mark.parametrize("lookup", ["absolute", "path"])
+def test_strict_resolver_refuses_script_dispatch_before_spawn(repo, tmp_path, monkeypatch, program, dispatch, lookup):
+    from types import SimpleNamespace
+    host = tmp_path / "host"
+    host.mkdir()
+    interpreter, marker = repo / "python", tmp_path / "interpreter-ran"
+    interpreter.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    script = host / program
+    script.write_text(("#!" + str(interpreter) if dispatch == "absolute" else "#!/usr/bin/env python") + "\nunused\n", encoding="utf-8")
+    script.chmod(0o700)
+    source = gitsafe_run.request_environment({"PATH": str(host)}, profile="strict/effect", root=repo)
+    def forbidden(*args, **kwargs):
+        pytest.fail("script refusal started a child")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.find_executable({}, source, lambda effective: str(script) if lookup == "absolute" else
+            gitsafe.pathlookup.which(program, path=effective["PATH"], outside=repo), error=gitsafe.GitError)
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+    assert str(caught.value).startswith("strict effects require a native executable: ")
+    assert str(caught.value).endswith(" is a script; configure the real binary")
+    assert caught.value.next_action and not marker.exists()
+
+
+@posix_only
+@pytest.mark.parametrize("form", ["dirname", "basename"])
+def test_ordinary_git_shims_preserve_script_identity(repo, tmp_path, monkeypatch, form):
+    from types import SimpleNamespace
+    import shlex
+    host = tmp_path / "shim-bin"
+    host.mkdir()
+    real = gitsafe.git_executable()
+    shutil.copy2(real, host / "git.real")
+    body = 'exec "$(dirname "$0")/git.real" "$@"' if form == "dirname" else \
+        'case "${0##*/}" in git) exec ' + shlex.quote(real) + ' "$@";; *) exit 9;; esac'
+    script = host / "git"
+    script.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+    script.chmod(0o700)
+    path = str(host) + os.pathsep + os.defpath
+    which = gitsafe.pathlookup.which
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=lambda name, **options: which(name, path=path)))
+    gitsafe._reset_for_tests()
+    try:
+        result = gitsafe.run(["version"], repo, _environ={"PATH": path})
+        assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+    finally:
+        gitsafe._reset_for_tests()
+
+
+# Exact AST proofs are reserved for refusals before lookup or mixed variants.
+# A changed body invalidates its proof; new construction sites need a guard.
+_STRICT_CENSUS_SOURCES = {
+    "test_gitsafe": "tests/unit/core/test_gitsafe.py",
+    "test_ghcli": "tests/unit/core/test_ghcli.py",
+    "test_team_git": "tests/unit/core/test_team_git.py",
+    "helpers_team_git": "tests/helpers_team_git.py",
+}
+
+_STRICT_SITE_PROOFS = {
+    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('141afd0b0e5474a14e57b2f2c6a00a7a3f5381ef876c15f86b69b871c2f863bd', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
+    ('test_gitsafe', 'test_effect_descriptor_refused_before_any_spawn'): ('f440d542ccf05a986720fb51cdadb1b5a38a54c0c776d783a4c8c4f2fa72e07b', 'Invalid receipt descriptors refuse in pass_through before executable lookup.'),
+    ('test_gitsafe', 'test_effect_unsupported_platform_is_a_pre_spawn_refusal'): ('4480e3b2ef2f7c06b1c60a74288dd00df9da0584dae64c5a8a765ec7437174ba', 'The effect-platform probe is forced false; pass_through refuses before lookup.'),
+    ('test_gitsafe', 'test_effect_write_roots_refuse_before_expansion'): ('f8042b05a19e1caa57c0370d7e57ff2c964a11d522499873180c6f8ad4bada44', 'Invalid or oversized root containers refuse before executable lookup.'),
+    ('test_gitsafe', 'test_envelope_kind_cannot_cross_a_public_boundary'): ('dfba2f124365cffe5c6e988b6f86c1109e5f6d2c68c4f33778ef606bbb5d5373', 'Every source kind differs from the target boundary; constructor validation refuses before lookup.'),
+    ('test_gitsafe', 'test_strict_executable_platform_probe_has_its_own_refusal'): ('c26c24a220cd30cb3b4c46b1965c9727842f2183fa2d6d84107dc9161da964cb', 'The program capability probe is forced false and its documented refusal is asserted.'),
+    ('test_gitsafe', 'test_strict_capture_own_bindings_do_not_admit_injected_locations'): ('cf58eb60d2e79fd91503ae2c6a4dc7b76f17c4e1fce762d0e949f06d0f687232', 'Only capture issues a clean lane; it calls the shared guard. All other entries inject a forbidden selector before issuance.'),
+    ('test_gitsafe', 'test_selector_inputs_refuse_before_git_spawn'): ('f9ea34d0d1728251da300947a5857d412d390fae06aabd82ec2615a34ee8b691', 'Clean baseline and preissued variants call the shared guard; other variants supply forbidden selectors before lookup.'),
+    ('test_gitsafe', 'test_per_call_selectors_refuse_before_effect_spawn'): ('91b3f072baf6dcaf111c58c71e13e6b59f953f671a966e73a4024352c484ec89', 'Lane and reused-source variants guard clean setup; raw, custody and strict calls reject the per-call selector before lookup.'),
+    ('test_team_git', 'test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal'): ('153ae9da3fbf92ca0a2817d999b8d7c5646dcf41f8d74e1cdb24ee518b364e5d', 'Input snapshot raises before lookup; successful recovery uses the shared optional guard.'),
+    ('test_team_git', 'test_ambient_key_diagnostics_canonicalize_and_redact_before_display'): ('5acdfc974780a818fc6a19f5bbfe86fbe4eb13479f80aced9fd03804cae87800', 'Forbidden ambient Git selector refuses before lookup.'),
+    ('test_team_git', 'test_ambient_lowercase_key_refuses_with_its_real_spelling'): ('3d4c462a8dc08273121ce4e084b3abc7ea23c57faa7e8916e07e2f05ccb2fe4f', 'Forbidden lowercase selector refuses before lookup; helper guard is deliberately bypassed.'),
+    ('test_team_git', 'test_ambient_refusal_is_deterministic_and_lists_every_exact_key'): ('29fe6bc8d5274beee29e0a77e957175e6e27f2bd522a652202821708e28fd954', 'Every subprocess environment contains forbidden Git location/trace selectors before lookup.'),
+    ('test_team_git', 'test_invalid_root_identity_precedes_git_or_metadata'): ('d08cd9c5fbb33bb31b87cf9f13d652da43a28a55330d36bb4405423630fb1b1c', 'Every supplied root is relative, traversal-bearing or contains NUL; root validation precedes Git.'),
+    ('test_team_git', 'test_missing_fenced_git_refuses_before_discovery_and_retries'): ('34311605be3cd567e7f19bb97d81fd2f5658d60fb3bdd3b9b3354b25e49d5d65', 'The resolver callback lacks its required environ argument and refuses before lookup; successful recovery is guarded.'),
+    ('test_team_git', 'test_relative_cwd_public_routes_share_the_git_error_hierarchy'): ('94b2cfc21ce24401758b5f55cc874b79a6f8a935d4370a76d3a4d110beac713b', 'Capture guards its valid executable setup; every other route supplies a relative root and refuses before lookup.'),
+    ('test_team_git', 'test_runner_ambient_redirect_before_entry_refuses_and_retries'): ('f6d22cbb652d556adfaee52f04a1215b43dd13f29595bd396879cd2cd3e240b1', 'Forbidden environment inputs refuse before lookup; only successful recovery is guarded.'),
+    ('test_team_git', 'test_store_entry_environment_bounds_have_public_refusal_and_retry'): ('1383f0c2e836cf9413f249a9919be2876f073813b22ffaac18c5abcede4a136b', 'Oversized inputs refuse before lookup; only bounded successful recovery is guarded.'),
+    ('test_gitsafe', 'test_effect_capture_spawn_golden_and_exactly_one_extra_fd'): ('6199733cdfe02e771bf3632262acffb7d1f3dd51598b1ae2de221f71fc7fa23d', 'Only the ordinary capture variant avoids strict lookup; every other variant calls the shared guard first.'),
+}
+
+
+def _strict_proof_digest(tree, name):
+    """Bind an early-refusal proof to its body, helpers and embedded programs."""
+    import hashlib
+    def stable(node):
+        if isinstance(node, ast.AST):
+            fields = dict(ast.iter_fields(node))
+            if hasattr(node, "type_params"):
+                fields["type_params"] = node.type_params
+            return (type(node).__name__, tuple((field, stable(value)) for field, value in sorted(fields.items())
+                if not (field == "type_params" and value == [])))
+        if isinstance(node, list):
+            return tuple(stable(value) for value in node)
+        return node
+    definitions = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            definitions[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    definitions[target.id] = node
+    pending, included = [name], {}
+    while pending:
+        key = pending.pop()
+        if key in included or key not in definitions:
+            continue
+        node = included[key] = definitions[key]
+        pending.extend(n.id for n in ast.walk(node) if isinstance(n, ast.Name))
+    return hashlib.sha256(ascii(sorted((key, stable(node)) for key, node in included.items())).encode("ascii")).hexdigest()
+
+
+def _census_parse_schema(source, schema):
+    """Exercise supported AST schemas without changing the shared ast module."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if schema == "py312":
+                if not hasattr(node, "type_params"):
+                    node.type_params = []
+            elif schema == "py39" and getattr(node, "type_params", None) == []:
+                del node.type_params
+    return tree
+
+
+def _strict_runner_census(sources, *, parse=ast.parse):
+    names = {"lane_runner", "issue_runner", "LaneRunner", "custody_program", "GitStore",
+             "strict_request", "new_store", "make_store", "_effect_call", "_assert_effect_survives_owner"}
+    functions, trees, calls, sites, aliases = {}, {}, [], [], {}
+    def owner(node, parents):
+        found = None
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.FunctionDef): found = node
+        return found
+    def marked(fn):
+        return fn is not None and (any(n.arg == "strict_program" for n in fn.args.args) or any(isinstance(n, ast.Call) and ast.unparse(n.func) == "pytest.mark.usefixtures"
+            and any(isinstance(a, ast.Constant) and a.value == "strict_program" for a in n.args)
+            for n in fn.decorator_list))
+    def required(call):
+        # native_fixture adds a compiler check; it cannot bypass program support.
+        return isinstance(call, ast.Call) and ast.unparse(call.func) == "strict_program_guard" and not call.args and all(k.arg == "native_fixture" or k.arg == "optional" and isinstance(k.value, ast.Constant) and k.value.value is False for k in call.keywords)
+    def call_name(module, scope, call):
+        name = ast.unparse(call.func).split(".")[-1]
+        for _ in range(len(aliases) + 1):
+            target = aliases.get((module, scope, name), aliases.get((module, "<module>", name), name))
+            if target == name: break
+            name = target
+        return name
+    def static_data(fn):
+        allowed = {"_run_subcommand_offenders", "_lane_offenders", "_lane_structure_offenders", "_strict_runner_census", "_strict_proof_digest", "_census_parse_schema", "dict", "len", "set", "any", "all"}
+        return fn is not None and all(ast.unparse(n.func) in allowed or ast.unparse(n.func).startswith(("ast.", "sources.", "cases.")) or ast.unparse(n.func).endswith(".read_text") for statement in fn.body for n in ast.walk(statement) if isinstance(n, ast.Call))
+    for module, source in sources.items():
+        tree = trees[module] = parse(source)
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        for fn in tree.body:
+            if isinstance(fn, ast.FunctionDef):
+                functions[(module, fn.name)] = fn
+        for node in ast.walk(tree):
+            fn = owner(node, parents)
+            scope = fn.name if fn else "<module>"
+            if isinstance(node, ast.ImportFrom):
+                aliases.update({(module, scope, a.asname): a.name for a in node.names if a.asname})
+            elif isinstance(node, ast.Assign) and isinstance(node.value, (ast.Name, ast.Attribute)):
+                aliases.update({(module, scope, n.id): ast.unparse(node.value).split(".")[-1] for n in node.targets if isinstance(n, ast.Name)})
+        for node in ast.walk(tree):
+            fn = owner(node, parents)
+            if isinstance(node, ast.Call):
+                calls.append((module, fn.name if fn else "<module>", node, "direct", node.lineno))
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or not any(name in node.value for name in names): continue
+            try:
+                embedded = parse(node.value)
+            except SyntaxError:
+                continue
+            owners = [fn.name] if fn else []
+            if fn is None:
+                assignment = parents.get(node)
+                while assignment in parents and not isinstance(assignment, ast.Assign): assignment = parents[assignment]
+                targets = {x.id for target in assignment.targets for x in ast.walk(target) if isinstance(x, ast.Name)} if isinstance(assignment, ast.Assign) else set()
+                owners = sorted({f.name for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in targets and (f := owner(n, parents)) is not None})
+            for inner in ast.walk(embedded):
+                if isinstance(inner, ast.Call) and call_name(module, fn.name if fn else "<module>", inner) in names:
+                    for scope in owners or ["<module>"]:
+                        calls.append((module, scope, inner, "static" if static_data(functions.get((module, scope))) else "embedded", node.lineno))
+    # Discover construction helpers transitively; a renamed helper stays covered.
+    constructing = set(names)
+    for _ in range(len(functions) + 1):
+        added = {scope for module, scope, node, kind, line in calls if kind != "static" and call_name(module, scope, node) in constructing}
+        if added <= constructing: break
+        constructing |= added
+    for module, scope, node, kind, line in calls:
+        if call_name(module, scope, node) in constructing:
+            sites.append((module, scope, node, kind, line))
+    def proof(key):
+        fn = functions.get(key)
+        record = _STRICT_SITE_PROOFS.get(key)
+        return fn is not None and record is not None and _strict_proof_digest(trees[key[0]], key[1]) == record[0]
+    def guarded(key, line, seen=()):
+        fn = functions.get(key)
+        if fn is None: return False
+        if marked(fn) or proof(key): return True
+        if any(isinstance(n, ast.Expr) and required(n.value) and n.lineno <= line for n in fn.body): return True
+        if fn.name == "new_store":
+            defaults = {n.arg: value for n, value in zip(fn.args.kwonlyargs, fn.args.kw_defaults)}
+            return isinstance(defaults.get("require_program"), ast.Constant) and defaults["require_program"].value is True and any(isinstance(n, ast.If) and n.lineno <= line and isinstance(n.test, ast.Name) and n.test.id == "require_program" and any(isinstance(x, ast.Expr) and required(x.value) for x in n.body) for n in fn.body)
+        if fn.name.startswith("test_") or key in seen: return False
+        callers = [(m, s, n, k, l) for m, s, n, k, l in sites if call_name(m, s, n) == fn.name and (m, s) != key]
+        return bool(callers) and all(guarded((m, s), l, (*seen, key)) for m, s, n, k, l in callers)
+    rows = []
+    for module, scope, node, kind, line in sites:
+        safe = kind == "static" or guarded((module, scope), line)
+        name = ast.unparse(node.func)
+        callee = (module, call_name(module, scope, node))
+        candidates = [key for key in functions if key[1] == callee[1]]
+        if callee not in functions and len(candidates) == 1: callee = candidates[0]
+        if callee in functions and not callee[1].startswith("test_"):
+            safe |= guarded(callee, functions[callee].end_lineno)
+        # Opting a helper out of its setup guard requires its own exact proof.
+        if kind != "static" and callee[1] == "new_store" and any(k.arg is None or k.arg == "require_program" and not (isinstance(k.value, ast.Constant) and k.value.value is True) for k in node.keywords):
+            safe = proof((module, scope)) or marked(functions.get((module, scope)))
+        rows.append({"module": module, "scope": scope, "line": line, "call": name,
+                     "kind": kind, "guarded": safe})
+    return rows
+
+
+def test_every_strict_runner_construction_has_a_shared_capability_guard():
+    sources = {name: (ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8")
+               for name in _STRICT_CENSUS_SOURCES}
+    rows = _strict_runner_census(sources)
+    missing = [row for row in rows if not row["guarded"]]
+    assert missing == []
+    cases = {
+        "direct": "def test_new(repo,scratch): gitsafe.lane_runner(repo,scratch)",
+        "helper": "def initialize(repo,scratch): return gitsafe.lane_runner(repo,scratch)\ndef test_new(repo,scratch): initialize(repo,scratch)",
+        "embedded": "def test_new(repo,scratch):\n code='gitsafe.lane_runner(repo,scratch)'\n subprocess.run(code)",
+        "late": "def test_new(repo,scratch):\n gitsafe.lane_runner(repo,scratch)\n strict_program_guard()",
+        "conditional": "def test_new(repo,scratch):\n if False: strict_program_guard()\n gitsafe.lane_runner(repo,scratch)",
+        "import-alias": "from aegis_core.gitsafe import lane_runner as build\ndef test_new(repo,scratch): build(repo,scratch)",
+        "assigned-alias": "def test_new(repo,scratch):\n build=gitsafe.lane_runner\n build(repo,scratch)",
+        "optional": "def test_new(repo,scratch):\n strict_program_guard(optional=unknown)\n gitsafe.lane_runner(repo,scratch)",
+        "guard-kwargs": "def test_new(repo,scratch):\n strict_program_guard(**options)\n gitsafe.lane_runner(repo,scratch)",
+        "late-helper": "def new_store(repo,*,require_program=True):\n tg.GitStore(repo,scratch)\n if require_program: strict_program_guard()\ndef test_new(repo): new_store(repo)",
+        "module-opt-out": "new_store(repo,require_program=False)",
+    }
+    for source in cases.values():
+        assert any(not row["guarded"] for row in _strict_runner_census({"control": source}))
+    covered = "@pytest.mark.usefixtures('strict_program')\ndef test_new(repo,scratch): gitsafe.lane_runner(repo,scratch)"
+    assert all(row["guarded"] for row in _strict_runner_census({"control": covered}))
+
+
+def test_strict_proof_changes_with_a_helper_or_embedded_program():
+    source = "CODE='gitsafe.lane_runner(repo,scratch)'\ndef initialize(): subprocess.run(CODE)\ndef test_new(): initialize()"
+    original = _strict_proof_digest(ast.parse(source), "test_new")
+    assert original != _strict_proof_digest(ast.parse(source.replace("repo,scratch", "other,scratch")), "test_new")
+    assert original != _strict_proof_digest(ast.parse(source.replace("subprocess.run(CODE)", "subprocess.Popen(CODE)")), "test_new")
+
+
+def test_strict_census_guard_forms_are_schema_independent():
+    source = '''
+@pytest.mark.usefixtures("strict_program")
+def test_marker(repo, scratch):
+    gitsafe.lane_runner(repo, scratch)
+def test_fixture(repo, scratch, strict_program):
+    gitsafe.lane_runner(repo, scratch)
+def test_direct(repo, scratch):
+    strict_program_guard()
+    gitsafe.lane_runner(repo, scratch)
+def initialize(repo, scratch):
+    strict_program_guard()
+    return gitsafe.lane_runner(repo, scratch)
+def test_helper(repo, scratch):
+    initialize(repo, scratch)
+@pytest.mark.usefixtures("strict_program")
+def test_embedded(repo, scratch):
+    subprocess.run("gitsafe.lane_runner(repo, scratch)")
+def test_unguarded(repo, scratch):
+    gitsafe.lane_runner(repo, scratch)
+def test_optional(repo, scratch):
+    strict_program_guard(optional=True)
+    gitsafe.lane_runner(repo, scratch)
+def test_late(repo, scratch):
+    gitsafe.lane_runner(repo, scratch)
+    strict_program_guard()
+'''
+    expected = {("test_marker", True), ("test_fixture", True), ("test_direct", True),
+                ("initialize", True), ("test_helper", True), ("test_embedded", True),
+                ("test_unguarded", False), ("test_optional", False), ("test_late", False)}
+    for schema in ("py39", "py312"):
+        rows = _strict_runner_census({"control": source}, parse=lambda text: _census_parse_schema(text, schema))
+        assert {(row["scope"], row["guarded"]) for row in rows} == expected
+
+
+def test_strict_census_repository_set_is_schema_independent():
+    sources = {name: (ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8")
+               for name in _STRICT_CENSUS_SOURCES}
+    native = _strict_runner_census(sources)
+    for schema in ("py39", "py312"):
+        rows = _strict_runner_census(sources, parse=lambda text: _census_parse_schema(text, schema))
+        assert [row for row in rows if not row["guarded"]] == []
+        assert rows == native
+
+
+def test_strict_proof_normalizes_only_empty_type_parameters():
+    source = "def checked():\n class Handler: pass\n async def nested(): return 1\n return 1"
+    legacy = _census_parse_schema(source, "py39")
+    modern = _census_parse_schema(source, "py312")
+    baseline = _strict_proof_digest(legacy, "checked")
+    assert baseline == _strict_proof_digest(modern, "checked")
+    modern.body[0].type_params = [ast.Name(id="T", ctx=ast.Load())]
+    assert baseline != _strict_proof_digest(modern, "checked")
+
+
+def test_strict_program_guard_has_one_shared_capability_probe():
+    sources = {name: ast.parse((ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8"))
+               for name in _STRICT_CENSUS_SOURCES}
+    probes = [(name, node.lineno) for name, tree in sources.items() for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("._program_supported")]
+    assert probes == [("helpers_team_git", strict_program_guard.__code__.co_firstlineno + 2)]
+    guard = next(node for node in sources["helpers_team_git"].body
+                 if isinstance(node, ast.FunctionDef) and node.name == "strict_program_guard")
+    assert [node.lineno for node in ast.walk(guard) if isinstance(node, ast.Call)
+            and ast.unparse(node.func).endswith("._program_supported")] == [probes[0][1]]
+    for name, home in (("test_gitsafe", "tests.helpers_team_git"),
+                       ("test_ghcli", "tests.unit.core.test_gitsafe"),
+                       ("test_team_git", "tests.helpers_team_git")):
+        assert any(isinstance(node, ast.ImportFrom) and node.module == home
+                   and {"strict_program", "strict_program_guard"} <= {alias.name for alias in node.names}
+                   for node in sources[name].body)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("entry", ["discovery", "fresh", "raw", "execute", "capture", "run", "publish", "cas"])
+@pytest.mark.parametrize("dispatch", ["absolute", "path"])
+def test_script_git_entry_refuses_before_any_child(repo, tmp_path, effect_lock, monkeypatch, entry, dispatch):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+    import hashlib
+    import struct
+    host, scratch = tmp_path / "host", tmp_path / "scratch"
+    host.mkdir()
+    scratch.mkdir()
+    program, marker = host / "git", tmp_path / "script-ran"
+    interpreter = repo / "model-python"
+    interpreter.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    source = {"PATH": str(host) + os.pathsep + os.path.dirname(gitsafe.git_executable())}
+    lane = None
+    if entry in ("run", "publish", "cas"):
+        symlink_or_skip(gitsafe.git_executable(), program)
+        lane = gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo)
+        program.unlink()
+    program.write_text(("#!" + str(interpreter) if dispatch == "absolute" else "#!/usr/bin/env model-python") + "\nunused\n", encoding="utf-8")
+    program.chmod(0o700)
+    def forbidden(*args, **kwargs):
+        pytest.fail("script entry started a child")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        if entry in ("discovery", "fresh"):
+            gitsafe.lane_runner(repo, scratch, environ=source, worktree_root=repo,
+                effect_fds=(effect_lock,) if entry == "fresh" else None)
+        elif entry == "raw":
+            gitsafe.run(["version"], repo, _environ=source, worktree_root=repo, effect_fds=(effect_lock,))
+        elif entry == "execute":
+            gitsafe_run.execute(["version"], repo, executable=lambda **options: str(program), legacy_runner=subprocess.run,
+                error=gitsafe.GitError, environ=source, timeout=5, stdin=None, hardening=gitsafe_run.DEFAULT_HARDENING,
+                env=None, tty=False, effect_fds=(effect_lock,), worktree_root=repo)
+        elif entry == "capture":
+            with gitsafe.custody(scratch=scratch):
+                gitsafe_run.capture([str(program), "version"], cwd=repo, env=source, stdin=None, timeout=5,
+                    error=gitsafe.GitError, effect_fds=(effect_lock,), worktree_root=repo)
+        elif entry == "run":
+            lane.run(["version"])
+        elif entry == "publish":
+            pack = b"PACK" + struct.pack("!II", 2, 0)
+            lane.publish(pack + hashlib.sha1(pack).digest(), effect_fds=(effect_lock,))
+        else:
+            lane.cas("refs/heads/lane/script", "a" * 40, None, effect_fds=(effect_lock,))
+    assert caught.value.code == "effect_command_refused" and caught.value.process_started is False
+    assert str(caught.value).startswith("strict effects require a native executable: ")
+    assert str(caught.value).endswith(" is a script; configure the real binary")
+    assert not marker.exists()
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("absolute", [False, True])
+@pytest.mark.parametrize("dispatch", ["absolute", "path"])
+def test_script_ssh_entry_never_starts_the_transport(repo, tmp_path, effect_lock, monkeypatch, absolute, dispatch):
+    from types import SimpleNamespace
+    import shlex
+    host = tmp_path / "host"
+    host.mkdir()
+    interpreter, marker = repo / "model-python", tmp_path / "script-ran"
+    interpreter.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    script = host / "ssh"
+    script.write_text(("#!" + str(interpreter) if dispatch == "absolute" else "#!/usr/bin/env model-python") + "\nunused\n", encoding="utf-8")
+    script.chmod(0o700)
+    calls = []
+    def launch(argv, **options):
+        calls.append(list(argv))
+        return subprocess.Popen(argv, **options)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": launch}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["fetch", "ssh://fixture.invalid/repo", "HEAD"], repo,
+            _environ={"PATH": str(host) + os.pathsep + os.path.dirname(gitsafe.git_executable())},
+            _hardening=_network_hardening("-c", "core.sshCommand=" + (shlex.quote(str(script)) if absolute else "ssh")),
+            _env={"GIT_ALLOW_PROTOCOL": "ssh"}, worktree_root=repo, effect_fds=(effect_lock,))
+    assert caught.value.code == "effect_command_refused" and caught.value.effect_process_started is False
+    assert caught.value.process_started is True  # Native Git read the owner configuration.
+    assert str(caught.value).endswith(" is a script; configure the real binary")
+    assert calls and all("fetch" not in argv and "push" not in argv for argv in calls)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("args,code,stdout,stderr,expected,unchanged", [
+    (["git", "status"], 0, b"status\0\xff", b"notice\xff", (b"status\0\xff", b"notice\xff"), True),
+    (["git", "status"], 7, b"out", b"err", (b"out", b"err"), True),
+    (["git", "push"], 0, b"pushed", b"notice", (b"pushed", b"notice"), True),
+    (["git", "fetch"], 1, b"private output", b"AUTHENTICATION FAILED: fixture", (b"", b"Git operation missing HTTPS credentials; prompts disabled."), False),
+    (["git", "push"], 128, b"private output", b"Permission denied (publickey).", (b"", b"Git operation missing SSH credentials; prompts disabled."), False),
+    (["git", "push"], 5, b"private output", b"private failure", (b"", b"Git operation effect command failed; observe before recovery."), False),
+    (["git", "-c", "core.fsmonitor=false", "fetch"], -15, b"private output", b"private failure", (b"", b"Git operation effect command failed; observe before recovery."), False),
+], ids=["success", "query-failure", "push-success", "https", "ssh", "generic", "signal"])
+def test_effect_result_preserves_standard_type_fields_and_bytes(args, code, stdout, stderr, expected, unchanged):
+    original = subprocess.CompletedProcess(args, code, stdout, stderr)
+    result = gitops_fds.git_result(original, result_type=subprocess.CompletedProcess)
+    assert type(result) is subprocess.CompletedProcess
+    assert result.args is args and result.returncode == code
+    assert (result.stdout, result.stderr) == expected
+    if unchanged:
+        assert result is original
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("query,suffix", [(["--git-common-dir"], b"\n"), (["--git-path", "index"], b"/index\n")])
+def test_effect_result_restores_directory_paths_without_changing_its_contract(tmp_path, query, suffix):
+    from types import SimpleNamespace
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        args = ["git", "rev-parse", *query]
+        original = subprocess.CompletedProcess(args, 0, f"/proc/{os.getpid()}/fd/{fd}".encode("ascii") + suffix, b"notice\xff")
+        process = SimpleNamespace(pid=os.getpid(), directories={"fds": (fd,)})
+        result = gitops_fds.git_result(original, result_type=subprocess.CompletedProcess, process=process)
+        assert type(result) is subprocess.CompletedProcess
+        assert result.args is args and result.returncode == 0
+        assert result.stdout == os.fsencode(tmp_path) + suffix and result.stderr == b"notice\xff"
+        os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="holder cleanup uses POSIX SIGUSR1")
+@pytest.mark.parametrize("fault", [None, "os-error", "timeout"])
+def test_effect_cleanup_keeps_timeout_class_and_closes_every_stream(fault):
+    import io
+    import signal
+    from types import SimpleNamespace
+    signals, waits = [], []
+    def wait(*, timeout):
+        waits.append(timeout)
+        if fault == "os-error":
+            raise OSError("fixture cleanup failure")
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(["fixture-holder"], timeout)
+        return 0
+    streams = [io.BytesIO() for _ in range(3)]
+    process = SimpleNamespace(raw=SimpleNamespace(poll=lambda: None, send_signal=signals.append, wait=wait),
+        stdin=streams[0], stdout=streams[1], stderr=streams[2], timeout_error=subprocess.TimeoutExpired)
+    try:
+        assert gitops_fds.cleanup_holder(process) is (fault is not None)
+        assert signals == [signal.SIGUSR1] and waits == [5]
+        assert all(stream.closed for stream in streams)
+    finally:
+        for stream in streams:
+            stream.close()
+
+
+def _bound_fence(path):
+    from aegis_core.primitives import real_key
+    return real_key(os.fspath(path))
+
+
+@contextlib.contextmanager
+def _bound_ordinary_root(path):
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    with bound_ordinary_root(_bound_fence(path)):
+        yield
+
+
+def test_bound_root_runs_enclosing_git_skips_workspace_git_and_retries(tmp_path, fresh_git_lookup):
+    """Git in the enclosing checkout is outside the owner root; git inside it is still refused."""
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    app = _worktree(enclosing / secret)
+    (app / "sub").mkdir()
+    inside = tmp_path / "INSIDE"
+    outside = tmp_path / "OUTSIDE"
+    _plant_git(app / "bin", inside)
+    _plant_git(enclosing / "bin", outside)
+    planted = os.pathsep.join((str(app / "bin"), str(enclosing / "bin")))
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError) as unbound:
+            gitsafe.run(["--version"], app / "sub")
+    assert unbound.value.code == "ERR_AEGIS"
+    assert not inside.exists() and not outside.exists()
+    with _bound_ordinary_root(app):
+        with _temporary_env({"PATH": planted}):
+            allowed = gitsafe.run(["--version"], app / "sub")
+        assert allowed.returncode == 0
+        assert outside.exists() and not inside.exists()
+        outside.unlink()
+        with _temporary_env({"PATH": str(app / "bin")}):
+            with pytest.raises(gitsafe.GitError) as refused:
+                gitsafe.run(["--version"], app)
+        fence = pathlookup.GitCache().for_cwd(app).fence
+        canonical = sanitize_display(fence, max_len=None)
+        expected = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
+        assert refused.value.code == "ERR_AEGIS"
+        assert str(refused.value).endswith(expected)
+        assert secret not in str(refused.value)
+        assert "[REDACTED_AWS]" in str(refused.value)
+        assert "\n" not in str(refused.value) and "\r" not in str(refused.value)
+        assert not inside.exists()
+        with _temporary_env({"PATH": _REAL_GIT_DIR}):
+            retried = gitsafe.run(["--version"], app)
+        assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+        assert not inside.exists()
+    assert pathlookup.ordinary_root.get() is None
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError):
+            gitsafe.run(["--version"], app)
+    assert not outside.exists() and not inside.exists()
+
+
+def test_bound_root_holds_for_ordinary_lookup_when_descriptors_are_unavailable(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    marker = tmp_path / "PWNED"
+    _plant_git(enclosing / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _bound_ordinary_root(app):
+            with _temporary_env({"PATH": str(enclosing / "bin")}):
+                result = gitsafe.run(["--version"], app)
+            assert pathlookup.GitCache().for_cwd(app).fence == _bound_fence(app)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert result.returncode == 0 and marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup(tmp_path, monkeypatch, fresh_git_lookup):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    seen = []
+    real = pathlookup.which
+
+    def which(name, *args, **kwargs):
+        seen.append(kwargs.get("outside"))
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(pathlookup), "which": which}))
+    with _bound_ordinary_root(app):
+        assert gitsafe.git_executable(cwd=enclosing) == real("git", path=os.environ.get("PATH", os.defpath),
+                                                              outside=_bound_fence(app), fence_program=True, descriptors=False)
+        seen.clear()
+        assert gitsafe.git_executable(environ={"PATH": _REAL_GIT_DIR}, cwd=enclosing)
+        assert seen and all(os.path.normcase(os.path.realpath(item)) != _bound_fence(app) for item in seen)
+        monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: False)
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.custody_program(enclosing, environ={"PATH": _REAL_GIT_DIR})
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False
+    assert pathlookup.ordinary_root.get() is None

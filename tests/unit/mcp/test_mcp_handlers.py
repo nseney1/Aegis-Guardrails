@@ -34,6 +34,45 @@ def test_scan_matches_rules_for_the_given_files(mcp_workspace: Path):
     assert [r["name"] for r in res["relevant_rules"]] == ["sample-rule"]
 
 
+@pytest.mark.parametrize("event", ["scan", "exposure"])
+@pytest.mark.parametrize("message, expected", [
+    ("disk\nfull", "disk full"),
+    ("disk\x1bfull", "guidance withheld: control characters"),
+    ("disk\0full", "guidance withheld: control characters"),
+    ("\x1b" + "x" * (1024 * 1024), "guidance_projection_limit"),
+    ("ghp_" + "a" * 30, "ghp_REDACTED"),
+    ("x" * 1100, "x" * 1021 + "..."),
+], ids=["newline", "esc", "nul", "oversized_control", "secret", "clipped"])
+def test_scan_telemetry_warning_retries_then_recovers(mcp_workspace, monkeypatch, capsys,
+                                                     event, message, expected):
+    from aegis_core import credit, scan_compliance
+
+    record = scan_compliance.record if event == "scan" else credit.record_exposure
+    attempts = []
+
+    def fail_twice(*args, **kwargs):
+        attempts.append(None)
+        if len(attempts) <= 2:
+            raise OSError(message)
+        return record(*args, **kwargs)
+
+    if event == "scan":
+        monkeypatch.setattr("aegis_core.scan_compliance.record", fail_twice)
+    else:
+        monkeypatch.setattr("aegis_core.credit.record_exposure", fail_twice)
+    args = {"workspace": str(mcp_workspace), "files": ["src/main.py"], "_session": "warning-retry"}
+    prefix = "scan event not recorded" if event == "scan" else "exposure record not written"
+    for _ in range(2):
+        assert [r["name"] for r in handle_scan(args)["relevant_rules"]] == ["sample-rule"]
+        assert capsys.readouterr().err == "aegis-mcp: " + prefix + ": " + expected + "\n"
+    assert [r["name"] for r in handle_scan(args)["relevant_rules"]] == ["sample-rule"]
+    assert capsys.readouterr().err == ""
+    assert len(attempts) == 3
+    handle_scan(args)
+    assert capsys.readouterr().err == ""
+    assert len(attempts) == (3 if event == "scan" else 4)
+
+
 @pytest.mark.parametrize("args,error", [
     ({"workspace": BAD_WORKSPACE}, None),
     ({"files": "not-a-list"}, "'files' must be a list of file paths"),

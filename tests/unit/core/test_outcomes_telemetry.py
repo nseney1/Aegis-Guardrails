@@ -13,18 +13,18 @@ def test_record_verification_telemetry(tmp_path: Path):
     assert record_verification_telemetry("", [], passed=True) == Recorded(0)
     assert record_verification_telemetry(ws, [], passed=True) == Recorded(0)
 
-    # Missing cells_dir
+    # Missing rules_dir
     assert record_verification_telemetry(ws, ["src/foo.py"], passed=True) == Recorded(0)
 
-    cells_dir = tmp_path / ".aegis" / "rules" / "traps"
-    cells_dir.mkdir(parents=True, exist_ok=True)
-    cell_file = cells_dir / "test-cell.md"
+    rules_dir = tmp_path / ".aegis" / "rules" / "traps"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    rule_file = rules_dir / "test-rule.md"
     fm = {
-        "id": "test-cell",
+        "id": "test-rule",
         "type": "trap",
         "target_paths": ["src/*.py"],
     }
-    cell_file.write_text(f"---\n{dump_frontmatter(fm)}---\n\n# Body\n", encoding="utf-8")
+    rule_file.write_text(f"---\n{dump_frontmatter(fm)}---\n\n# Body\n", encoding="utf-8")
 
     # Pass
     ok = record_verification_telemetry(
@@ -49,7 +49,7 @@ def test_record_verification_telemetry(tmp_path: Path):
     assert ok_fail == Recorded(1)
     from aegis_core.telemetry_engine import ledger
     # One trigger row per rule and run: a local run is never a verdict (R-evidence-1).
-    assert ledger.aggregate(tmp_path, "test-cell") == {
+    assert ledger.aggregate(tmp_path, "test-rule") == {
         "triggers": 2, "tp": 0, "fp": 0, "last_ts": ledger.read(tmp_path).rows[-1]["ts"],
     }
     assert [r["meta"]["passed"] for r in ledger.read(tmp_path).rows] == [True, False]
@@ -63,15 +63,15 @@ def test_telemetry_edge_cases_and_error_branches(tmp_path: Path, monkeypatch, ca
     ws = str(tmp_path)
 
     # record_verification_telemetry: a failing ledger append is handled
-    cells_dir = tmp_path / ".aegis" / "rules" / "traps"
-    cells_dir.mkdir(parents=True, exist_ok=True)
-    cell_file = cells_dir / "test-cell.md"
+    rules_dir = tmp_path / ".aegis" / "rules" / "traps"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    rule_file = rules_dir / "test-rule.md"
     fm = {
-        "id": "test-cell",
+        "id": "test-rule",
         "type": "trap",
         "target_paths": ["src/*.py"],
     }
-    cell_file.write_text(f"---\n{dump_frontmatter(fm)}---\n\n# Body\n", encoding="utf-8")
+    rule_file.write_text(f"---\n{dump_frontmatter(fm)}---\n\n# Body\n", encoding="utf-8")
     def mock_append_err(*args, **kwargs):
         raise RuntimeError("db error")
     monkeypatch.setattr("aegis_core.telemetry_engine.ledger.append", mock_append_err)

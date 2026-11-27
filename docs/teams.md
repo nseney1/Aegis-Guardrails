@@ -1,10 +1,102 @@
 # Agent teams
 
+This guide covers repository lanes. Use the [team surface chooser](../README.md#agent-teams)
+for management audit or the source-checkout runtime prototype.
+
 A lane is an agent's worktree and branch. A dispatcher or person assigns paths,
-then checks the lane's committed changes before integration. Aegis supplies
-cooperative leases and a post-lane check; it does not start agents or manage their
+then checks the lane's committed changes before integration. The lease and lane-check
+commands supply cooperative leases and a post-lane check; they do not start agents or manage their
 worktrees. A read-only reviewer claims no paths, and its verdict applies to the
 exact tree it reviewed. Review verdicts belong in the pull request, not the ledger.
+
+## On this branch
+
+These surfaces are in the tree. This page is the entry; the linked pages are the depth.
+
+| Surface | What you can use | Depth |
+|---|---|---|
+| Repository lanes | `aegis team claim` and `aegis check --lane` | the sections below |
+| Work queue | `aegis team queue` | [Queue work for teams](#queue-work-for-teams) |
+| Model selection | `aegis team model` and the `aegis_team_model` tool; a choice requires an admitted binding | [Model selection](model-selection.md) |
+| Team profile | `aegis team config`, `aegis team doctor` and `aegis team hosts` | [Team profiles](teams-profile.md) |
+| Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
+| Product mailbox | `aegis team mail send` and `aegis team mail read` over `aegis_core.team_mailbox`; `aegis team mail doctor` over `aegis_core.team_mailbox_doctor` | [Mail and board](#mail-and-board) |
+| Team board | `aegis team board` configures, reads and inspects the board over `aegis_core.team_board` | [Mail and board](#mail-and-board) |
+| Container isolation | `aegis team isolation check` plans from an absolute team-run file or compares an inspection; it does not start a container | [Container isolation](teams-container-isolation.md) |
+| Source pages | `aegis_core.team_source` serves pinned object pages from an owner-selected root; refusals are fixed envelopes | [Architecture](architecture.md#where-to-read-next) |
+| Session wake | `aegis_core.team_session_wake` validates the profile binding and attempts a turn for unread mail | [Session wakes](#session-wakes) |
+| Codex stdio wire | `aegis_core.team_native_wire.ProtocolClient` launches no process; the caller owns and reaps the process and transfers both pipe streams to the client, which closes them on `close()` or a terminal protocol error; cancel through `client.close()` and never close or reuse the streams directly | [Architecture](architecture.md#where-to-read-next) |
+| Workspace ledger | `aegis_core.team_workspace_store` and `aegis_core.team_workspace_display`; `tools/hierarchy_workspace.py` stays outside the wheel | [Architecture](architecture.md#where-to-read-next) |
+| Session stop | `aegis_core.team_session_stop`, `team_session_census` and `team_session_custody`; a stop signals only a process proven to belong to the recorded session | [Security](../SECURITY.md#teams-trust-model) |
+| Served identity | `aegis_core.model_served.observe_served` records host, model, level, family and a fallback reason; it adds no command | [Model selection](model-selection.md) |
+| Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
+| Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
+| Git delivery | snapshots, plans, compare-and-swap publishing and qualification as libraries. Publisher activation is still unwired. | [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities) |
+| Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
+| Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
+
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Automatic landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. A separate OS principal is tracked in `OS-PRINCIPAL-1`.
+
+`tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+
+## Setup and limits of each surface
+
+**Repository lanes** use `aegis team claim` and `aegis check --lane`, included in
+the installed CLI. Leases supply cooperative conflict information; these commands
+do not launch agents or reserve runtime capacity. The sections below cover lane
+setup, checks and lease operations.
+
+**Management audit** uses `aegis workspace` from the reviewed, source-pinned
+prototype CLI, with a separate manager registration and owner-approved policy
+and membership. Audit acknowledgements grant zero fitness credit, no execution
+authority and no native Teams enforcement. Follow the
+[manager workspace guide](manager-workspaces.md) to prepare and activate it.
+
+**Runtime team tools** are a source-checkout prototype; `tools/hierarchy_team.py`
+is outside the installed wheel. Team runs need Linux, Python 3.9+, Git, `bwrap`,
+the selected host CLI and a dedicated host login. They set up runs, start and stop
+supported CLI sessions, and inspect run status. Fixed start failures are
+recorded as `failed_to_start` or `start_incomplete`, with the reasons in the
+[runtime guide](agent-hierarchies.md#start-resume-and-stop-sessions). The job
+runner calls `check_settlement_processes` on settlement and recovery before it
+treats a stopped job as finished, and refuses while the recorded process group
+still has members. The small-change dispatcher calls `check_stopped` before it
+accepts a completed retained job. Under a host plan, a handoff checkpoint keeps open-work briefs, the last touching brief, briefs listed in `entries[].briefs`, and the last inherited brief when none qualifies; without a plan, briefs carry forward unchanged. Start with the
+[runtime guide](agent-hierarchies.md) and the
+[team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
+
+### Mail and board
+
+`aegis team mail send` publishes a request, `aegis team mail read` reads a
+bounded page, and `aegis team mail doctor` inspects mailbox health without
+writes. The doctor is `aegis_core.team_mailbox_doctor`, folded into that command;
+it is not a separate tool. `aegis team doctor` checks the team profile. `aegis team board` can
+configure channels and access, read pages and inspect board health through
+`aegis_core.team_board`. See the
+[mail](reference.md#aegis-team-mail) and [board](reference.md#aegis-team-board)
+command sections for arguments.
+
+Mail and board require the mailbox store's POSIX descriptor support. This
+includes `O_NOFOLLOW`, `O_DIRECTORY`, descriptor-relative `open`, `mkdir`,
+`link`, `unlink`, `stat` and `rmdir`, and `scandir` on a directory descriptor.
+After successful argument parsing and workspace resolution, missing descriptor
+support yields `unsupported_platform` for mail send, mail read and every board
+command, and `MD_PLATFORM` for mail doctor. A malformed option before `mail` or `board` is a fixed usage refusal (exit 2) and does not echo the caller's tokens. A board write waits up to 5.0 seconds for the board lock, then refuses `busy` if the lock is still held. A post or disposition refuses `rate_limited` when that endpoint already has 30 actions in the last 60 seconds: the refusal tells the caller to wait for the window and writes nothing.
+
+### Session wakes
+
+`aegis_core.team_session_wake.wake` refuses a mismatched profile with
+`binding_mismatch` before starting a turn. With a valid profile, an empty inbox
+returns `nothing_unread` and a dry run with unread mail returns `dry_run`. An
+actual wake with unread mail on a supported platform refuses with `busy` if
+the endpoint is already claimed. See [Security](../SECURITY.md#repository-trust).
 
 ## Claim and finish a lane
 
@@ -15,6 +107,430 @@ aegis team claim docs --paths 'docs/**' --branch lane/docs --ttl 3600 --json
 aegis team list --json
 ```
 
+### Lease path globs
+
+A leading slash anchors a lease glob to the workspace root. Use `/pyproject.toml`
+for the root file and `/docs/` for the root directory prefix. The anchor is retained
+in the stored lease and in JSON claim, list and status output:
+
+```sh
+aegis team claim root-files --paths '/pyproject.toml' '/MANIFEST.in' --json
+```
+
+A slashless glob retains its any-depth meaning: `pyproject.toml` also protects
+nested files with that basename. Its overlap is conservative and can conflict with
+unrelated lanes. An anchored root-file declaration avoids that broad basename
+reading. Wildcards with a shared literal prefix can still conflict even when their
+extensions differ; uncertainty refuses the claim.
+
+When a slashless existing root file is refused solely because of the any-depth
+reading, the refusal may suggest its anchored form in `next_action`. This is advice
+to retry; it does not grant the lease or bypass the next claim's conflict check.
+JSON refusals include that guidance when available; text refusals print it on stderr.
+
+Lease blobs remain version 1. Older readers strip a root anchor and therefore
+interpret an anchored root filename more widely, preserving conflict protection
+across versions. Known whitespace leases retain their old conservative scope and
+must be released and reclaimed to change their paths.
+
+These semantics also govern queue item and `lease_free` path globs. Queue entries
+use POSIX separators. Rule targeting and `.aegis/team.json` policy globs retain
+their existing normalization and matching behavior.
+
+## Queue work for teams
+
+The Router enqueues work; an orchestrator selects an item and claims its current
+revision. Queue claims are cooperative scheduling records, separate from the
+repository path leases above. They do not launch sessions or grant execution authority.
+The service uses Python 3.9's standard library and requires POSIX descriptor-relative
+no-follow operations. Unsupported platforms return a structured refusal.
+
+Before the first queue claim:
+
+- Initialize the repository and declare the selected lane in `.aegis/team.json`,
+  using the [minimal policy example](#committed-policy-and-provenance). Declaration
+  is required for queue claims; repository path leases can operate without it.
+- Have the owner review policy changes and use `aegis approve` before merge.
+- List the item, read its full constraints, satisfy its dependencies and holds,
+  and use its current revision. Supply all capabilities the item requires.
+- Establish the lane's separate repository path lease and record its branch;
+  queue claims grant neither path leases nor execution authority.
+
+```sh
+aegis team queue add --item '{"id":"DOCS-1","title":"Update guide","paths":["docs/**"],"capabilities":["docs"]}' --json
+aegis team queue list --capability docs --json
+aegis team queue list --include-done --json
+aegis team queue claim DOCS-1 --lane docs --branch lane/docs --capability docs --expect REVISION --ttl 3600 --json
+aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
+aegis team queue audit --json
+aegis team queue compact --json
+```
+
+To return unfinished work instead of completing it, use `aegis team queue release
+DOCS-1 --lane docs --expect CLAIM_REVISION --json`. Use `unclaim` to also return
+the lane's repository lease when its paths intersect the item's write set.
+Stop the lane's writer and queued jobs and verify their liveness in the host layer
+before acknowledging with `aegis team queue unclaim DOCS-1 --lane docs --expect
+CLAIM_REVISION --writer-stopped --reason 'Waiting for review' --json`. The binding
+check supplements that verification by refusing a verified live writer even when
+you pass `--writer-stopped`.
+[`test_unclaim_releases_intersecting_lease_and_records_once`](../tests/unit/core/test_team_claims.py#L617),
+[`test_operator_must_acknowledge_stopped_writer`](../tests/unit/core/test_team_claims.py#L854),
+[`test_cli_unclaim_live_binding_defeats_stop_acknowledgement`](../tests/unit/cli/test_cli_team_queue.py#L648).
+
+`list --capability` names capabilities available to the team: list items whose
+requirements are all satisfied. Repeat it to supply multiple capabilities.
+Omitting the option disables this filter; items with empty requirements match
+every supplied set. This filter does not bypass other claim-time checks.
+
+Use the actual `revision` returned by add, list, claim or release in place of the
+example placeholders. Release and done are alternative transitions from a claim;
+after release, claim again before completing the item. Claims expire at their
+recorded `expires_at`: an expired claim can be replaced using its current revision,
+but cannot complete work. Stale revisions always refuse, including concurrent
+claims of the same item. List displays claimed lanes as `lane [ITEM: title]`.
+Each lane may hold one live queue claim; another claim refuses with `lane_busy`.
+Release and done accept `--lane`; live claims require their matching lane
+(`lane_required` when the lane is omitted, and the claim's own lane when another
+lane is supplied). Lane labels are cooperative caller
+assertions, not authenticated identities or OS permissions.
+
+**Recovering an unclaim**
+
+If an unclaim cannot complete, read the top-level `reason` and `next_action`
+in the JSON response. In the tested retries with a saved intent and a lease or
+receipt blocker, the response also shows the cause and its `next_action` in
+`blockers`. Follow the applicable `next_action`. In the tested case of a live
+foreign covering lease, the cause's action contains the `aegis team release`
+command after the `Inspect the covering lease before retrying` prefix.
+[`test_crash_recovery_blocks_other_transitions_and_records_once`](../tests/unit/core/test_team_claims.py#L710),
+[`test_recovery_cause_names_the_blocker_and_retries`](../tests/unit/core/test_team_claims.py#L1643).
+
+Retry the same unclaim for the recorded item, lane and revision as the recorded
+caller. In those recovery cases, a later run that finds the saved intent
+completes it once the blocker is resolved or reports the pending cause while it
+persists.
+[`test_cli_recovery_from_another_cwd_names_and_reaches_its_workspace`](../tests/unit/cli/test_cli_team_queue.py#L2448),
+[`test_recovery_cause_names_the_blocker_and_retries`](../tests/unit/core/test_team_claims.py#L1643).
+
+In the concurrent-unclaim regression, one caller wins and one `unclaim` event
+is recorded.
+[`test_concurrent_unclaims_have_one_recorded_winner`](../tests/unit/core/test_team_claims.py#L745).
+
+Successful `queue list --json` responses include `claimable_fingerprint`, a
+SHA-256 digest of scheduling state: claimable item IDs and revisions, item and
+typed-hold state, milestones, completion history and live lease OIDs (including
+unreadable lease evidence), configured lane eligibility and effective profile
+validity/capacity. The claimable set uses the same eligibility checks as claim.
+Git errors and timeouts refuse observation; they never mean an empty lease set.
+In a non-Git workspace, `lease_free` holds stay unmet because lease evidence is
+unavailable. The digest is independent of display filters and observation
+timestamps. Unchanged scheduling state yields the same digest. The digest changes
+after unclaim in [`test_unclaim_releases_intersecting_lease_and_records_once`](../tests/unit/core/test_team_claims.py#L617).
+Lease release or expiry, completion and clearing a hold change it. A changed digest
+signals callers to inspect the queue again; it grants no claim authority and
+does not replace the revision check. Automatic supervisor retries are separate.
+
+For polling, `aegis team queue list --view fingerprint --json` returns the same
+response envelope and fingerprint without constructing full item views. It marks
+`view: fingerprint`, names omitted `items` and `completed_ids`, and instructs the
+caller to run `aegis team queue list --view full --json` after a change. Display
+filters do not affect the fingerprint. A fingerprint never authorizes a claim.
+
+For triage, `aegis team queue audit --view findings --json` retains findings,
+affected item IDs with their current revisions, states and lanes, the claim expiry
+time and whether each claim expired, and counts of items, findings and affected
+items. States and expiry evidence match the full views. It marks `view: findings`,
+identifies omitted item detail and points to
+`aegis team queue list --include-done --view full --json`, which also displays
+retained completed items. Read full constraints before deciding to change holds
+or work. Both commands default to
+`--view full`; refusal envelopes are unchanged by view selection. These view
+options are available through the CLI and core service; MCP keeps its full list.
+
+Pass the lane's branch explicitly with `claim --branch`; it can be a short local
+name or `refs/heads/` name. Queue claims never infer a lane branch from the shared
+workspace's HEAD. Omitted branches are recorded as unknown. Queue claims use the
+repository lease's branch-label predicate: 1 to 200 characters with no whitespace
+or control characters. Punctuation and non-ASCII characters are accepted. The
+optional `refs/heads/` prefix counts toward this input limit and is removed for
+new claim storage and audit comparison. Stored evidence, including older prefixed
+records, is kept verbatim and sanitized for display; unsupported values are
+reported per item instead of preventing queue operations.
+Other `refs/` prefixes, empty local names, nested ref prefixes and `HEAD` are
+refused. This validates a label, without requiring that branch to exist in the
+coordinator checkout.
+
+All queue results are JSON, with schema `aegis.team.queue.<verb>/v1`, including
+refusals. Exit codes are 0 done, 1 refused and 2 usage. Refusals contain `refused`,
+`reason` and `next_action`; parser failures use the `usage` verb. List and audit
+create no state or locks. The read-only MCP tool `aegis_team_queue` lists the same
+items, blockers and labels, with optional `capabilities` and `include_done` fields.
+Its schema admits no mutation verb. Successful payloads match the CLI; refusals
+retain the core envelope and add `error` with the fixed reason for MCP's `isError` flag.
+The MCP server validates the original closed client object before workspace
+binding or removal of reserved keys. Unknown keys (including `workspace` and
+`files`), malformed objects and invalid values refuse as `invalid_arguments`.
+Binding failures refuse as `queue_io_unavailable` without raw pin diagnostics.
+Any invocation containing `team` followed anywhere by `queue` in the whole argv
+uses the queue's non-echoing parser boundary, including words after `--`, option
+values and malformed commands. Removed-command shortcuts also defer to this
+parser boundary. The existing `aegis hook run` shortcut runs before that boundary:
+malformed hook arguments, including ones mentioning `team queue`, exit 0 silently
+to preserve the hook's must-not-block contract. Only a successful parse as `team queue`
+exempts queue data named `model` from the raw model-token policy. Workspace bounds
+apply equally before `team`, between `team` and `queue`, and after `queue` or its verb.
+For a structurally established queue command, parser refusals may also carry
+`argument_error`: a fixed category (`missing_required`, `missing_value`,
+`invalid_value` or `limit_exceeded`), allowlisted argument names, and a concrete
+`help_command`. Unknown tokens and supplied values remain opaque. When the
+command or diagnostic cannot be safely established, the generic refusal remains.
+Empty workspace values, NUL bytes and `..` components refuse before workspace
+resolution, as do values exceeding the length or separator limits.
+CLI and core use one bounded tokenizer independent of Python's Windows path parser.
+Parents separated by slash, backslash or colon refuse, including drive-relative,
+UNC server/share and device-prefix spellings, on every OS and supported Python version.
+
+Items require `id`, a single-line `title`, nonempty workspace-relative `paths`
+globs, and `capabilities`, a list of team labels. These labels are never host kinds.
+Optional fields are `after` (prerequisite item ids), `hold` (a judgment hold),
+`hold_until`, `scope_rulings` and `invariants` (lists of single-line text), and
+`brief_paths` (up to 128 literal workspace-relative write paths from the brief).
+Brief paths cannot contain wildcards; this typed declaration never opens a brief
+file or parses arbitrary Markdown. Omitted declarations add no paths to the item's scope.
+Every declared brief path must match the item's `paths` at add time; otherwise
+`brief_outside_scope` refuses with exit 2 before storage is created. Correct the
+declaration and add again; an invalid immutable item never consumes a queue slot.
+Unknown fields, duplicate JSON keys, multiline values and malformed items refuse. Limits
+are 256 unfinished items, 128 entries per item list, 64 characters per id/label,
+256 per title/path, 4,096 per ruling/invariant/hold, and 1 MiB of queue state.
+Validated constraint text is returned in full. Completed rows are hidden by default;
+`list --include-done` includes them. They do not consume the unfinished-item cap.
+`compact` removes completed rows except prerequisites named by unfinished items,
+and keeps a minimal completion marker for every removed ID. It reports
+`removed_count`, `removed_ids` and `retained_done_count`, is serialized with
+mutations, and is safe to retry. Later `after` dependencies still resolve as done,
+and removed IDs remain reserved: re-adding them refuses `item_exists` and claiming
+them refuses `item_done`. `list --include-done` exposes compacted IDs separately as
+`completed_ids`; this global history has no retained capability metadata to filter.
+Completion history is bounded to 8,192 IDs and the existing file/JSON limits.
+`queue_history_limit` refuses further compaction without changing state. Today,
+the operator should stop retrying compact, run `aegis team queue list --include-done
+--json`, and give the coordinator the refusal and `completed_ids` history. Keep
+the queue state and ID reservations intact while the coordinator tracks the ruled
+archive-command follow-up. This version has no supported command to free history
+slots; do not hand-edit or reset the state file. Existing work can continue within
+the remaining queue limits.
+Compaction retains no removed item bodies.
+Queue transition events remain in their existing event history. The entire proposed serialized state
+must also pass the bounded JSON reader before publication; `queue_size_limit`
+names the file/reader limit and leaves the previous queue intact. `queue_live_limit`
+requires completing unfinished work before adding another item.
+
+Credential-like text in `id`, `title`, `paths`, `capabilities`, `after`, `hold`,
+`scope_rulings` or `invariants` refuses
+add. Text-field detections return `credential_like_text` (exit 2), with guidance
+to rephrase assignments, for example `Auth: update login flow` as `Update login flow`.
+Item IDs, prerequisite IDs in `after` and capability labels are validated as
+identifiers first and return `invalid_item` when malformed. The heuristic remains fail closed
+and can refuse ordinary prose. Detection is per field: a value split
+across `id` and `title` is not detected across that boundary. Labels are composed
+after each field is canonicalized, redacted and bounded; generated `id: title`
+punctuation does not trigger another credential check on the joined label.
+Milestone names and `lease_free` paths within `hold_until` use the same checks.
+
+Typed `hold_until` conditions are objects of one of these shapes:
+
+| Condition | When a claim may proceed |
+| --- | --- |
+| `{"kind":"lease_free","paths":["docs/**"]}` | No live repository or queue lease covers those globs; unreadable repository leases block. |
+| `{"kind":"milestone","name":"develop-merge"}` | The coordinator has recorded that milestone in the owner-managed queue state. |
+| `{"kind":"owner"}` | An owner decision removes the condition; it never self-clears. |
+| `{"kind":"coordinator"}` | A coordinator decision removes the condition; it never self-clears. |
+
+For a live claimed item, `lease_free` ignores its own queue claim and its holder's
+repository lease. Other lanes' covering leases still block; expired claims have
+no holder exemption.
+
+Missing or invalid `.aegis/team.json` lane configuration is a coordinator blocker
+at claim time; it cannot prevent adding or listing items. The team-policy parser
+accepts a UTF-8 BOM and uses its own limits. Prerequisites
+must be done; missing prerequisites remain visible with `next_action`. Claim checks
+the lane declaration, capability labels, overlap with other live queue claims and
+available writer slots. Under the queue mutation lock, claim re-reads repository
+leases and refuses `foreign_lease` for overlapping live foreign leases or unreadable
+lease records, even without a `lease_free` condition. The requested lane's own
+repository lease is exempt from this scope check. `brief_paths` are validated
+against the item's admitted globs at add time; an out-of-scope declaration refuses
+add with `brief_outside_scope` before the item enters the queue. Claim rechecks
+this declaration as part of its preflight.
+The lease observation is a snapshot; queue and repository lease stores are separate
+and this command grants no cross-store transaction or execution authority.
+The layered team profile supplies `run_config.limits.writers_max`; live repository
+lease lanes and live queue claim lanes share that count, with each lane counted once.
+The resulting distinct lane count must fit the limit, including when the requested
+lane already has a repository lease. Add/release responses show known blockers;
+an unobserved `lease_free` condition asks for list to evaluate repository leases,
+so it cannot be reported as satisfied merely because a mutation skipped that read.
+Audit identifies items waiting only on the coordinator and satisfied typed conditions
+still retained with a judgment hold on queued work. A judgment hold is never
+automatically removed; satisfied `lease_free` conditions should remain in place
+so a later claim rechecks them.
+Audit reports `LANE-NO-LEASE` when a live queue claim has an absent or expired
+repository lease. `LEASE-UNREADABLE` is a distinct outcome: inspect `aegis team list
+--json`, then use `aegis team release` with the unreadable lease's current
+`--expect` OID before claiming again. An unreadable snapshot never proves absence.
+`CLAIM-BRANCH-UNKNOWN` reports null or absent branch evidence, including legacy
+claims and claims made without `--branch` while detached. It never substitutes
+the shared workspace's current HEAD. `LEASE-BRANCH-UNKNOWN` reports missing branch
+evidence or a branch that is not a local branch on a readable live repository
+lease; release and recreate that lease with an explicit local branch.
+`LEASE-BRANCH-MISMATCH` requires two known
+branches that differ. Short and `refs/heads/` names compare equally. Independent
+claim-branch and lease findings can both appear. The live-claim findings above
+include fixed reasons and next actions, and stop appearing after the queue claim
+is released or expires.
+`CLAIM-BRANCH-UNSUPPORTED` reports one item's stored branch evidence that current
+claim rules refuse, including nested ref prefixes accepted by older versions.
+Its item view includes `branch_supported: false`. The evidence is not rewritten.
+Unsupported evidence suppresses only the branch comparison: live claims still
+report lease presence, readability and lease-side branch findings. Other queue
+items remain usable. This finding persists on expired and completed rows until
+cleared by a normal transition, even when completed items are hidden by the
+default list view. Release active or expired claims using their current
+revision (or complete a live claim with done); compact completed rows after any
+unfinished dependents finish. These normal transitions clear unsupported
+evidence. An expired claim still refuses done with `lease_expired`; re-claim it
+directly with its current revision and a supported branch, or release it first.
+New claims continue to refuse unsupported branch spellings.
+
+Add, claim, release and done append a correlated event under the queue transaction
+lock, using the existing `lease_claimed` event kind and `queue_<verb>` result.
+Details include the caller, item/lane label, previous/current revision, holder and
+expiry. These queue receipts are excluded from lease metrics. The default caller
+is the existing local owner label. As with lane leases,
+an event failure leaves the completed mutation intact and returns a fixed
+`event_not_recorded` warning with a next action; list before retrying, since the
+previous revision is stale. Events provide cooperative audit history, not a
+cross-file atomic journal.
+Compaction that removes rows appends a `queue_compact` event with counts and every
+removed ID in the bounded `removed_ids` list;
+an unchanged retry appends no duplicate event. Event failure returns a warning
+without undoing the already completed compaction.
+
+Queue state is `.aegis/state/team-queue.json`. Its optional `completed` object maps
+compacted IDs to `true`; older records without it load as empty history. Milestones are an owner-managed
+list of stable labels in that versioned document; this round adds no milestone
+recording verb. Model inputs and editable files are untrusted. Owner-UID rewriting
+of owner-only state is outside v5.0's threat model. These records supply no OS
+authorization. CLI renew/gc preflight rules are described below; build-kit wrapper
+retirement remains separate follow-up work.
+
+### Owner-bound MCP queue connection
+
+The owner can register a separate queue MCP server with an installed, isolated
+interpreter:
+
+```sh
+python -I -c 'from aegis_mcp.queue_owner import main; raise SystemExit(main())' ID
+```
+
+This connection exposes exactly `aegis_team_queue` and `aegis_team_queue_claim`.
+The ordinary Aegis connection keeps its existing tool list. Claim accepts only
+`id`, `expect` (the actual revision returned by list), and `lane`; it starts no
+host and creates no repository lease or execution authority.
+
+Before launch, the owner installs a private registration at
+`<account-home>/.aegis/mcp-queue/registrations/ID.json`, using directories with mode
+0700 and files with mode 0600. Account home comes from the effective UID's account
+database, never HOME, USERPROFILE or XDG settings. The registration fields are
+`schema`, `registration_id`, `endpoint`, `role`, `workspace`, `lanes`, `ttl_s` and
+`session_ttl_s`; see the [complete registration example](how-it-works.md#owner-bound-queue-connection).
+Only `role: orchestrator` can claim a lane admitted by that policy. Capability
+labels, branch and claim TTL come from the owner registration; caller role fields,
+environment strings and repository files cannot grant or widen permission.
+Registration lanes, capabilities and branches use the queue's shared validators.
+Invalid lane names, duplicate capabilities and invalid branch labels return
+`role_invalid` before a session record is created.
+
+Launch writes a process/session record bound to the registration's original byte
+digest. Linux process-instance qualification and descriptor-relative no-follow
+operations are required; other platforms refuse with `unsupported_platform`
+(`BL-16c-PORTABLE`). Safe separator and dot spellings of the workspace identify the
+same directory; parent traversal and symlinked workspaces refuse. Both TTLs are
+owner-selected integers from 1 through 86400 seconds. Changed or expired authority
+records and a second initialize invalidate the session; the owner must restart it.
+Even an equivalent rewrite of registration bytes requires a fresh session.
+
+The owner must exclude the authority directory and its replaceable ancestors from
+every hostile child's sandbox. The product does not verify this deployment
+prerequisite, and file modes do not isolate unrestricted processes sharing the
+owner UID. The separate OS-principal boundary remains `OS-PRINCIPAL-1`.
+
+Claim refusals return the queue claim envelope with `isError: true`, fixed reasons
+and recovery guidance. Malformed input returns `invalid_arguments` before IO;
+authority reasons are `role_missing`, `role_invalid`, `role_foreign`, `role_stale`,
+`role_forbidden`, `role_lock_timeout` and `role_io_unavailable`. Workspace/dispatch
+failures return `queue_io_unavailable`; unsupported hosts return
+`unsupported_platform`. Existing queue refusals, such as `stale_revision`,
+`blocked` and `queue_lock_timeout`, retain their core semantics. Exit codes in the
+envelope are 0 for success, 2 for invalid arguments and 1 for other refusals.
+
+## Inspect every lane
+
+```sh
+aegis team status --base origin/develop
+aegis team status --base origin/develop --check --json
+```
+
+`status` lists every readable or unreadable lease ref, including expired leases.
+Each readable row includes the holder label, expiry, recorded branch, captured tip,
+commits ahead/behind the base, and overlaps with live declarations. Unreadable
+leases appear separately in each readable row's `unknown_overlaps`: their scope
+cannot be ruled out. `stale` means expired or a recorded branch is missing;
+unreadable leases have `stale: null`. None of these fields establish actor liveness
+or reserve runtime capacity.
+
+Without `--base`, status uses the same base selection as `check --lane`. An explicit
+base that cannot resolve is a usage error (exit 2). A missing default base, shallow
+history, absent branch or unreadable object leaves the affected counts unknown
+(`null` in JSON), with an explanation. Inspection still exits 0 when individual
+leases are expired, stale or unreadable. Repository-wide Git failures exit 1.
+
+`--check` applies the existing lane gate to each live lease's captured branch tip,
+using its declared paths and `shared` policy from that exact tip. This is
+**self-attested** policy. It does not read the caller's dirty working-tree policy,
+switch branches, run tests, launch agents, write events or change leases. Short
+branch labels name local branches; `refs/heads/...` and `refs/remotes/...` are
+accepted explicitly. Tags and revision expressions are not branch labels.
+The result identifies the exact lease and commit it observed; concurrent changes
+can make that observation stale. Re-run before making a separate write decision.
+
+Checks exit 1 when any verdict fails or cannot be established, including expired
+or unreadable leases and missing branches. Rows remain visible so uncertainty
+cannot silently produce a passing result. Without `--check`, every `check` field
+is `null` and no verdict is requested. Runtime reservations and native execution
+remain separate from this repository inspection.
+
+### Lane JSON schemas
+
+Schema IDs are additive to the existing envelopes, fields and exit codes:
+
+| JSON surface | `schema` |
+| --- | --- |
+| `team claim`, `renew`, `transfer`, `release`, `gc`, `list`, `metrics` | `aegis.team.<action>/v1` |
+| `team status` | `aegis.team.status/v1` |
+| `check --lane` | `aegis.check.lane/v1` |
+| `check --partition` | `aegis.check.partition/v1` |
+
+Handled refusals and errors carry the same schema ID as their command. Existing
+lease blobs and `.aegis/team.json` remain version 1. Readers of the older CLI
+documents can continue using their existing fields and ignoring the added ID.
+These repository schemas are distinct from runtime `aegis.team-run-status/v1`
+and its nested `aegis.team-status/v1`; they do not describe a running team.
+
+## Renew and finish a lane
+
 The claim prints its lease object ID. Save that ID for compare-and-swap operations:
 
 ```sh
@@ -24,7 +540,12 @@ aegis team renew docs --expect LEASE_OID --ttl 3600
 Replace `LEASE_OID` with the ID you received. Renewal prints a new ID; use the
 latest one on the next renewal, transfer or release. Nothing renews automatically,
 and there is no MCP team tool. The default TTL is 3600 seconds, with a maximum of
-86400. A live overlapping claim is refused; for example, this overlaps `docs/**`:
+86400. CLI renewal checks that a recorded branch still exists; a missing recorded
+branch refuses with `lease_branch_missing`. An attached worktree is not required.
+Unavailable Git evidence refuses renew and gc with `liveness_unknown` before
+lease mutation; restore private Git metadata, then retry. GC still collects
+expired leases with attached worktrees and reports them as described below.
+A live overlapping claim is refused; for example, this overlaps `docs/**`:
 
 ```sh
 aegis team claim api --paths 'docs/api/**'
@@ -52,6 +573,12 @@ make it visible to every worktree. The lane name must match
 `[a-z0-9][a-z0-9._-]{0,62}`. An expired lease can be claimed again; `aegis team gc`
 removes expired leases. A timestamp over 300 seconds ahead of the reader is marked
 `clock_skew` and still counts as live.
+
+GC JSON keeps event-recording warnings in `warnings` as strings and reports
+collected lanes with attached worktrees in the additive `lane_warnings` array,
+with rows such as `{"lane": "docs", "reason": "expired_with_worktree"}`. Text mode
+prints `Warning: docs: expired_with_worktree` on stderr. These warnings do not
+retain expired leases; a retry with nothing to collect returns both arrays empty.
 
 A lease is cooperative conflict input, not a lock, not an identity and not proof
 that an agent is alive. Different lanes' claims can race between the overlap read

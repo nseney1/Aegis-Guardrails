@@ -36,6 +36,9 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 __all__ = [
+    "LeaseGlob",
+    "LeaseGlobError",
+    "require_rule_glob",
     "credit_weights",
     "split_credit",
     "first_match",
@@ -49,6 +52,30 @@ __all__ = [
 ]
 
 Patterns = Union[str, Iterable[object], None]
+
+
+class LeaseGlob(str):
+    """Lease provenance, with ordinary string equality and wire representation.
+
+    Defined in the parser's dependency layer to avoid an import cycle. Only
+    team_paths decides lease containment and overlap semantics.
+    """
+
+    __slots__ = ()
+
+
+class LeaseGlobError(TypeError):
+    """Fixed internal refusal: a lease glob reached a rule-only API."""
+
+    def __init__(self) -> None:
+        super().__init__("lease globs cannot use rule matching")
+
+
+def require_rule_glob(glob: object) -> None:
+    """Refuse lease provenance before rule normalization can erase its anchor."""
+    if isinstance(glob, LeaseGlob):
+        raise LeaseGlobError()
+
 
 _TEST_SUFFIXES = ("_test.py", "_test.go") + tuple(
     f".{kind}.{extension}"
@@ -221,6 +248,7 @@ def _glob_match(glob: _Glob, text: str) -> bool:
 
 def matches(pattern: str, path: str) -> bool:
     """Whether target_paths ``pattern`` applies to the workspace-relative ``path``."""
+    require_rule_glob(pattern)
     if not isinstance(pattern, str) or not isinstance(path, str):
         return False
     pat, rel = normalize_path(pattern), normalize_path(path)
@@ -238,6 +266,7 @@ _WILDCARD = re.compile(r"[*?\[]")
 def _literal_prefix(glob: object) -> Optional[str]:
     """The text every path ``glob`` matches starts with, casefolded; None when ``glob``
     matches nothing (not a string, or empty after normalizing)."""
+    require_rule_glob(glob)
     if not isinstance(glob, str):
         return None
     pattern = normalize_path(glob)
@@ -276,8 +305,12 @@ def _as_list(patterns: Patterns) -> List[object]:
     if patterns is None:
         return []
     if isinstance(patterns, str):
+        require_rule_glob(patterns)
         return [patterns]
-    return list(patterns)
+    out = list(patterns)
+    for pattern in out:
+        require_rule_glob(pattern)
+    return out
 
 
 def first_match(patterns: Patterns, path: str) -> Optional[str]:

@@ -44,7 +44,7 @@ ladder and is reached by review (`aegis rule promote`, D1), not by
   `__class__`-swap module proxy from 2 to 5 mirrored modules, duplicated handlers
   in `aegis_mcp/handlers/governance.py` and `handlers/telemetry.py` that were
   patched at import inside `except: pass`, and left permanent aliases
-  (`CellInventory`, `find_matching_cells`) with two import paths.
+  for inventory and rule selection with two import paths.
 - It added `WorkspaceLayout` with no production consumer, moved release-gate
   logic into CLI formatters and packed lines in `yaml_engine/parser.py` to meet
   a 350-line gate. Hotspot cyclomatic complexity rose 4.4%, and the docs,

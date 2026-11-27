@@ -1,0 +1,3200 @@
+"""Queue behaviour through its service, with real storage and process races."""
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+import json
+import multiprocessing
+import os
+import shutil
+import subprocess
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch as queue_patch
+
+import pytest
+
+from conftest import symlink_or_skip
+from aegis_core import atomicio, primitives, storage, storage_confined, team, team_queue as queue
+from aegis_core.redaction import redact_command_secrets
+
+
+_RACE_CONTROL = SimpleNamespace()
+
+
+class _PipeReadiness:
+    """A one-byte readiness message, with no lock shared with a worker."""
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.pause = None
+        self.signaled = False
+        # Optional (set-event, hold-event) pairs. Unset on the normal path.
+        self.after_poll = None
+        self.before_assign = None
+        # Parent-only. Spawn pickles this as None, so a child never sees hooks.
+        self.phase = None
+
+    def set(self):
+        self.writer.send_bytes(b"r")
+        if self.pause is not None:
+            self.pause.wait(30)
+
+    def _claim_ready(self):
+        """First observer records signaled and publishes the helper latch."""
+        with _OBSERVE_LOCK:
+            first = not self.signaled
+            self.signaled = True
+        if not first:
+            return
+        phase = self.phase
+        observe = None if phase is None else phase.observed
+        if observe is not None:
+            observe()
+
+    def wait(self, timeout):
+        if self.signaled:
+            return True
+        phase = self.phase
+        hook = None if phase is None else phase.before_poll
+        if hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        if self.signaled:
+            return True
+        polled = self.reader.poll(timeout)
+        # Publish the helper latch before a test hook can run. Poll does not
+        # consume the byte, so a later observer still sees it. The child
+        # process has no callback installed.
+        if polled:
+            self._claim_ready()
+        hook = self.after_poll
+        if hook is None and phase is not None:
+            hook = phase.after_pipe
+        if polled and hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        return self.signaled or polled
+
+    def is_set(self):
+        if self.signaled:
+            return True
+        if not self.reader.poll(0):
+            return False
+        with _OBSERVE_LOCK:
+            if self.signaled:
+                return True
+            if not self.reader.poll(0):
+                return False
+            try:
+                raw = self.reader.recv_bytes(1)
+            except (EOFError, OSError):
+                return False
+            if raw != b"r":
+                return False
+            try:
+                self.writer.send_bytes(raw)
+            except (EOFError, OSError):
+                return False
+            self.signaled = True
+        # Latch before any hook, while the byte is back in the pipe.
+        phase = self.phase
+        observe = None if phase is None else phase.observed
+        if observe is not None:
+            observe()
+        hook = self.before_assign
+        if hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        return True
+
+
+class _PipeRelease:
+    """Closing the parent writer releases every polling child reader."""
+    def __init__(self, *, reader=None, writer=None, waiting=None):
+        self.reader, self.writer, self.waiting = reader, writer, waiting
+
+    def set(self):
+        self.writer.close()
+
+    def wait(self, timeout):
+        if self.waiting is not None:
+            self.waiting.send_bytes(b"w")
+        return self.reader.poll(timeout)
+
+
+class _PipeControls:
+    def __init__(self, context):
+        self.connections = []
+        try:
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.entered = _PipeReadiness(reader, writer)
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.release = _PipeRelease(writer=writer)
+            # A worker receives no release writer, so parent close means EOF.
+            self.worker_release = _PipeRelease(reader=reader)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+    def close(self):
+        for connection in self.connections:
+            connection.close()
+
+
+def _readiness_pause_worker(entered, release, action):
+    if action == "terminate-ready":
+        entered.pause = release
+    entered.set()
+    release.wait(30)
+
+
+def _readiness_probe(action):
+    from threading import Thread
+    context = multiprocessing.get_context("spawn")
+    connections = []
+    process = None
+    watchdog = None
+    try:
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        connections.extend((ready_reader, ready_writer))
+        release_reader, release_writer = context.Pipe(duplex=False)
+        connections.extend((release_reader, release_writer))
+        waiting_reader, waiting_writer = context.Pipe(duplex=False)
+        connections.extend((waiting_reader, waiting_writer))
+        entered = _PipeReadiness(ready_reader, ready_writer)
+        release = _PipeRelease(writer=release_writer)
+        worker_release = _PipeRelease(reader=release_reader, waiting=waiting_writer)
+        process = context.Process(target=_readiness_pause_worker,
+            args=(entered, worker_release, action))
+        process.start()
+        assert waiting_reader.poll(5), "worker did not enter the readiness/release wait"
+        assert waiting_reader.recv_bytes(1) == b"w"
+        if action == "kill-waiter":
+            process.kill()
+        else:
+            process.terminate()
+        process.join(0.5)
+        if process.is_alive():
+            process.kill()
+        process.join(2)
+        assert not process.is_alive()
+        watchdog = Thread(target=release.set, daemon=True)
+        watchdog.start()
+        watchdog.join(1)
+        assert not watchdog.is_alive()
+        return entered.is_set()
+    finally:
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(0.5)
+            if process.is_alive():
+                process.kill()
+            process.join(2)
+            if not process.is_alive():
+                process.close()
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.parametrize("action", ["terminate-ready", "kill-waiter"])
+def test_pipe_controls_survive_terminated_readiness_and_killed_waiter(action):
+    assert _spawn_race(_readiness_probe, [action], timeout=8) == [True]
+    assert multiprocessing.active_children() == []
+
+
+def _race_process(worker, argument, writer, initializer, initargs, after_send):
+    try:
+        try:
+            if initializer is not None:
+                initializer(*initargs)
+            outcome = {"status": "ok", "value": worker(argument)}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+            if len(message) > 65536:
+                raise AssertionError("spawned race result exceeds 65536 bytes")
+        except BaseException as error:
+            try:
+                kind = redact_command_secrets(primitives.sanitize_display(
+                    type(error).__name__, max_len=None))[:80]
+                detail = redact_command_secrets(primitives.sanitize_display(
+                    str(error), max_len=None))[:512]
+            except BaseException:
+                kind, detail = "AssertionError", "race worker failed while formatting its diagnostic"
+            outcome = {"status": "error", "kind": kind, "message": detail}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+        try:
+            writer.send_bytes(message)
+        except OSError:
+            raise SystemExit(1) from None
+        if outcome["status"] != "ok":
+            raise SystemExit(1)
+        if after_send is not None:
+            after_send()
+    finally:
+        writer.close()
+
+
+# Process launch, including an injected delay, is outside the readiness clock.
+_LAUNCH_LIMIT = 20
+# Parent-local. A spawned worker reimports this module and gets its own lock.
+_OBSERVE_LOCK = threading.Lock()
+# Readiness allowance shared with the rescue watchdogs. It starts when the
+# helper publishes, after the workers are launched, and a slow start inside
+# it is not part of the fault deadline.
+_READY_LIMIT = 5
+# Joins after terminate, after kill, and for the result readers.
+_REAP_LIMIT = 0.5 + 2 + 2
+# The success-path retry spawn runs before the watchdog is told the test finished.
+_RETRY_LIMIT = 3
+# Pre-publication stall for rescue-grace regressions. Past the startup bound,
+# and shorter than the tightest spawn fault + cleanup pair (race_list).
+_SPAWN_GRACE_HOLD = _READY_LIMIT + 0.35
+# In-process observation does not wait for a spawned interpreter.
+_PROMPT_STARTUP = 0.5
+_PROMPT_HOLD = 0.9
+# A peer waiting for the blocked worker must outlast the startup allowance.
+_PEER_LIMIT = _READY_LIMIT + 5
+
+
+class _PhaseStart:
+    """The instant a helper begins its readiness wait."""
+
+    def __init__(self):
+        from threading import Event
+        self.event = Event()
+        self.instant = None
+        self.accepted = Event()
+        self.ready = Event()
+        self.t_ready = None
+        # Wakes the unset wait on publication or finish. Not a readiness signal.
+        self.wake = Event()
+        # Per-call hooks. Unset on the normal path. Not a module global.
+        self.before_ready = None
+        self.after_ready = None
+        self.observed = None
+        self.before_poll = None
+        self.after_pipe = None
+        self.hold_cancel = None
+
+    def publish(self):
+        from time import monotonic
+        if self.instant is None:
+            self.instant = monotonic()
+        self.event.set()
+
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+
+
+def _latch_ready(ready, phase):
+    """Publish the helper latch once. t_ready is recorded in this same block.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    from time import monotonic
+    if ready is not None and ready.is_set():
+        return
+    hook = None if phase is None else phase.before_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    if phase is not None and phase.t_ready is None:
+        phase.t_ready = monotonic()
+    if ready is not None:
+        ready.set()
+    if phase is not None:
+        phase.wake.set()
+
+
+def _publish_ready(source, ready, phase):
+    """Set the helper latch once, at the moment this helper observes source.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    if phase is not None:
+        phase.publish()
+
+    def publish():
+        _latch_ready(ready, phase)
+
+    previous = None
+    if phase is not None:
+        previous = phase.observed
+        phase.observed = publish
+        # The child already holds a pickled pipe whose phase is None.
+        source.phase = phase
+    try:
+        observed = source.wait(_READY_LIMIT)
+    finally:
+        if phase is not None:
+            phase.observed = previous
+    if not observed:
+        return False
+    _latch_ready(ready, phase)
+    hook = None if phase is None else phase.after_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    return True
+
+
+def _start_phased_watchdog(release, *, launch, startup, fault, cleanup, phase):
+    """Rescue only after the full grace bound, never at startup expiry alone.
+
+    While phase.ready is unset this waits startup + fault + cleanup from the
+    published instant. Once the helper publishes, the deadline is phase.t_ready
+    + fault + cleanup. t_ready is recorded in the same block as the publication.
+    This never polls a pipe and never decides readiness itself. finish() wakes
+    the wait and does not set the latch.
+    """
+    from threading import Event, Thread
+    from time import monotonic
+    done, rescued = Event(), Event()
+    ready = phase.ready
+
+    def rescue():
+        phase.wait(launch)
+        if done.is_set() or phase.instant is None:
+            if phase.instant is None and not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        total = startup + fault + cleanup
+        remaining = total - (monotonic() - phase.instant)
+        if remaining < 0:
+            remaining = 0
+        phase.wake.wait(remaining)
+        if not ready.is_set():
+            if not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        phase.accepted.set()
+        limit = phase.t_ready + fault + cleanup - monotonic()
+        if limit < 0:
+            limit = 0
+        if not done.wait(limit):
+            rescued.set()
+        release.set()
+
+    def finish():
+        done.set()
+        phase.event.set()
+        phase.wake.set()
+
+    watchdog = Thread(target=rescue, daemon=True)
+    watchdog.start()
+    return finish, rescued, ready, watchdog
+
+
+def _join_started(thread, timeout):
+    """Join a thread only when start() succeeded."""
+    if thread is not None and thread.ident is not None:
+        thread.join(timeout)
+
+
+def _wait_or_cancel(event, cancel, timeout):
+    """True when event is set and cancel is not. cancel ends the wait."""
+    from time import monotonic
+    deadline = monotonic() + timeout
+    while not cancel.is_set():
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return event.is_set()
+        if event.wait(min(0.05, remaining)):
+            return not cancel.is_set()
+    return False
+
+
+def _poll_or_cancel(reader, cancel, timeout):
+    """True when the pipe is ready and cancel is not. cancel ends the poll."""
+    from time import monotonic
+    deadline = monotonic() + timeout
+    while not cancel.is_set():
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return reader.poll(0)
+        if reader.poll(min(0.05, remaining)):
+            return not cancel.is_set()
+    return False
+
+
+def _end_consumer_call(cancel, release_helper, phase, finish, consumer, watchdog,
+                       watchdog_bound, paused=None):
+    """Set this call's cancel, join every started thread, and assert each stopped.
+
+    Callers close pipes only after this returns. cancel is set before any join.
+    The consumer join bound is the documented 2s. A pause thread, when this call
+    armed one, is released and joined here too.
+    """
+    cancel.set()
+    release_helper.set()
+    phase.after_pipe = None
+    if finish is not None:
+        finish()
+    _join_started(consumer, 2)
+    _join_started(watchdog, watchdog_bound)
+    if paused is not None:
+        _release_publication_hold(phase, paused)
+    assert consumer is None or not consumer.is_alive()
+    assert watchdog is None or not watchdog.is_alive()
+    assert paused is None or not paused.is_alive()
+
+
+def _release_publication_hold(phase, thread):
+    """Clear this call's hook and finish its pause thread."""
+    cancel = phase.hold_cancel
+    phase.hold_cancel = None
+    hook = phase.before_ready
+    phase.before_ready = None
+    if cancel is not None:
+        cancel.set()
+    if hook is not None:
+        hook[0].set()
+        hook[1].set()
+    _join_started(thread, 2)
+
+
+def _arm_pre_publication_hold(phase, bound):
+    """Suspend the helper after observation and before it publishes the latch.
+
+    The hook lives on this phase. Installation and thread start share one
+    cleanup, so a start failure leaves no hook and no thread.
+    """
+    from threading import Event, Thread
+    saw, hold, cancel = Event(), Event(), Event()
+
+    def pause():
+        try:
+            if saw.wait(30):
+                cancel.wait(bound)  # Crosses startup expiry; shorter than fault + cleanup.
+        finally:
+            hold.set()
+
+    thread = Thread(target=pause, daemon=True)
+    try:
+        phase.hold_cancel = cancel
+        phase.before_ready = (saw, hold)
+        thread.start()
+    except BaseException:
+        phase.before_ready = None
+        phase.hold_cancel = None
+        cancel.set()
+        saw.set()
+        hold.set()
+        _join_started(thread, 1)
+        raise
+    return hold, thread
+
+
+def _spawn_race(worker, arguments, *, timeout=30, initializer=None, initargs=(), after_send=None,
+                ready=None, launch_delay=0, phase=None):
+    """Own each spawned worker and escalate cleanup without unbounded joins.
+
+    timeout is measured from start unless ready is given. ready is an event the
+    worker sets once it has entered the fault; the deadline then restarts so
+    spawn latency is not part of that bound. The default remains 30s.
+    """
+    from concurrent.futures import FIRST_EXCEPTION, Future, wait
+    from threading import Event, Thread
+    from time import monotonic
+    context = multiprocessing.get_context("spawn")
+    processes, connections, readers, pending = [], [], [], []
+
+    def receive(reader, future):
+        try:
+            raw = reader.recv_bytes(65536)
+            text = primitives.json_preflight(raw, max_bytes=65536, max_depth=32,
+                max_nodes=4096, max_items=4096, max_string=65536)
+            outcome = primitives.strict_loads(text)
+            assert isinstance(outcome, dict), "invalid spawned race outcome"
+            if outcome.get("status") == "ok" and set(outcome) == {"status", "value"}:
+                future.set_result(outcome["value"])
+                return
+            assert set(outcome) == {"status", "kind", "message"}, "invalid spawned race failure"
+            assert outcome["status"] == "error", "invalid spawned race failure status"
+            kind, message = outcome["kind"], outcome["message"]
+            assert isinstance(kind, str) and len(kind) <= 80, "invalid spawned race error kind"
+            assert isinstance(message, str) and len(message) <= 512, "invalid spawned race error message"
+            error_type = {"ValueError": ValueError, "TimeoutError": FutureTimeoutError}.get(kind, AssertionError)
+            future.set_exception(error_type(message))
+        except EOFError:
+            future.set_exception(FutureTimeoutError("spawned race worker exited without a result"))
+        except BaseException:
+            future.set_exception(AssertionError("invalid spawned race outcome"))
+
+    try:
+        if launch_delay:
+            Event().wait(launch_delay)  # Injected launch time, before the readiness wait.
+        deadline = monotonic() + timeout
+        for argument in arguments:
+            reader, writer = context.Pipe(duplex=False)
+            connections.extend((reader, writer))
+            process = context.Process(target=_race_process,
+                args=(worker, argument, writer, initializer, initargs, after_send))
+            processes.append(process)
+            process.start()
+            writer.close()
+            future = Future()
+            pending.append(future)
+            thread = Thread(target=receive, args=(reader, future), daemon=True)
+            readers.append(thread)
+            thread.start()
+        if ready is not None:
+            # Poll only. The helper sets phase.ready at that observation, before
+            # any later consumer of the byte. Peers still see it. The deadline
+            # restarts from the latch, not from before the helper call.
+            latch = None if phase is None else phase.ready
+            if not _publish_ready(ready, latch, phase):
+                raise AssertionError("blocked worker did not enter")
+            origin = monotonic()
+            if phase is not None and phase.t_ready is not None:
+                origin = phase.t_ready
+            deadline = origin + timeout
+        completed, incomplete = wait(pending, timeout=max(0, deadline - monotonic()),
+                                     return_when=FIRST_EXCEPTION)
+        for future in completed:
+            if future.exception() is not None:
+                future.result()
+        if incomplete:
+            raise FutureTimeoutError()
+        for process in processes:
+            process.join(max(0, deadline - monotonic()))
+            if process.is_alive():
+                raise FutureTimeoutError()
+            if process.exitcode != 0:
+                raise AssertionError("race worker exited with status " + str(process.exitcode))
+        return [future.result() for future in pending]
+    finally:
+        try:
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+            deadline = monotonic() + 0.5
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.kill()
+            deadline = monotonic() + 2
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            deadline = monotonic() + 2
+            for thread in readers:
+                if thread.ident is not None:
+                    thread.join(max(0, deadline - monotonic()))
+            assert not any(process.is_alive() for process in processes), "race worker survived kill"
+            assert not any(thread.is_alive() for thread in readers), "race result reader did not stop"
+        finally:
+            for connection in connections:
+                connection.close()
+            for process in processes:
+                if not process.is_alive():
+                    process.close()
+
+
+def _hang_after_race_result():
+    from threading import Event, Thread
+    Thread(target=Event().wait, args=(30,), daemon=False).start()
+
+
+def _exit_after_race_result():
+    raise SystemExit(7)
+
+
+@pytest.mark.parametrize("shutdown", ["hang", "exit"])
+def test_spawn_race_requires_clean_exit_after_result(shutdown):
+    callback = _hang_after_race_result if shutdown == "hang" else _exit_after_race_result
+    expected = FutureTimeoutError if shutdown == "hang" else AssertionError
+    message = None if shutdown == "hang" else "^race worker exited with status 7$"
+    with pytest.raises(expected, match=message):
+        _spawn_race(_race_control_worker, ["return"], timeout=5, after_send=callback)
+    assert multiprocessing.active_children() == []
+    assert _spawn_race(_race_control_worker, ["return"]) == ["spawn"]
+    assert multiprocessing.active_children() == []
+
+
+def test_consumed_readiness_byte_is_not_a_false_rescue():
+    """Helper observes the byte; a later is_set leaves that byte in place."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release, polled, release_poll = Event(), Event(), Event()
+    entered.after_poll = (polled, release_poll)
+    phase = _PhaseStart()
+    finish, rescued, seen, watchdog = _start_phased_watchdog(
+        release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+        fault=2, cleanup=_REAP_LIMIT, phase=phase)
+    worker = Thread(target=entered.set, daemon=True)
+
+    def helper():
+        assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+    helper_thread = Thread(target=helper, daemon=True)
+    try:
+        worker.start()
+        helper_thread.start()
+        assert polled.wait(5), "helper did not see the readiness byte"
+        assert entered.is_set(), "helper observation was not visible to is_set"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        release_poll.set()
+        assert phase.accepted.wait(5), "watchdog did not accept the helper latch"
+        assert seen.is_set(), "helper did not publish the readiness latch"
+        assert not rescued.is_set(), "a later is_set marked a rescue"
+    finally:
+        release_poll.set()
+        finish()
+        if worker.ident is not None:
+            worker.join(2)
+        if helper_thread.ident is not None:
+            helper_thread.join(2)
+        if watchdog.ident is not None:
+            watchdog.join(_READY_LIMIT + 2)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert entered.signaled
+    assert not rescued.is_set()
+
+
+def test_rescue_grace_on_consumed_readiness_byte():
+    """Startup expiry before publication is not a rescue for the consumed-byte caller."""
+    from threading import Event, Thread
+    assert _PROMPT_STARTUP < _PROMPT_HOLD < 2 + _REAP_LIMIT
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release, polled, release_poll = Event(), Event(), Event()
+    entered.after_poll = (polled, release_poll)
+    phase = _PhaseStart()
+    paused = None
+    finish = None
+    watchdog = None
+    worker = None
+    helper_thread = None
+    rescued = None
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _PROMPT_HOLD)
+        finish, rescued, seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP,
+            fault=2, cleanup=_REAP_LIMIT, phase=phase)
+        worker = Thread(target=entered.set, daemon=True)
+
+        def helper():
+            assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+        helper_thread = Thread(target=helper, daemon=True)
+        worker.start()
+        helper_thread.start()
+        assert polled.wait(5), "helper did not see the readiness byte"
+        assert entered.is_set(), "helper observation was not visible to is_set"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        release_poll.set()
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert seen.is_set(), "helper did not publish the readiness latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+    finally:
+        _release_publication_hold(phase, paused)
+        release_poll.set()
+        if finish is not None:
+            finish()
+        _join_started(worker, 2)
+        _join_started(helper_thread, 2)
+        _join_started(watchdog, _PROMPT_STARTUP + 2 + _REAP_LIMIT + 1)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert entered.signaled
+    assert rescued is not None and not rescued.is_set()
+
+
+def test_is_set_before_helper_poll_is_not_a_false_rescue():
+    """is_set is the first observer and leaves the byte for a later poll."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release = Event()
+    at_poll, release_poll = Event(), Event()
+    consumed, release_assign = Event(), Event()
+    phase = _PhaseStart()
+    finish = None
+    watchdog = None
+    worker = None
+    helper_thread = None
+    checker = None
+    try:
+        phase.before_poll = (at_poll, release_poll)
+        entered.before_assign = (consumed, release_assign)
+        finish, rescued, seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP,
+            fault=2, cleanup=_REAP_LIMIT, phase=phase)
+        worker = Thread(target=entered.set, daemon=True)
+
+        def helper():
+            assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+        helper_thread = Thread(target=helper, daemon=True)
+        checker = Thread(target=entered.is_set, daemon=True)
+        worker.start()
+        assert reader.poll(5), "worker did not send readiness"
+        helper_thread.start()
+        assert at_poll.wait(5), "helper did not reach the readiness poll"
+        checker.start()
+        assert consumed.wait(5), "is_set did not observe the readiness byte"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        assert entered.signaled, "is_set did not record readiness before its hook"
+        assert seen.is_set(), "is_set did not publish the helper latch before its hook"
+        release_assign.set()
+        release_poll.set()
+        helper_thread.join(2)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "is_set before the helper poll marked a rescue"
+    finally:
+        release_assign.set()
+        release_poll.set()
+        phase.before_poll = None
+        if finish is not None:
+            finish()
+        _join_started(checker, 2)
+        _join_started(worker, 2)
+        _join_started(helper_thread, 2)
+        _join_started(watchdog, _PROMPT_STARTUP + 2 + _REAP_LIMIT + 1)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert not rescued.is_set()
+
+
+def _init_visible_ready(entered, release, seen_writer):
+    _race_control_init(entered, release, 0)
+    _RACE_CONTROL.seen_writer = seen_writer
+
+
+def _raise_after_peer_visible(action):
+    if action == "blocked":
+        _RACE_CONTROL.entered.set()
+        assert _RACE_CONTROL.release.wait(60), "control was not released"
+        return "released"
+    assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+    _RACE_CONTROL.seen_writer.send_bytes(b"s")
+    raise ValueError("race control failed")
+
+
+def test_byte_consumed_before_observer_poll_is_not_a_false_rescue():
+    """Helper sees the byte; the parent consumes it before any later poll."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    seen_reader, seen_writer = context.Pipe(duplex=False)
+    helper_polled, release_helper, cancel = Event(), Event(), Event()
+    phase = _PhaseStart()
+    controls = None
+    finish = None
+    watchdog = None
+    consumer = None
+    try:
+        controls = _PipeControls(context)
+        entered, release = controls.entered, controls.release
+        phase.after_pipe = (helper_polled, release_helper)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=2, cleanup=_REAP_LIMIT + _RETRY_LIMIT, phase=phase)
+
+        def consume():
+            try:
+                if not _wait_or_cancel(helper_polled, cancel, 15):
+                    return
+                if not _poll_or_cancel(seen_reader, cancel, 15):
+                    return
+                if seen_reader.recv_bytes(1) != b"s":
+                    return
+                entered.is_set()
+            finally:
+                release_helper.set()
+
+        consumer = Thread(target=consume, daemon=True)
+        consumer.start()
+        with pytest.raises(ValueError, match="^race control failed$"):
+            _spawn_race(_raise_after_peer_visible, ["raise", "blocked"], timeout=2,
+                        ready=entered, initializer=_init_visible_ready,
+                        initargs=(entered, controls.worker_release, seen_writer),
+                        phase=phase)
+        accepted = phase.accepted.wait(_READY_LIMIT + 2)
+        assert accepted and not rescued.is_set(), (
+            "consuming the readiness byte before a watchdog poll marked a rescue")
+    finally:
+        try:
+            _end_consumer_call(
+                cancel, release_helper, phase, finish, consumer, watchdog, 10)
+        finally:
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                seen_reader.close()
+                seen_writer.close()
+
+
+def test_rescue_grace_on_byte_consumed_before_observer_poll():
+    """Startup expiry before publication is not a rescue for the consumed-byte spawn."""
+    from threading import Event, Thread
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    context = multiprocessing.get_context("spawn")
+    seen_reader, seen_writer = context.Pipe(duplex=False)
+    helper_polled, release_helper, cancel = Event(), Event(), Event()
+    phase = _PhaseStart()
+    controls = None
+    paused = None
+    finish = None
+    watchdog = None
+    consumer = None
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        controls = _PipeControls(context)
+        entered, release = controls.entered, controls.release
+        phase.after_pipe = (helper_polled, release_helper)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=fault, cleanup=cleanup, phase=phase)
+
+        def consume():
+            try:
+                if not _wait_or_cancel(helper_polled, cancel, 15):
+                    return
+                if not _poll_or_cancel(seen_reader, cancel, 15):
+                    return
+                if seen_reader.recv_bytes(1) != b"s":
+                    return
+                entered.is_set()
+            finally:
+                release_helper.set()
+
+        consumer = Thread(target=consume, daemon=True)
+        consumer.start()
+        with pytest.raises(ValueError, match="^race control failed$"):
+            _spawn_race(_raise_after_peer_visible, ["raise", "blocked"], timeout=fault,
+                        ready=entered, initializer=_init_visible_ready,
+                        initargs=(entered, controls.worker_release, seen_writer),
+                        phase=phase)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+    finally:
+        try:
+            _end_consumer_call(
+                cancel, release_helper, phase, finish, consumer, watchdog,
+                _READY_LIMIT + fault + cleanup + 1, paused)
+        finally:
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                seen_reader.close()
+                seen_writer.close()
+
+
+def test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue():
+    """A timed stall before publication must not rescue a live fault."""
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_race_control_worker, ["blocked", "blocked"], timeout=fault,
+                                ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert not rescued.is_set(), (
+                    "preemption before publication marked a rescue")
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def test_rescue_grace_on_blocked_spawn():
+    """Startup expiry before publication is not a rescue for the blocked spawn."""
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_race_control_worker, ["blocked", "blocked"], timeout=fault,
+                                ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def _race_control_init(entered, release, startup_delay=0):
+    _RACE_CONTROL.entered, _RACE_CONTROL.release = entered, release
+    _RACE_CONTROL.startup_delay = startup_delay
+
+
+def _race_control_worker(action):
+    if action == "return":
+        return multiprocessing.get_start_method()
+    if action == "raise":
+        assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        raise ValueError("race control failed")
+    if action == "exit":
+        assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        os._exit(7)
+    delay = getattr(_RACE_CONTROL, "startup_delay", 0)
+    if delay:
+        from threading import Event
+        Event().wait(delay)  # Injected before readiness; the fault clock starts later.
+    if action == "ignore":
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _RACE_CONTROL.entered.set()
+    assert _RACE_CONTROL.release.wait(60), "control was not released"
+    if action == "ignore":
+        os._exit(0)
+    return "released"
+
+
+@pytest.mark.parametrize("startup_delay,launch_delay", [(0, 0), (3, 0), (3, 3)])
+@pytest.mark.parametrize("action,timeout", [("blocked", 2), ("exit", 2), ("raise", 2),
+                                         ("raise-later", 2), ("ignore", 2)])
+def test_spawn_race_failure_reaps_workers_before_retry(action, timeout, startup_delay,
+                                                       launch_delay):
+    if action == "ignore" and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        phase = _PhaseStart()
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=timeout, cleanup=_REAP_LIMIT + _RETRY_LIMIT, phase=phase)
+        try:
+            expected = ValueError if action in {"raise", "raise-later"} else FutureTimeoutError
+            message = "^race control failed$" if action in {"raise", "raise-later"} else None
+            actions = (["ignore"] * 2 if action == "ignore" else
+                       ["raise", "blocked"] if action == "raise" else
+                       ["blocked", "raise"] if action == "raise-later" else ["blocked", action])
+            with pytest.raises(expected, match=message):
+                _spawn_race(_race_control_worker, actions, timeout=timeout, ready=entered,
+                            initializer=_race_control_init,
+                            initargs=(entered, controls.worker_release, startup_delay),
+                            launch_delay=launch_delay, phase=phase)
+            assert entered.is_set(), "failure control never reached its blocked worker"
+            assert not rescued.is_set(), "pool shutdown waited for the blocked worker"
+            assert multiprocessing.active_children() == []
+            assert _spawn_race(_race_control_worker, ["return"] * 2) == ["spawn"] * 2
+            assert multiprocessing.active_children() == []
+        finally:
+            finish()
+            if watchdog.ident is not None:
+                watchdog.join(10)
+            assert not watchdog.is_alive()
+
+
+@pytest.mark.parametrize("action", ["blocked", "exit", "raise", "raise-later", "ignore"])
+def test_rescue_grace_before_publication_on_spawn_failure(action):
+    """Startup expiry before publication still yields the spawn-race fault."""
+    if action == "ignore" and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                expected = ValueError if action in {"raise", "raise-later"} else FutureTimeoutError
+                message = "^race control failed$" if action in {"raise", "raise-later"} else None
+                actions = (["ignore"] * 2 if action == "ignore" else
+                           ["raise", "blocked"] if action == "raise" else
+                           ["blocked", "raise"] if action == "raise-later" else ["blocked", action])
+                with pytest.raises(expected, match=message):
+                    _spawn_race(_race_control_worker, actions, timeout=fault, ready=entered,
+                                initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert entered.is_set(), "failure control never reached its blocked worker"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+                assert _spawn_race(_race_control_worker, ["return"] * 2) == ["spawn"] * 2
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+@pytest.mark.parametrize("limit,bound", [("bytes", 0), ("depth", 2), ("nodes", 11),
+                                         ("items", 4), ("string", 13)])
+@pytest.mark.parametrize("as_bytes", [False, True])
+@pytest.mark.parametrize("over", [False, True])
+def test_json_preflight_inline_boundaries(monkeypatch, limit, bound, as_bytes, over):
+    value = item(title="Work")
+    raw = json.dumps(value, separators=(",", ":"))
+    if limit == "bytes":
+        bound = len(raw.encode("utf-8"))
+    limits = dict(bytes=1000, depth=16, nodes=100, items=100, string=100)
+    limits[limit] = bound - int(over)
+    monkeypatch.setattr(queue, "MAX_BYTES", limits["bytes"])
+    monkeypatch.setattr(queue, "MAX_JSON_DEPTH", limits["depth"])
+    monkeypatch.setattr(queue, "MAX_JSON_NODES", limits["nodes"])
+    monkeypatch.setattr(queue, "MAX_JSON_ITEMS", limits["items"])
+    monkeypatch.setattr(queue, "MAX_JSON_STRING", limits["string"])
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    if as_bytes:
+        raw = raw.encode("utf-8")
+    for _ in range(2):
+        result = queue.parse_item(raw)
+        if over:
+            assert result == {"refused": True, "reason": "invalid_item",
+                              "next_action": "Supply a bounded queue item with the documented fields and single-line values."}
+        else:
+            assert result == {"refused": False, "item": value}
+    assert len(parsed) == (0 if over else 2)
+
+
+@pytest.mark.parametrize("string_units", ["escaped", "source"])
+@pytest.mark.parametrize("raw,limit,bound", [
+    ('"é"', "bytes", 4), ('[[0]]', "depth", 2), ('[0,0]', "nodes", 3),
+    ('[0,0]', "items", 2), ('{"a":0,"b":0}', "items", 2),
+    ('"abcd"', "string", 4), ('"\\u0061\\u0062"', "string", 2),
+    ('"\\\\\\""', "string", 2), ('1234', "atom", 4),
+])
+@pytest.mark.parametrize("over", [False, True])
+def test_shared_json_preflight_boundaries(string_units, raw, limit, bound, over):
+    if limit == "string" and string_units == "source":
+        bound = len(raw) - 1  # Includes the closing quote, as the queue always has.
+    limits = dict(max_bytes=100, max_depth=16, max_nodes=100, max_items=100,
+                  max_string=100, max_atom=64)
+    limits["max_" + limit] = bound - int(over)
+    for value in (raw, raw.encode("utf-8")):
+        if over:
+            reason = {"bytes": "size", "depth": "nesting", "items": "container"}.get(limit, limit)
+            with pytest.raises(ValueError, match="^" + reason + "$"):
+                primitives.json_preflight(value, string_units=string_units, **limits)
+        else:
+            assert primitives.json_preflight(value, string_units=string_units, **limits) == raw
+
+
+@pytest.mark.parametrize("over", [False, True])
+def test_json_atom_limit_precedes_parser(monkeypatch, over):
+    raw = json.dumps(item(hold=True))
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "MAX_JSON_ATOM", 4 - int(over))
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    assert queue.parse_item(raw)["reason"] == "invalid_item"
+    assert parsed == ([] if over else [raw])
+
+
+@pytest.mark.parametrize("raw", ['"é"', '"😀"'])
+@pytest.mark.parametrize("as_bytes", [False, True])
+def test_shared_json_byte_limit_is_utf8_before_parsing(raw, as_bytes):
+    value = raw.encode("utf-8") if as_bytes else raw
+    limits = dict(max_bytes=len(raw.encode("utf-8")), max_depth=16,
+                  max_nodes=100, max_items=100, max_string=100)
+    assert primitives.json_preflight(value, **limits) == raw
+    limits["max_bytes"] -= 1
+    with pytest.raises(ValueError, match="^size$"):
+        primitives.json_preflight(value, **limits)
+
+
+def _threaded_json_preflight(arguments):
+    from aegis_core import team_profile
+    root, expected = arguments
+    def observe(index):
+        raw = json.dumps(item()) if index % 2 else "["
+        inline = queue.parse_item(raw)
+        loaded = team_profile.load(root, user_root=root)
+        assert loaded == expected
+        return inline["refused"]
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        assert list(workers.map(observe, range(24))) == [i % 2 == 0 for i in range(24)]
+
+
+def test_json_preflight_callers_share_no_concurrent_state(make_store):
+    from aegis_core import team_profile
+    root = make_store
+    target = root.joinpath(*team_profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(b'{"version":1}')
+    expected = team_profile.load(root, user_root=root)
+    _spawn_race(_threaded_json_preflight, [(root, expected)])
+
+
+@pytest.mark.parametrize("verb", ["add", "list", "audit", "compact", "claim", "release", "unclaim", "done"])
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b'{"version":NaN}', b'{"version":1,"version":1}', b" " * 101])
+def test_json_caller_refusal_golden(make_store, monkeypatch, verb, raw):
+    root = make_store
+    add(root)
+    target = root / ".aegis/state/team-queue.json"
+    target.write_bytes(raw)
+    monkeypatch.setattr(queue, "MAX_BYTES", 100)
+    arguments = {"now": 100}
+    if verb == "add":
+        arguments["item"] = item("TWO")
+    elif verb in ("claim", "release", "unclaim", "done"):
+        arguments.update(identifier="ONE", expect="a" * 64, lane="alpha")
+        if verb == "unclaim":
+            arguments["writer_stopped"] = True
+    for _ in range(2):
+        result = getattr(queue, verb)(root, **arguments)
+        assert result == {
+            "schema": "aegis.team.queue." + verb + "/v1",
+            "source": "aegis team queue " + verb, "aegis_version": result["aegis_version"],
+            "checked_at": "1970-01-01T00:01:40Z", "scope": {},
+            "refused": True, "status": "refused", "exit_code": 1,
+            "reason": "invalid_queue_state",
+            "next_action": "Ask the coordinator to repair the queue state from trusted evidence.",
+        }
+        assert target.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b"NaN", b'{"id":1,"id":1}', "\ud800", None])
+def test_json_inline_refusal_golden(raw):
+    assert queue.parse_item(raw) == {
+        "refused": True, "reason": "invalid_item",
+        "next_action": "Supply a bounded queue item with the documented fields and single-line values.",
+    }
+
+
+@pytest.fixture
+def make_store(tmp_path):
+    if not queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    if shutil.which("git") is None:
+        pytest.skip("requires git")
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / ".aegis").mkdir()
+    (root / ".aegis" / "team.json").write_text(json.dumps({
+        "v": 1, "lanes": {"alpha": ["src/**"], "beta": ["docs/**"]}}), encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    # Restored by the repository's autouse environment-isolation fixture.
+    os.environ.update({"HOME": str(home), "USERPROFILE": str(home)})
+    return root
+
+
+def item(identifier="ONE", **fields):
+    return {"id": identifier, "title": "Queue work", "paths": ["src/**"],
+            "capabilities": ["core"], **fields}
+
+
+def test_partial_views_preserve_full_results_and_skip_item_projection(make_store, monkeypatch):
+    root = make_store
+    revision = add(root, hold="Await decision", hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    full_list = queue.list(root, now=101)
+    full_audit = queue.audit(root, now=101)
+    before = (root / ".aegis/state/team-queue.json").read_bytes()
+    def no_item_projection(*args, **kwargs):
+        pytest.fail("partial observations must not build full item views")
+    monkeypatch.setattr(queue, "_view", no_item_projection)
+    for _ in range(2):
+        small = queue.list(root, view="fingerprint", capabilities=["unrelated"], include_done=True, now=101)
+        assert small == {**{key: value for key, value in full_list.items() if key != "items"},
+                         "view": "fingerprint", "omitted": ["items", "completed_ids"],
+                         "next_action": "After a fingerprint change, run aegis team queue list --view full --json; the fingerprint never authorizes a claim."}
+        audit = queue.audit(root, view="findings", now=101)
+        assert audit["findings"] == full_audit["findings"]
+        assert audit["affected_items"] == [{"id": "ONE", "revision": revision, "lane": None,
+                                            "state": "queued", "lease_expired": False, "expires_at": None}]
+        assert audit["counts"] == {"items": 1, "findings": 1, "affected_items": 1}
+        assert audit["view"] == "findings" and audit["omitted"] == ["items"]
+        assert "aegis team queue list --include-done --view full --json" in audit["next_action"]
+        assert "items" not in audit
+    assert (root / ".aegis/state/team-queue.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_empty_failure_and_retry(make_store, verb, view):
+    root = make_store
+    observe = getattr(queue, verb)
+    empty = observe(root, view=view, now=100)
+    assert empty["exit_code"] == 0 and "items" not in empty
+    if verb == "audit":
+        assert empty["findings"] == [] and empty["affected_items"] == []
+        assert empty["counts"] == {"items": 0, "findings": 0, "affected_items": 0}
+    add(root)
+    state = root / ".aegis/state/team-queue.json"
+    original = state.read_bytes()
+    for raw in (b"{", b" " * (queue.MAX_BYTES + 1)):
+        state.write_bytes(raw)
+        assert observe(root, view=view, now=101) == observe(root, now=101)
+        assert state.read_bytes() == raw
+    state.write_bytes(original)
+    retried = observe(root, view=view, now=102)
+    assert retried["exit_code"] == 0
+    if verb == "audit":
+        assert retried["findings"] == [] and retried["affected_items"] == []
+        assert retried["counts"] == {"items": 1, "findings": 0, "affected_items": 0}
+    _spawn_race(_threaded_partial_view_retry, [(root, verb, view, retried)])
+
+
+def _threaded_partial_view_retry(arguments):
+    root, verb, view, retried = arguments
+    observe = getattr(queue, verb)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(observe, root, view=view, now=102) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [retried] * 3
+
+
+@pytest.mark.parametrize("verb,view", [("list", "findings"), ("audit", "fingerprint"),
+                                      ("list", ["full"]), ("audit", "private-value" * 4096)],
+                         ids=["list-wrong-view", "audit-wrong-view", "wrong-type", "oversized"])
+def test_invalid_view_precedes_platform_probe(monkeypatch, verb, view):
+    def unavailable():
+        pytest.fail("invalid view must refuse before platform discovery")
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+    result = getattr(queue, verb)(None, view=view, now=100)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_unsupported_platform(tmp_path, monkeypatch, verb, view):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = getattr(queue, verb)(tmp_path, view=view, now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+
+
+def _threaded_fingerprint_views(root):
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.list, root, view="fingerprint", now=101) for _ in range(3)]
+        results = [future.result(timeout=30) for future in futures]
+    return results
+
+
+def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
+    root = make_store
+    revision = add(root)
+    results = _spawn_race(_threaded_fingerprint_views, [root])[0]
+    assert results[0] == results[1] == results[2]
+    token = results[0]["claimable_fingerprint"]
+    assert queue.claim(root, "ONE", expect=token, lane="alpha", capabilities=["core"], now=101)["reason"] == "stale_revision"
+    claimed = claim(root, revision)
+    active = queue.list(root, view="fingerprint", now=102)
+    assert active["claimable_fingerprint"] != token
+    assert queue.list(root, view="fingerprint", now=112)["claimable_fingerprint"] != active["claimable_fingerprint"]
+    assert not claimed["refused"]
+
+
+def add(root, identifier="ONE", **fields):
+    result = queue.add(root, item(identifier, **fields), now=100)
+    assert not result["refused"], result
+    return result["item"]["revision"]
+
+
+def claim(root, revision, identifier="ONE", lane="alpha", now=101, ttl_s=10, branch="lane/alpha"):
+    return queue.claim(root, identifier, expect=revision, lane=lane,
+                       capabilities=["core"], ttl_s=ttl_s, now=now, branch=branch)
+
+
+def race_claim(arguments):
+    root, revision = arguments
+    return claim(root, revision)
+
+
+@pytest.mark.parametrize("spelling,accepted", [
+    ("/workspace", True), ("workspace", True), ("./workspace", True),
+    ("workspace/..cache", True), ("C:workspace", True), ("C:\\workspace", True),
+    ("C:..\\ws", False), ("C:..", False), ("\\..\\ws", False), ("ws/../x", False),
+    ("/workspace/../other", False), ("workspace\\..\\other", False),
+    ("", False), ("/workspace/\x00", False), (None, False), (1, False), (b"/workspace", False),
+    ("x" * 32768, True), ("x" * 32769, False),
+    ("/" * 256, True), ("/" * 257, False), ("\\" * 257, False),
+    ("/" * 128 + "\\" * 129, False),
+], ids=["absolute", "relative", "current", "nonparent-name", "drive-relative", "drive-absolute",
+        "drive-parent", "drive-parent-only", "rooted-parent", "relative-parent", "absolute-parent",
+        "backslash-parent", "empty", "nul", "none", "integer", "bytes", "max-length", "over-length",
+        "max-depth", "over-depth", "backslash-depth", "mixed-depth"])
+def test_workspace_spelling_predicate_is_pure_and_cross_platform(spelling, accepted):
+    assert queue.valid_workspace_spelling(spelling) is accepted
+
+
+@pytest.mark.parametrize("spelling", ["C:..\\ws", "C:..", "\\..\\ws", "ws/../x"])
+@pytest.mark.parametrize("verb", ["list", "audit", "add"])
+def test_invalid_workspace_precedes_platform_and_filesystem_checks(monkeypatch, spelling, verb):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    arguments = {"item": item(), "caller": "owner"} if verb == "add" else {}
+    result = getattr(queue, verb)(spelling, now=100, **arguments)
+    assert result["refused"] is True and result["reason"] == "invalid_arguments"
+    assert result["exit_code"] == 2 and result["next_action"]
+    assert all(spelling not in value for value in result.values() if isinstance(value, str))
+
+
+def test_claim_cas_expiry_release_done_and_retry(make_store):
+    root = make_store
+    revision = add(root)
+    claimed = claim(root, revision)
+    assert not claimed["refused"]
+    token = claimed["item"]["revision"]
+    assert queue.list(root, now=102)["items"][0]["label"] == "alpha [ONE: Queue work]"
+    assert claim(root, revision)["reason"] == "stale_revision"
+    assert claim(root, token)["reason"] == "already_claimed"
+    assert queue.done(root, "ONE", expect=token, now=111)["reason"] == "lease_expired"
+    replacement = claim(root, token, lane="beta", now=111)
+    assert not replacement["refused"]
+    newer = replacement["item"]["revision"]
+    assert queue.release(root, "ONE", expect=token, now=112)["reason"] == "stale_revision"
+    released = queue.release(root, "ONE", expect=newer, lane="beta", now=112)
+    assert not released["refused"]
+    final = claim(root, released["item"]["revision"], now=113)
+    completed = queue.done(root, "ONE", expect=final["item"]["revision"], lane="alpha", now=114)
+    assert completed["item"]["state"] == "done"
+    assert queue.done(root, "ONE", expect=completed["item"]["revision"], now=115)["reason"] == "not_claimed"
+
+
+def test_concurrent_process_claims_have_one_winner(make_store):
+    root = make_store
+    revision = add(root)
+    results = _spawn_race(race_claim, [(root, revision)] * 2)
+    assert sorted(result["refused"] for result in results) == [False, True]
+    assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
+
+
+def test_capabilities_dependencies_and_typed_holds(make_store):
+    root = make_store
+    revision = add(root, hold_until=[{"kind": "owner"}], after=["MISSING"])
+    refused = claim(root, revision)
+    assert refused["reason"] == "blocked"
+    assert {row["reason"] for row in refused["blockers"]} == {"owner", "after"}
+    assert all(row["refused"] and row["next_action"] for row in refused["blockers"])
+    assert queue.list(root, capabilities=["docs"], now=101)["items"] == []
+    assert queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=[], now=101)["reason"] == "capability_mismatch"
+
+
+def test_missing_lane_config_is_coordinator_condition(make_store):
+    root = make_store
+    revision = add(root)
+    (root / ".aegis" / "team.json").unlink()
+    result = claim(root, revision)
+    assert result["reason"] == "blocked"
+    assert result["blockers"][0]["reason"] == "coordinator"
+    assert queue.audit(root, now=101)["findings"][0]["code"] == "WAITING_ONLY_COORDINATOR"
+
+
+def test_milestone_and_lease_free_evaluated_at_claim(make_store):
+    root = make_store
+    revision = add(root, hold_until=[{"kind": "milestone", "name": "landed"},
+                                    {"kind": "lease_free", "paths": ["src/**"]}])
+    lease = team.claim(root, "beta", ["src/**"], owner="owner", now=100, ttl_s=10)
+    result = claim(root, revision)
+    assert {row["reason"] for row in result["blockers"]} == {"milestone", "lease_free", "foreign_lease"}
+    state = root / ".aegis" / "state" / "team-queue.json"
+    document = json.loads(state.read_text(encoding="utf-8"))
+    document["milestones"] = ["landed"]
+    state.write_text(json.dumps(document), encoding="utf-8")
+    assert claim(root, revision)["reason"] == "blocked"
+    assert not claim(root, revision, now=110)["refused"]
+    assert lease.lease.expired(110)
+
+
+@pytest.mark.parametrize("held,wanted,blocked", [
+    ("/pyproject.toml", "/pyproject.toml", True),
+    ("/pyproject.toml", "/nested/pyproject.toml", False),
+    ("pyproject.toml", "/nested/pyproject.toml", True),
+    ("/docs/", "/docs/guide.md", True),
+    ("/docs/", "/docs2/guide.md", False),
+    ("src/*.rs", "src/readme.txt", True),
+])
+def test_repository_lease_free_uses_lease_path_semantics_and_expiry(make_store, held, wanted, blocked):
+    root = make_store
+    revision = add(root, paths=["work/**"], hold_until=[{"kind": "lease_free", "paths": [wanted]}])
+    team.claim(root, "beta", [held], owner="owner", now=100, ttl_s=10)
+    result = claim(root, revision)
+    if blocked:
+        assert result["reason"] == "blocked"
+        assert any(row["reason"] == "lease_free" for row in result["blockers"])
+    else:
+        # The external lane still occupies the default writer slot, even when
+        # its anchored scope does not cover this hold's path.
+        assert result["reason"] == "capacity_full"
+    listed = queue.list(root, now=101)
+    assert any(row["reason"] == "lease_free" for row in listed["items"][0]["blockers"]) is blocked
+    assert not claim(root, revision, now=110)["refused"]
+
+
+@pytest.mark.parametrize("held,wanted,blocked", [
+    ("/pyproject.toml", "/nested/pyproject.toml", False),
+    ("pyproject.toml", "/nested/pyproject.toml", True),
+    ("/docs/", "/docs/guide.md", True),
+    ("src/*.rs", "src/readme.txt", True),
+])
+@pytest.mark.parametrize("judgment", ("scope", "lease_free"))
+def test_queue_lease_paths_gate_scope_and_holds_with_release_retry(make_store, held, wanted, blocked, judgment):
+    root = make_store
+    first = add(root, paths=[held])
+    second = add(root, "TWO", paths=[wanted] if judgment == "scope" else ["work/**"],
+                 hold_until=[] if judgment == "scope" else [{"kind": "lease_free", "paths": [wanted]}])
+    active = claim(root, first)
+    assert not active["refused"]
+    result = claim(root, second, "TWO", lane="beta")
+    if blocked:
+        assert result["reason"] == "blocked"
+        expected = "scope_overlap" if judgment == "scope" else "lease_free"
+        assert any(row["reason"] == expected for row in result["blockers"])
+    else:
+        assert result["reason"] == "capacity_full"
+    assert not queue.release(root, "ONE", expect=active["item"]["revision"], lane="alpha", now=102)["refused"]
+    assert not claim(root, second, "TWO", lane="beta", now=103)["refused"]
+
+
+def race_scoped_claim(arguments):
+    root, revision, identifier, lane = arguments
+    return claim(root, revision, identifier, lane=lane)
+
+
+def test_concurrent_overlapping_lease_scopes_have_one_winner(make_store):
+    root = make_store
+    first = add(root, paths=["/src/one.py"])
+    second = add(root, "TWO", paths=["/src/*.txt"])
+    results = _spawn_race(race_scoped_claim, [(root, first, "ONE", "alpha"),
+                                            (root, second, "TWO", "beta")])
+    assert sorted(row["refused"] for row in results) == [False, True]
+    loser = next(row for row in results if row["refused"])
+    assert loser["reason"] == "blocked"
+    assert any(row["reason"] == "scope_overlap" for row in loser["blockers"])
+
+
+def test_audit_identifies_satisfied_conditions_and_judgment_hold(make_store):
+    root = make_store
+    add(root, hold="Await decision", hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    result = queue.audit(root, now=101)
+    assert [row["code"] for row in result["findings"]] == ["CONDITIONS_MET_STILL_HELD"]
+    assert result["findings"][0]["next_action"]
+
+
+def test_writer_capacity_comes_from_layered_profile_and_release_frees_slot(make_store):
+    root = make_store
+    first = add(root)
+    second = add(root, "TWO", paths=["docs/**"])
+    claimed = claim(root, first)
+    assert claim(root, second, "TWO", lane="beta")["reason"] == "capacity_full"
+    queue.release(root, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not claim(root, second, "TWO", lane="beta", now=103)["refused"]
+
+
+@pytest.mark.parametrize("value", [None, {}, item(id="../escape"), item(title="one\ntwo"),
+                                  item(paths=["../outside"]), item(paths=["/../outside"]),
+                                  item(paths=["C:/outside"]), item(paths=["src\\outside"]),
+                                  item(capabilities=["core"] * 129),
+                                  item(hold_until=[{"kind": "unknown"}]), item(unknown=True)])
+def test_malformed_items_refuse_without_echo_or_write(make_store, value):
+    result = queue.add(make_store, value, now=100)
+    assert result["refused"] and result["reason"] == "invalid_item" and result["next_action"]
+    assert not (make_store / ".aegis" / "state").exists()
+
+
+def test_unsupported_platform_has_stable_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    for verb, kwargs in [("list", {}), ("audit", {}), ("compact", {}), ("add", {"item": item()})]:
+        result = getattr(queue, verb)(tmp_path, **kwargs)
+        assert result["reason"] == "unsupported_platform" and result["refused"]
+
+
+def test_symlinked_state_is_refused_without_touching_target(make_store, tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir()
+    symlink_or_skip(target, make_store / ".aegis" / "state", target_is_directory=True)
+    assert queue.add(make_store, item(), now=100)["reason"] == "queue_io_unavailable"
+    assert list(target.iterdir()) == []
+
+
+def test_size_limit_before_json_parse_and_lock_timeout(make_store, monkeypatch):
+    root = make_store
+    add(root)
+    state = root / ".aegis" / "state" / "team-queue.json"
+    state.write_bytes(b" " * (queue.MAX_BYTES + 1))
+    assert queue.list(root, now=101)["reason"] == "queue_size_limit"
+    assert queue.parse_item("[" * 10000)["reason"] == "invalid_item"
+    def timeout(*args, **kwargs):
+        raise storage.LockTimeoutError("untrusted detail")
+    monkeypatch.setattr(queue, "locked", timeout)
+    result = queue.add(root, item("TWO"), now=101)
+    assert result["reason"] == "queue_lock_timeout"
+    assert "untrusted detail" not in json.dumps(result)
+
+
+def test_read_keeps_its_opened_file_during_an_ancestor_swap(make_store, tmp_path, monkeypatch):
+    root = make_store
+    add(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = root / ".aegis"
+    moved = root / "original-aegis"
+
+    def opened(path, *args, **kwargs):
+        fd = os.open(path, *args, **kwargs)
+        if path == "team.json":
+            original.rename(moved)
+            symlink_or_skip(outside, original, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(storage_confined, "os", SimpleNamespace(**{**vars(os), "open": opened}))
+    result = queue.list(root, now=101)
+    assert not result["refused"], result
+    assert list(outside.iterdir()) == []
+    assert result["items"][0]["id"] == "ONE"
+
+
+@pytest.mark.parametrize("failure", ["open", "fstat", "read", "write", "fsync", "replace"])
+def test_descriptor_failures_close_handles_and_refuse_without_echo(make_store, monkeypatch, failure):
+    root = make_store
+    add(root)
+    state = root / ".aegis" / "state" / "team-queue.json"
+    before = state.read_bytes()
+    live = set()
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        os.close(fd)
+        live.remove(fd)
+
+    def failed(*args, **kwargs):
+        raise OSError("token=private-value\nuntrusted")
+
+    proxy = SimpleNamespace(**{**vars(os),
+        "open": failed if failure == "open" else opened, "close": closed,
+        "fstat": failed if failure == "fstat" else os.fstat,
+        "read": failed if failure == "read" else os.read,
+        "write": failed if failure == "write" else os.write,
+        "fsync": failed if failure == "fsync" else os.fsync,
+        "replace": failed if failure == "replace" else os.replace})
+    def publication(*args, **kwargs):
+        # Scope the OS fault to the actual publisher. The workspace lock also
+        # uses atomicio's opener but closes through storage's OS reference.
+        monkeypatch.setattr(atomicio, "os", proxy)
+        try:
+            return atomicio.atomic_write_bytes(*args, **kwargs)
+        finally:
+            monkeypatch.setattr(atomicio, "os", os)
+
+    if failure in ("write", "fsync", "replace"):
+        monkeypatch.setattr(queue, "atomic_write_bytes", publication)
+    else:
+        monkeypatch.setattr(storage_confined, "os", proxy)
+    result = queue.add(root, item("TWO"), now=101)
+    assert result["reason"] == "queue_io_unavailable" and result["refused"]
+    assert "private-value" not in json.dumps(result)
+    assert not live
+    assert state.read_bytes() == before
+    if failure in ("write", "fsync", "replace"):
+        monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
+    else:
+        monkeypatch.setattr(storage_confined, "os", os)
+    assert not queue.add(root, item("TWO"), now=102)["refused"]
+
+
+def test_large_utf8_and_serialized_items_are_refused_without_changing_state(make_store):
+    root = make_store
+    add(root)
+    state = root / ".aegis" / "state" / "team-queue.json"
+    before = state.read_bytes()
+    assert queue.parse_item('"' + "😀" * (queue.MAX_BYTES // 4) + '"')["reason"] == "invalid_item"
+    oversized = item("TWO", invariants=["😀" * queue.MAX_TEXT] * queue.MAX_FIELDS)
+    assert queue.add(root, oversized, now=101)["reason"] == "queue_size_limit"
+    assert state.read_bytes() == before
+
+
+@pytest.mark.parametrize("raw", [b"{}", b'{"version":1,"version":1}', b"[", b"NaN"])
+def test_corrupt_queue_state_has_a_fixed_refusal(make_store, raw):
+    root = make_store
+    add(root)
+    (root / ".aegis" / "state" / "team-queue.json").write_bytes(raw)
+    result = queue.list(root, now=101)
+    assert result["reason"] == "invalid_queue_state" and result["exit_code"] == 1
+
+@pytest.mark.parametrize("text", ["é" * 4096, "😀" * 2048, "😀" * 4096], ids=["bmp", "astral-half", "astral-full"])
+@pytest.mark.parametrize("field", ["hold", "scope_rulings", "invariants"])
+def test_accepted_constraint_roundtrips_without_loss(make_store, text, field):
+    fields = {field: text if field == "hold" else [text]}
+    result = queue.add(make_store, item(**fields), now=100)
+    assert not result["refused"], result
+    assert result["item"][field] == fields[field]
+    listed = queue.list(make_store, now=101)
+    assert not listed["refused"], listed
+    assert listed["items"][0][field] == fields[field]
+
+
+def test_aggregate_parser_limit_refuses_before_publication_and_retry(make_store):
+    paths = ["scope/%03d" % index for index in range(128)]
+    conditions = [{"kind": "lease_free", "paths": paths} for _ in range(128)]
+    for index in range(4):
+        before = queue.list(make_store, now=100)
+        result = queue.add(make_store, item("HEAVY%d" % index, hold_until=conditions), now=100)
+        listed = queue.list(make_store, now=101)
+        assert not listed["refused"], (result, listed)
+        if result["refused"]:
+            assert result["reason"] == "queue_size_limit"
+            assert listed["items"] == before["items"]
+            assert not queue.add(make_store, item("SMALL"), now=102)["refused"]
+            break
+    else:
+        pytest.fail("aggregate parser limit was not exercised")
+
+
+def test_queue_transitions_have_correlated_events_and_lane_checks(make_store):
+    from aegis_core import events
+    root = make_store
+    added = queue.add(root, item(), now=100, caller="router")
+    assert not added["refused"]
+    claimed = queue.claim(root, "ONE", expect=added["item"]["revision"], lane="alpha",
+                          capabilities=["core"], now=101, caller="worker")
+    assert not claimed["refused"]
+    token = claimed["item"]["revision"]
+    assert queue.done(root, "ONE", expect=token, now=102)["reason"] == "lane_required"
+    assert queue.done(root, "ONE", expect=token, lane="beta", now=102)["reason"] == "lane_mismatch"
+    released = queue.release(root, "ONE", expect=token, lane="alpha", now=102, caller="worker")
+    assert not released["refused"]
+    claimed_again = queue.claim(root, "ONE", expect=released["item"]["revision"], lane="alpha",
+                                capabilities=["core"], now=103, caller="worker")
+    completed = queue.done(root, "ONE", expect=claimed_again["item"]["revision"], lane="alpha",
+                           now=104, caller="worker")
+    assert not completed["refused"]
+    rows = [row["detail"] for row in events.read(root).rows if row["detail"].get("queue") is True]
+    assert [row["action"] for row in rows] == ["add", "claim", "release", "claim", "done"]
+    assert rows[0]["caller"] == "router"
+    assert rows[1]["label"] == "alpha [ONE: Queue work]"
+    assert rows[1]["from_revision"] == added["item"]["revision"]
+    assert rows[1]["to_revision"] == claimed["item"]["revision"]
+    assert rows[2]["from_holder"] == "alpha" and rows[2]["to_holder"] is None
+    assert rows[2]["from_expires_at"] == claimed["item"]["expires_at"]
+    assert rows[-1]["to_revision"] == completed["item"]["revision"]
+
+
+@pytest.mark.parametrize("identifier", ["BL-AUTH", "BL-TOKEN", "BL-SECRET", "BL-CREDENTIAL"])
+def test_queue_labels_preserve_separately_validated_components(make_store, identifier):
+    from aegis_core import events
+    (make_store / ".aegis" / "team.json").write_text(
+        json.dumps({"v": 1, "lanes": {"docs": ["src/**"]}}), encoding="utf-8")
+    added = queue.add(make_store, item(identifier, title="Update guide"), now=100)
+    assert not added["refused"]
+    unclaimed_label = identifier + ": Update guide"
+    claimed_label = "docs [" + unclaimed_label + "]"
+    assert added["item"]["label"] == unclaimed_label
+    claimed = claim(make_store, added["item"]["revision"], identifier, lane="docs")
+    assert not claimed["refused"] and claimed["item"]["label"] == claimed_label
+    assert queue.list(make_store, now=102)["items"][0]["label"] == claimed_label
+    assert queue.audit(make_store, now=102)["items"][0]["label"] == claimed_label
+    released = queue.release(make_store, identifier, expect=claimed["item"]["revision"], lane="docs", now=102)
+    assert not released["refused"] and released["item"]["label"] == unclaimed_label
+    reclaimed = claim(make_store, released["item"]["revision"], identifier, lane="docs", now=103)
+    completed = queue.done(make_store, identifier, expect=reclaimed["item"]["revision"], lane="docs", now=104)
+    assert not completed["refused"] and completed["item"]["label"] == claimed_label
+    receipts = [row["detail"] for row in events.read(make_store).rows if row["detail"].get("queue") is True]
+    assert [row["label"] for row in receipts] == [unclaimed_label] + [claimed_label] * 4
+
+
+@pytest.mark.parametrize("field", ["id", "milestone", "lane"])
+def test_secret_identifiers_refuse_before_acceptance(make_store, field):
+    secret = "sk-" + "a" * 24
+    if field == "id":
+        result = queue.add(make_store, item(secret), now=100)
+        assert result["reason"] == "invalid_item"
+    elif field == "milestone":
+        result = queue.add(make_store, item(hold_until=[{"kind": "milestone", "name": secret}]), now=100)
+        assert result["reason"] == "invalid_item"
+    else:
+        revision = add(make_store)
+        result = claim(make_store, revision, lane=secret)
+        assert result["reason"] == "invalid_arguments"
+    assert secret not in json.dumps(result)
+    assert not queue.list(make_store, now=101)["refused"]
+
+@pytest.mark.parametrize("size", [513, 4096])
+def test_constraints_remain_complete_through_all_views_and_transitions(make_store, size):
+    text = "x" * size
+    value = item(hold=text, scope_rulings=[text], invariants=[text])
+    added = queue.add(make_store, value, now=100)
+    assert not added["refused"]
+    for row in [added["item"], queue.list(make_store, now=101)["items"][0],
+                queue.audit(make_store, now=101)["items"][0]]:
+        assert row["hold"] == text and row["scope_rulings"] == [text] and row["invariants"] == [text]
+    # Judgment holds deliberately refuse claims; the same validated constraints
+    # without a hold must survive every claimed/released/completed response.
+    revision = add(make_store, "TWO", paths=["docs/**"], scope_rulings=[text], invariants=[text])
+    claimed = claim(make_store, revision, identifier="TWO")
+    released = queue.release(make_store, "TWO", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    claimed = claim(make_store, released["item"]["revision"], identifier="TWO", now=103)
+    completed = queue.done(make_store, "TWO", expect=claimed["item"]["revision"], lane="alpha", now=104)
+    for result in [released, claimed, completed]:
+        assert not result["refused"], result
+        assert result["item"]["scope_rulings"] == [text] and result["item"]["invariants"] == [text]
+
+
+@pytest.mark.parametrize("policy", [b"\xef\xbb\xbf{\"v\":1,\"lanes\":{\"alpha\":[\"src/**\"]}}",
+    json.dumps({"v": 1, "lanes": {"lane%d" % i: ["src/**"] for i in range(300)}}).encode()], ids=["bom", "many-lanes"])
+def test_team_policy_uses_its_own_parser(make_store, policy):
+    (make_store / ".aegis" / "team.json").write_bytes(policy)
+    revision = add(make_store)
+    listed = queue.list(make_store, now=101)
+    assert not listed["refused"], listed
+    lane = "alpha" if policy.startswith(b"\xef") else "lane0"
+    assert not claim(make_store, revision, lane=lane)["refused"]
+
+
+@pytest.mark.parametrize("policy", [b"{", b"{}", b'{"v":1}', b'{"v":1,"lanes":{}}',
+    b"x" * (team.MAX_CONFIG_BYTES + 1),
+    json.dumps({"v": 1, "lanes": {"sk-" + "a" * 24: ["src/**"]}}).encode()],
+    ids=["syntax", "missing-version", "missing-lanes", "empty-lanes", "oversized", "secret-lane"])
+def test_bad_policy_is_only_a_coordinator_claim_blocker(make_store, policy):
+    (make_store / ".aegis" / "team.json").write_bytes(policy)
+    revision = add(make_store)
+    listed = queue.list(make_store, now=101)
+    assert not listed["refused"], listed
+    audited = queue.audit(make_store, now=101)
+    assert not audited["refused"]
+    assert [finding["code"] for finding in audited["findings"]] == ["WAITING_ONLY_COORDINATOR"]
+    result = claim(make_store, revision)
+    assert result["reason"] == "blocked"
+    assert result["blockers"][0]["reason"] == "coordinator"
+    assert "team.json" in result["blockers"][0]["next_action"]
+    assert "queue state" not in json.dumps(result)
+    (make_store / ".aegis" / "team.json").write_text(
+        json.dumps({"v": 1, "lanes": {"alpha": ["src/**"]}}), encoding="utf-8")
+    assert not claim(make_store, revision)["refused"]
+
+
+def test_done_rows_do_not_count_toward_live_cap(make_store):
+    add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    seed = json.loads(path.read_text())
+    row = seed["items"].pop("ONE")
+    # Owner-managed seed document at the documented persistence boundary.
+    for index in range(256):
+        identifier = "ITEM%d" % index
+        seed["items"][identifier] = {**row, "item": {**row["item"], "id": identifier}}
+    path.write_text(json.dumps(seed), encoding="utf-8")
+    result = queue.add(make_store, item("OVER"), now=100)
+    assert result["reason"] == "queue_live_limit"
+    claimed = claim(make_store, row["revision"], identifier="ITEM0")
+    assert not claimed["refused"]
+    assert not queue.done(make_store, "ITEM0", expect=claimed["item"]["revision"], lane="alpha", now=102)["refused"]
+    assert not queue.add(make_store, item("OVER"), now=103)["refused"]
+    assert len(queue.list(make_store, now=104)["items"]) == 256
+    assert len(queue.list(make_store, include_done=True, now=104)["items"]) == 257
+
+
+def test_audit_requires_judgment_hold_and_live_claim_does_not_block_itself(make_store):
+    revision = add(make_store, hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    assert queue.audit(make_store, now=101)["findings"] == []
+    claimed = claim(make_store, revision)
+    assert not claimed["refused"]
+    listed = queue.list(make_store, now=102)
+    assert listed["items"][0]["conditions_met"] is True
+
+
+@pytest.mark.parametrize("existing_lease", [False, True], ids=["empty-metrics", "lease-metrics"])
+def test_queue_receipts_do_not_change_lease_metrics(make_store, existing_lease):
+    if existing_lease:
+        team.claim(make_store, "alpha", ["src/**"], owner="owner", now=100)
+        with pytest.raises(team.LeaseRefused, match="overlap"):
+            team.claim(make_store, "beta", ["src/**"], owner="owner", now=100)
+    before = team.event_counts(make_store)
+    revision = add(make_store)
+    claimed = claim(make_store, revision)
+    assert not claimed["refused"]
+    released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not released["refused"]
+    reclaimed = claim(make_store, released["item"]["revision"], now=103)
+    assert not reclaimed["refused"]
+    completed = queue.done(make_store, "ONE", expect=reclaimed["item"]["revision"], lane="alpha", now=104)
+    assert not completed["refused"]
+    assert team.event_counts(make_store) == before
+
+
+def test_live_claim_ignores_only_its_holders_repository_lease(make_store):
+    root = make_store
+    revision = add(root, hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    claimed = claim(root, revision)
+    assert not claimed["refused"]
+    own = team.claim(root, "alpha", ["src/**"], owner="owner", now=102)
+    listed = queue.list(root, now=103)["items"][0]
+    assert listed["conditions_met"] is True and listed["blockers"] == []
+    assert queue.audit(root, now=103)["items"][0]["conditions_met"] is True
+    team.release(root, "alpha", own.oid, caller="owner")
+    other = team.claim(root, "beta", ["src/**"], owner="owner", now=104)
+    listed = queue.list(root, now=105)["items"][0]
+    assert listed["conditions_met"] is False
+    assert [block["reason"] for block in listed["blockers"]] == ["lease_free"]
+    assert listed["blockers"][0]["next_action"] == "Wait for the covering live leases to expire or be released."
+    team.release(root, "beta", other.oid, caller="owner")
+    assert queue.list(root, now=106)["items"][0]["conditions_met"] is True
+    team.claim(root, "alpha", ["src/**"], owner="owner", now=107)
+    expired = queue.list(root, now=111)["items"][0]
+    assert expired["lease_expired"] is True and expired["conditions_met"] is False
+
+
+def test_same_lane_is_busy_and_none_capabilities_refuses(make_store):
+    revision = add(make_store)
+    other = add(make_store, "TWO", paths=["docs/**"])
+    assert queue.claim(make_store, "ONE", expect=revision, lane="alpha",
+                       capabilities=None, now=101)["reason"] == "invalid_arguments"
+    assert not claim(make_store, revision)["refused"]
+    assert claim(make_store, other, identifier="TWO")["reason"] == "lane_busy"
+
+
+def test_mutation_without_lease_observation_and_event_failure_retry(make_store, monkeypatch):
+    from aegis_core import events
+    revision = add(make_store)
+    claimed = claim(make_store, revision)
+    def broken(*args, **kwargs):
+        raise gitsafe.GitError("untrusted")
+    from aegis_core import gitsafe
+    monkeypatch.setattr(queue, "team", SimpleNamespace(**{**vars(team), "read_leases": broken}))
+    monkeypatch.setattr(queue, "events", SimpleNamespace(try_append=lambda *a, **k: OSError("token=private-value")))
+    added = queue.add(make_store, item("TWO", hold_until=[{"kind": "lease_free", "paths": ["docs/**"]}]), now=102)
+    assert not added["refused"] and added["warnings"][0]["reason"] == "event_not_recorded"
+    released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not released["refused"] and "private-value" not in json.dumps(released)
+    assert queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)["reason"] == "stale_revision"
+    monkeypatch.setattr(queue, "team", team)
+    monkeypatch.setattr(queue, "events", events)
+    assert not queue.list(make_store, now=103)["refused"]
+
+def race_finish(arguments):
+    root, verb, revision = arguments
+    return getattr(queue, verb)(root, "ONE", expect=revision, lane="alpha", now=102)
+
+
+@pytest.mark.parametrize("verb", ["release", "done"])
+def test_concurrent_finishes_emit_one_transition(make_store, verb):
+    from aegis_core import events
+    revision = add(make_store)
+    claimed = claim(make_store, revision)
+    results = _spawn_race(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2)
+    assert sorted(result["refused"] for result in results) == [False, True]
+    assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
+    receipts = [row["detail"] for row in events.read(make_store).rows
+                if row["detail"].get("queue") and row["detail"]["action"] == verb]
+    assert len(receipts) == 1
+    assert receipts[0]["from_revision"] == claimed["item"]["revision"]
+    assert receipts[0]["to_revision"] == next(result for result in results if not result["refused"])["item"]["revision"]
+    assert receipts[0]["to_holder"] is None and receipts[0]["expires_at"] is None
+
+def test_existing_repository_lanes_over_capacity_refuse_until_release(make_store):
+    root = make_store
+    alpha = team.claim(root, "alpha", ["/src/"], owner="owner", now=100)
+    beta = team.claim(root, "beta", ["/docs/"], owner="owner", now=100)
+    revision = add(root)
+    result = claim(root, revision)
+    assert result["reason"] == "capacity_full"
+    team.release(root, "beta", beta.oid, caller="owner")
+    assert not claim(root, revision, now=102)["refused"]
+    assert alpha.oid
+
+
+def test_added_dependencies_and_unobserved_lease_conditions_are_visible(make_store):
+    result = queue.add(make_store, item(after=["MISSING"]), now=100)
+    assert not result["refused"]
+    assert result["item"]["conditions_met"] is False
+    assert result["item"]["blockers"][0]["reason"] == "after"
+    assert result["item"]["blockers"][0]["next_action"]
+    prerequisite = add(make_store, "MISSING", paths=["docs/**"])
+    claimed = claim(make_store, prerequisite, identifier="MISSING")
+    completed = queue.done(make_store, "MISSING", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not completed["refused"]
+    assert not claim(make_store, result["item"]["revision"], now=103)["refused"]
+    held = queue.add(make_store, item("HELD", paths=["misc/**"],
+        hold_until=[{"kind": "lease_free", "paths": ["misc/**"]}]), now=104)
+    assert held["item"]["conditions_met"] is False
+    assert held["item"]["blockers"][0]["reason"] == "lease_free"
+    assert "list" in held["item"]["blockers"][0]["next_action"]
+
+
+def test_concurrent_disjoint_claims_enforce_writer_capacity(make_store):
+    first = add(make_store, paths=["/src/one.py"])
+    second = add(make_store, "TWO", paths=["/docs/one.md"])
+    results = _spawn_race(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
+                                            (make_store, second, "TWO", "beta")])
+    assert sorted(result["refused"] for result in results) == [False, True]
+    assert next(result for result in results if result["refused"])["reason"] == "capacity_full"
+
+
+@pytest.mark.parametrize("spelling", [r"\\?\C:..\ws", r"1:..\ws", r"\\srv\..\ws",
+                                     r"\\..\ws\x", r"\\.\..\ws"])
+@pytest.mark.parametrize("verb", ["list", "audit", "add", "compact", "claim", "release", "done"])
+def test_prefix_parent_components_refuse_before_io(monkeypatch, spelling, verb):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    assert queue.valid_workspace_spelling(spelling) is False
+    kwargs = {"item": item()} if verb == "add" else {}
+    if verb in ("claim", "release", "done"):
+        kwargs.update(identifier="ONE", expect="0" * 64, lane="alpha")
+    result = getattr(queue, verb)(spelling, **kwargs)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert all(spelling not in value for value in result.values() if isinstance(value, str))
+
+
+@pytest.mark.parametrize("text", ["Auth: update login flow", "Fix token: refresh handling", "token=private-value"])
+@pytest.mark.parametrize("field", ["title", "hold", "scope_rulings", "invariants"])
+def test_credential_text_has_rephrase_guidance_and_no_echo(make_store, text, field):
+    value = item(**{field: [text] if field in ("scope_rulings", "invariants") else text})
+    parsed = queue.parse_item(json.dumps(value))
+    result = queue.add(make_store, value, now=100)
+    for response in (parsed, result):
+        assert response["reason"] == "credential_like_text"
+        assert "rephrase" in response["next_action"].lower()
+        assert all(text not in value for value in response.values() if isinstance(value, str))
+    assert result["exit_code"] == 2
+    assert not (make_store / ".aegis" / "state" / "team-queue.json").exists()
+    assert not queue.add(make_store, item(title="Update login flow"), now=101)["refused"]
+
+
+@pytest.mark.parametrize("mode", ["foreign", "own", "expired", "disjoint", "unreadable"])
+def test_claim_preflight_rechecks_repository_leases_after_list(make_store, mode):
+    revision = add(make_store)
+    assert queue.list(make_store, now=100)["items"][0]["conditions_met"]
+    lane = "alpha" if mode == "own" else "beta"
+    lease = team.claim(make_store, lane, ["docs/**" if mode == "disjoint" else "src/**"],
+                       owner="owner", now=90 if mode == "expired" else 100, ttl_s=10)
+    if mode == "unreadable":
+        from aegis_core import gitsafe
+        blob = gitsafe.write_blob(make_store, b"{}")
+        gitsafe.update_ref(make_store, team.lane_ref(lane), blob, lease.oid)
+    result = claim(make_store, revision)
+    if mode in ("foreign", "unreadable"):
+        assert result["reason"] == "blocked"
+        assert result["blockers"][0]["reason"] == "foreign_lease"
+        assert queue.list(make_store, now=102)["items"][0]["revision"] == revision
+        current = team.read_leases(make_store)
+        oid = current.unreadable[0].oid if mode == "unreadable" else lease.oid
+        team.release(make_store, lane, oid, caller="owner")
+        assert not claim(make_store, revision, now=103)["refused"]
+    elif mode == "disjoint":
+        assert result["reason"] == "capacity_full"
+    else:
+        assert not result["refused"], result
+
+
+@pytest.mark.parametrize("path,allowed", [("src/a.py", True), ("docs/a.md", False)])
+def test_brief_paths_must_be_admitted_at_add(make_store, path, allowed):
+    value = item(brief_paths=[path])
+    parsed = queue.parse_item(json.dumps(value))
+    result = queue.add(make_store, value, now=100)
+    if allowed:
+        assert not result["refused"]
+        assert not claim(make_store, result["item"]["revision"])["refused"]
+    else:
+        for response in (parsed, result):
+            assert response["reason"] == "brief_outside_scope"
+            assert response["next_action"]
+        assert result["exit_code"] == 2
+        assert not (make_store / ".aegis" / "state" / "team-queue.json").exists()
+        assert not queue.add(make_store, item(brief_paths=["src/a.py"]), now=101)["refused"]
+
+
+@pytest.mark.parametrize("paths", [["../escape"], ["src/*.py"], ["src/one\ntwo.py"], ["x"] * 129, "src/a.py"])
+def test_malformed_brief_paths_refuse_before_storage(make_store, paths):
+    result = queue.add(make_store, item(brief_paths=paths), now=100)
+    assert result["reason"] == "invalid_item" and result["exit_code"] == 2
+    assert not (make_store / ".aegis" / "state" / "team-queue.json").exists()
+
+
+@pytest.mark.parametrize("mode,code", [("missing", "LANE-NO-LEASE"), ("expired", "LANE-NO-LEASE"),
+                                      ("mismatch", "LEASE-BRANCH-MISMATCH"), ("matching", None)])
+def test_audit_claim_lease_branch_and_retry(make_store, mode, code):
+    revision = add(make_store)
+    claimed = claim(make_store, revision)
+    assert not claimed["refused"], claimed
+    branch = "refs/heads/lane/alpha"
+    if mode != "missing":
+        team.claim(make_store, "alpha", ["src/**"], owner="owner",
+                   branch="other" if mode == "mismatch" else branch,
+                   now=90 if mode == "expired" else 100, ttl_s=10)
+    audited = queue.audit(make_store, now=102)
+    assert not audited["refused"], audited
+    assert [row["code"] for row in audited["findings"]] == ([] if code is None else [code])
+    assert all(row["refused"] and row["reason"] and row["next_action"] for row in audited["findings"])
+    assert not queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=103)["refused"]
+    assert queue.audit(make_store, now=104)["findings"] == []
+
+
+def finish_one(root, identifier="ONE"):
+    revision = add(root, identifier)
+    claimed = claim(root, revision, identifier)
+    assert not claimed["refused"], claimed
+    completed = queue.done(root, identifier, expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not completed["refused"], completed
+
+
+def test_completed_filter_and_compaction_preserve_live_dependencies(make_store):
+    finish_one(make_store)
+    finish_one(make_store, "UNUSED")
+    revision = add(make_store, "TWO", after=["ONE"])
+    assert [row["id"] for row in queue.list(make_store, now=103)["items"]] == ["TWO"]
+    assert len(queue.list(make_store, include_done=True, now=103)["items"]) == 3
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    size = path.stat().st_size
+    compacted = queue.compact(make_store, now=103)
+    assert not compacted["refused"] and compacted["removed_count"] == 1
+    assert path.stat().st_size < size
+    assert compacted["retained_done_count"] == 1
+    assert queue.compact(make_store, now=104)["removed_count"] == 0
+    assert not claim(make_store, revision, "TWO", now=104)["refused"]
+
+
+def race_compact(root):
+    return queue.compact(root, now=103)
+
+
+def test_compaction_concurrency_failure_and_retry(make_store, monkeypatch):
+    finish_one(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    def failed(*args, **kwargs):
+        raise OSError("token=private-value")
+    monkeypatch.setattr(queue, "atomic_write_bytes", failed)
+    refused = queue.compact(make_store, now=103)
+    assert refused["reason"] == "queue_io_unavailable" and refused["exit_code"] == 1
+    assert "private-value" not in json.dumps(refused)
+    assert path.read_bytes() == before
+    monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
+    results = _spawn_race(race_compact, [make_store] * 2)
+    assert all(not row["refused"] for row in results)
+    assert sorted(row["removed_count"] for row in results) == [0, 1]
+    assert queue.list(make_store, include_done=True, now=104)["items"] == []
+
+
+@pytest.mark.parametrize("value", [None, 0, "true", [], {}])
+def test_include_done_is_strict_before_platform(monkeypatch, value):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = queue.list("/workspace", include_done=value)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+
+
+@pytest.mark.parametrize("verb", ["list", "audit", "compact"])
+@pytest.mark.parametrize("data,reason", [(b"{", "invalid_queue_state"),
+    (b" " * (queue.MAX_BYTES + 1), "queue_size_limit")], ids=["malformed", "oversized"])
+def test_new_observation_and_compaction_failures_preserve_state(make_store, verb, data, reason):
+    add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    path.write_bytes(data)
+    refused = getattr(queue, verb)(make_store, now=101)
+    assert refused["reason"] == reason and refused["exit_code"] == 1
+    assert path.read_bytes() == data
+
+
+@pytest.mark.parametrize("branch", ["private-value\ninjected", "private-value topic", "x" * 201,
+    "refs/tags/private-value", "refs/heads/HEAD", "refs/heads/", "HEAD", 1, ""])
+def test_branch_input_failure_is_fixed_and_retryable(make_store, branch):
+    revision = add(make_store)
+    result = claim(make_store, revision, branch=branch)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert "private-value" not in json.dumps(result)
+    assert not claim(make_store, revision)["refused"]
+
+
+def test_compact_empty_unsupported_lock_timeout_and_event_failure(make_store, monkeypatch):
+    from aegis_core import events
+    root = make_store
+    assert queue.compact(root, now=100)["removed_count"] == 0
+    assert not (root / ".aegis" / "state" / "team-queue.json").exists()
+    supported = queue.descriptor_supported
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    assert queue.compact(root, now=100)["reason"] == "unsupported_platform"
+    monkeypatch.setattr(queue, "descriptor_supported", supported)
+    def timeout(*args, **kwargs):
+        raise storage.LockTimeoutError("token=private-value")
+    monkeypatch.setattr(queue, "locked", timeout)
+    assert queue.compact(root, now=100)["reason"] == "queue_lock_timeout"
+    monkeypatch.setattr(queue, "locked", storage.locked)
+    finish_one(root)
+    monkeypatch.setattr(queue, "events", SimpleNamespace(try_append=lambda *a, **k: OSError("private-value")))
+    result = queue.compact(root, now=103)
+    assert not result["refused"] and result["warnings"][0]["reason"] == "event_not_recorded"
+    assert "private-value" not in json.dumps(result)
+    monkeypatch.setattr(queue, "events", events)
+    assert queue.compact(root, now=104)["removed_count"] == 0
+
+
+@pytest.mark.parametrize("branch", ["lane/alpha", "refs/heads/lane/alpha"])
+def test_claim_branch_comes_from_lane_and_audit_never_uses_head(make_store, branch):
+    revision = add(make_store)
+    claimed = claim(make_store, revision, branch=branch)
+    assert not claimed["refused"], claimed
+    assert claimed["item"]["branch"] == "lane/alpha"
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch="lane/alpha", now=100)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=make_store, check=True)
+    assert queue.audit(make_store, now=102)["findings"] == []
+
+
+@pytest.mark.parametrize("mode", ["null", "absent"])
+def test_unknown_claim_branch_cannot_be_replaced_by_later_checkout(make_store, mode):
+    # This history belongs entirely to the temporary repo, not the source checkout.
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/seed"], cwd=make_store, check=True)
+    subprocess.run(["git", "-c", "user.name=Queue Test", "-c", "user.email=queue@example.test",
+                    "commit", "--allow-empty", "-q", "-m", "seed"], cwd=make_store, check=True)
+    subprocess.run(["git", "checkout", "--detach", "-q"], cwd=make_store, check=True)
+    revision = add(make_store)
+    claimed = claim(make_store, revision, branch=None)
+    assert not claimed["refused"], claimed
+    assert claimed["item"].get("branch") is None
+    if mode == "absent":
+        path = make_store / ".aegis" / "state" / "team-queue.json"
+        document = json.loads(path.read_text())
+        document["items"]["ONE"].pop("branch", None)
+        path.write_text(json.dumps(document), encoding="utf-8")
+    subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=make_store, check=True)
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch="main", now=100)
+    result = queue.audit(make_store, now=102)
+    assert [row["code"] for row in result["findings"]] == ["CLAIM-BRANCH-UNKNOWN"]
+    assert result["findings"][0]["next_action"]
+
+
+def test_unrecorded_lease_branch_is_unknown_not_mismatch(make_store):
+    revision = add(make_store)
+    assert not claim(make_store, revision)["refused"]
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", now=100)
+    result = queue.audit(make_store, now=102)
+    assert [row["code"] for row in result["findings"]] == ["LEASE-BRANCH-UNKNOWN"]
+
+
+def test_unreadable_lease_audit_has_a_working_recovery_action(make_store):
+    from aegis_core import gitsafe
+    revision = add(make_store)
+    assert not claim(make_store, revision)["refused"]
+    bad = gitsafe.write_blob(make_store, b"{}")
+    gitsafe.update_ref(make_store, team.lane_ref("alpha"), bad, None)
+    result = queue.audit(make_store, now=102)
+    assert [row["code"] for row in result["findings"]] == ["LEASE-UNREADABLE"]
+    assert "release" in result["findings"][0]["next_action"]
+    team.release(make_store, "alpha", bad, caller="owner")
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch="lane/alpha", now=100)
+    assert queue.audit(make_store, now=103)["findings"] == []
+
+
+def test_compacted_ids_satisfy_future_dependencies_and_cannot_be_reused(make_store):
+    from aegis_core import events
+    finish_one(make_store)
+    compacted = queue.compact(make_store, now=103)
+    assert compacted["removed_count"] == 1
+    listed = queue.list(make_store, include_done=True, now=104)
+    assert listed["completed_ids"] == ["ONE"]
+    refused = queue.add(make_store, item(), now=104)
+    assert refused["reason"] == "item_exists" and "include-done" in refused["next_action"]
+    assert claim(make_store, "0" * 64)["reason"] == "item_done"
+    revision = add(make_store, "TWO", after=["ONE"])
+    assert not claim(make_store, revision, "TWO", now=104)["refused"]
+    receipts = [row["detail"] for row in events.read(make_store).rows if row["detail"].get("action") == "compact"]
+    assert receipts[0]["removed_ids"] == ["ONE"]
+    assert queue.compact(make_store, now=105)["removed_count"] == 0
+
+
+def test_refusal_guidance_names_completed_filter_and_compact(make_store):
+    finish_one(make_store)
+    result = queue.add(make_store, item(), now=103)
+    assert "include-done" in result["next_action"]
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    path.write_bytes(b" " * (queue.MAX_BYTES + 1))
+    assert "aegis team queue compact" in queue.list(make_store)["next_action"]
+
+
+def test_completion_history_limit_preserves_state_and_retry(make_store):
+    finish_one(make_store)
+    assert queue.compact(make_store, now=103)["removed_ids"] == ["ONE"]
+    finish_one(make_store, "TWO")
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text())
+    state["completed"].update({"OLD%d" % i: True for i in range(queue.MAX_COMPLETED - 1)})
+    path.write_text(json.dumps(state), encoding="utf-8")
+    before = path.read_bytes()
+    for moment in (104, 105):
+        refused = queue.compact(make_store, now=moment)
+        assert refused["reason"] == "queue_history_limit" and refused["exit_code"] == 1
+        assert path.read_bytes() == before
+    listed = queue.list(make_store, include_done=True, now=106)
+    assert len(listed["completed_ids"]) == queue.MAX_COMPLETED
+    assert listed["items"][0]["id"] == "TWO" and listed["items"][0]["state"] == "done"
+    revision = add(make_store, "THREE", after=["ONE"])
+    assert not claim(make_store, revision, "THREE", now=106)["refused"]
+
+
+@pytest.mark.parametrize("completed", [["OLD"], {"OLD": False}, {"../private-value": True},
+    {"ONE": True}, {"OLD%d" % i: True for i in range(queue.MAX_COMPLETED + 1)}],
+    ids=["wrong-type", "wrong-marker", "bad-id", "overlaps-body", "over-limit"])
+def test_invalid_completion_history_has_fixed_refusal(make_store, completed):
+    add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text())
+    state["completed"] = completed
+    path.write_text(json.dumps(state), encoding="utf-8")
+    result = queue.list(make_store, now=101)
+    assert result["reason"] == "invalid_queue_state" and result["exit_code"] == 1
+    assert "private-value" not in json.dumps(result)
+
+
+def race_branch_claim(arguments):
+    root, revision, branch = arguments
+    return claim(root, revision, branch=branch)
+
+
+def test_concurrent_claims_record_only_the_winners_branch(make_store):
+    revision = add(make_store)
+    results = _spawn_race(race_branch_claim, [(make_store, revision, "lane/a"),
+                                            (make_store, revision, "lane/b")])
+    assert sorted(result["refused"] for result in results) == [False, True]
+    winner = next(result for result in results if not result["refused"])
+    assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
+    listed = queue.list(make_store, now=102)["items"][0]
+    assert listed["branch"] == winner["item"]["branch"]
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=listed["branch"], now=100)
+    assert queue.audit(make_store, now=102)["findings"] == []
+
+
+@pytest.mark.parametrize("branch,valid", [(None, True), ("lane/x", True),
+    ("refs/heads/lane/x", True), ("x" * 200, True), ("refs/heads/" + "x" * 189, True),
+    ("x" * 201, False), ("refs/heads/" + "x" * 191, False),
+    ("private-value\ninjected", False), ("", False), ({}, False)],
+    ids=["unknown", "short", "full", "short-limit", "full-limit", "short-over", "full-over", "multiline", "empty", "type"])
+def test_branch_validation_precedes_platform_probe(tmp_path, monkeypatch, branch, valid):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = queue.claim(tmp_path, "ONE", expect="0" * 64, lane="alpha", branch=branch, now=100)
+    assert result["reason"] == ("unsupported_platform" if valid else "invalid_arguments")
+    assert result["exit_code"] == (1 if valid else 2)
+    assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("field", ["after", "capabilities"])
+def test_identifier_fields_refuse_before_credential_heuristic(make_store, field):
+    value = item(**{field: ["Auth: update login flow"]})
+    for result in (queue.parse_item(json.dumps(value)), queue.add(make_store, value, now=100)):
+        assert result["reason"] == "invalid_item" and result["next_action"]
+        assert "Auth: update login flow" not in json.dumps(result)
+    assert not (make_store / ".aegis" / "state" / "team-queue.json").exists()
+
+
+@pytest.mark.parametrize("branch,accepted", [
+    ("feature/c++", True), ("fix/issue#12", True), ("user@topic", True), ("feat/naïve", True),
+    ("x", True), ("refs/heads/x", True), ("x" * 200, True), ("x" * 201, False),
+    ("refs/heads/" + "x" * 189, True), ("refs/heads/" + "x" * 191, False),
+    ("../label", True), ("label..x", True), ("label.lock", True), ("label//x", True),
+    ("label/.", True), ("label?x", True), ("-label", True),
+    ("private-value topic", False), ("private-value\ninjected", False),
+    ("private-value\rtrailer", False), ("private-value\tfield", False),
+    ("private-value\x00", False), ("private-value\x1b[31m", False),
+    ("private-value\x85", False), ("private-value\u2028line", False),
+    ("", False), (1, False),
+], ids=["plus", "hash", "at", "unicode", "short", "full", "limit", "over-limit",
+        "full-limit", "full-over-limit", "parent-label", "dots-label", "lock-label",
+        "empty-component-label", "dot-component-label", "question-label", "leading-hyphen-label",
+        "space", "newline", "carriage-return", "tab", "nul", "ansi", "c1", "line-separator", "empty", "type"])
+def test_queue_and_lease_claim_share_branch_predicate(make_store, branch, accepted):
+    revision = add(make_store)
+    if accepted:
+        lease = team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=branch, now=100)
+        assert lease.lease.branch == branch
+    else:
+        with pytest.raises(team.TeamUsageError, match="^branch must be 1 to 200 characters with no spaces or control characters$"):
+            team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=branch, now=100)
+    result = claim(make_store, revision, branch=branch)
+    assert result["refused"] is not accepted, result
+    if accepted:
+        normalized = branch.removeprefix("refs/heads/")
+        assert result["item"]["branch"] == normalized
+        assert queue.list(make_store, now=102)["items"][0]["branch"] == normalized
+        assert queue.audit(make_store, now=102)["findings"] == []
+    else:
+        assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+        assert "private-value" not in json.dumps(result)
+        assert not claim(make_store, revision)["refused"]
+
+
+@pytest.mark.parametrize("lease_branch,queue_branch", [("refs/heads/x", "x"), ("x", "refs/heads/x")])
+def test_audit_normalizes_both_lease_and_queue_local_refs(make_store, lease_branch, queue_branch):
+    revision = add(make_store)
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=lease_branch, now=100)
+    assert not claim(make_store, revision, branch=queue_branch)["refused"]
+    assert queue.audit(make_store, now=102)["findings"] == []
+
+
+@pytest.mark.parametrize("branch", ["refs/tags/x", "refs/remotes/origin/x", "HEAD", "refs/heads/HEAD"])
+def test_queue_refuses_nonlocal_or_head_labels_even_when_lease_accepts(make_store, branch):
+    revision = add(make_store)
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=branch, now=100)
+    result = claim(make_store, revision, branch=branch)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert branch not in json.dumps(result)
+    assert not claim(make_store, revision, branch="x")["refused"]
+    audited = queue.audit(make_store, now=102)
+    assert [row["code"] for row in audited["findings"]] == ["LEASE-BRANCH-UNKNOWN"]
+    assert branch not in json.dumps(audited)
+
+
+def test_legacy_prefixed_claim_branch_remains_readable(make_store):
+    revision = add(make_store)
+    assert not claim(make_store, revision)["refused"]
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["items"]["ONE"]["branch"] = "refs/heads/lane/alpha"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch="lane/alpha", now=100)
+    assert queue.list(make_store, now=102)["items"][0]["branch"] == "refs/heads/lane/alpha"
+    assert queue.audit(make_store, now=102)["findings"] == []
+
+
+def test_branch_display_redacts_each_returned_field(make_store):
+    branch = "token=private-value"
+    revision = add(make_store)
+    team.claim(make_store, "alpha", ["src/**"], owner="owner", branch=branch, now=100)
+    claimed = claim(make_store, revision, branch=branch)
+    assert not claimed["refused"], claimed
+    listed = queue.list(make_store, now=102)
+    audited = queue.audit(make_store, now=102)
+    for result in (claimed, listed, audited):
+        assert "private-value" not in json.dumps(result)
+    assert "REDACTED" in claimed["item"]["branch"]
+    assert audited["findings"] == []
+
+
+def stored_branch_item(root, branch, state):
+    profile = root / ".aegis" / "team" / "profile.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps({"version": 1, "run_config": {"limits": {"writers_max": 2}}}), encoding="utf-8")
+    revision = add(root)
+    second = add(root, "TWO", paths=["docs/**"])
+    claimed = claim(root, revision)
+    assert not claimed["refused"], claimed
+    if state == "completed":
+        assert not queue.done(root, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)["refused"]
+    path = root / ".aegis" / "state" / "team-queue.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # Seed an older record at the documented persistence boundary, without
+    # depending on commits or history in the source checkout.
+    document["items"]["ONE"]["branch"] = branch
+    path.write_text(json.dumps(document), encoding="utf-8")
+    team.claim(root, "alpha", ["src/**"], owner="owner", branch="lane/alpha", now=100)
+    team.claim(root, "beta", ["docs/**"], owner="owner", branch="lane/beta", now=100)
+    return path, document["items"]["ONE"]["revision"], second, 112 if state == "expired" else 103
+
+
+@pytest.mark.parametrize("state,effective,expired", [("active", "claimed", False),
+                                                    ("expired", "queued", True),
+                                                    ("completed", "done", False)])
+def test_findings_state_and_expiry_match_full_views_after_retry(make_store, state, effective, expired):
+    root = make_store
+    path, revision, _, moment = stored_branch_item(root, "refs/heads/refs/tags/legacy", state)
+    original = path.read_bytes()
+    full = queue.list(root, include_done=True, view="full", now=moment)
+    expected = next(row for row in full["items"] if row["id"] == "ONE")
+    assert expected["state"] == effective and expected["lease_expired"] is expired
+    assert expected["revision"] == revision and expected["expires_at"] == 111
+    fields = ("id", "revision", "lane", "state", "lease_expired", "expires_at")
+    for _ in range(2):
+        findings = queue.audit(root, view="findings", now=moment)
+        assert findings["exit_code"] == 0 and any(
+            row["code"] == "CLAIM-BRANCH-UNSUPPORTED" for row in findings["findings"])
+        assert findings["affected_items"] == [{key: expected[key] for key in fields}]
+        assert findings["next_action"] == (
+            "Run aegis team queue list --include-done --view full --json and read full constraints before changing holds or work.")
+    if state != "completed":
+        audited = queue.audit(root, view="full", now=moment)
+        assert next(row for row in audited["items"] if row["id"] == "ONE") == expected
+    path.write_bytes(b"{")
+    failed = queue.audit(root, view="findings", now=moment)
+    assert failed["reason"] == "invalid_queue_state" and failed["exit_code"] == 1
+    assert failed == queue.audit(root, view="full", now=moment)
+    path.write_bytes(original)
+    _spawn_race(_threaded_audit_findings, [(root, moment, findings)])
+    assert path.read_bytes() == original
+
+
+def _threaded_audit_findings(arguments):
+    root, moment, findings = arguments
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.audit, root, view="findings", now=moment) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [findings] * 3
+
+
+@pytest.mark.parametrize("branch,unsupported", [
+    ("refs/heads/refs/tags/x", True), ("refs/heads/refs/heads/x", True),
+    ("refs/heads/refs/remotes/origin/x", True), ("lane/alpha", False),
+], ids=["nested-tag", "nested-head", "nested-remote", "valid"])
+@pytest.mark.parametrize("state", ["active", "expired", "completed"])
+@pytest.mark.parametrize("verb", ["list", "audit", "compact", "add", "claim", "release", "done"])
+def test_stored_branch_isolated_from_queue_operations(make_store, branch, unsupported, state, verb):
+    root = make_store
+    path, revision, second, moment = stored_branch_item(root, branch, state)
+    if verb == "list":
+        result = queue.list(root, include_done=True, now=moment)
+    elif verb == "add":
+        result = queue.add(root, item("THREE", paths=["other/**"]), now=moment)
+    elif verb == "claim":
+        result = claim(root, second, "TWO", lane="beta", branch="lane/beta", now=moment)
+    elif verb in ("release", "done"):
+        result = getattr(queue, verb)(root, "ONE", expect=revision, lane="alpha", now=moment)
+    else:
+        result = getattr(queue, verb)(root, now=moment)
+    expected_error = ("not_claimed" if state == "completed" else "lease_expired"
+                      if state == "expired" and verb == "done" else None) if verb in ("release", "done") else None
+    if expected_error:
+        assert result["refused"] and result["reason"] == expected_error and result["exit_code"] == 1
+    else:
+        assert not result["refused"], result
+    cleared = ((verb == "release" and state != "completed") or
+               (verb == "done" and state == "active") or (verb == "compact" and state == "completed"))
+    audited = queue.audit(root, now=moment)
+    assert not audited["refused"], audited
+    findings = audited["findings"]
+    assert [row["code"] for row in findings] == (["CLAIM-BRANCH-UNSUPPORTED"] if unsupported and not cleared else [])
+    if findings:
+        assert findings[0]["item_id"] == "ONE" and findings[0]["reason"] == "claim_branch_unsupported"
+        assert findings[0]["next_action"] and branch not in json.dumps(findings)
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    if not cleared:
+        assert persisted["items"]["ONE"]["branch"] == branch
+    if verb == "list":
+        row = next(row for row in result["items"] if row["id"] == "ONE")
+        assert row["branch"] == branch
+        assert row.get("branch_supported", True) is not unsupported
+    if unsupported and not cleared:
+        if state == "completed":
+            recovery = queue.compact(root, now=moment)
+        else:
+            recovery = queue.release(root, "ONE", expect=revision, lane="alpha", now=moment)
+        assert not recovery["refused"], recovery
+        assert queue.audit(root, now=moment)["findings"] == []
+
+
+@pytest.mark.parametrize("branch", ["refs/heads/refs/tags/x", "refs/heads/refs/heads/x",
+    "refs/heads/refs/remotes/origin/x"])
+def test_new_claim_still_refuses_unsupported_stored_spellings(make_store, branch):
+    revision = add(make_store)
+    refused = claim(make_store, revision, branch=branch)
+    assert refused["reason"] == "invalid_arguments" and refused["exit_code"] == 2
+    assert branch not in json.dumps(refused)
+    assert not claim(make_store, revision)["refused"]
+
+
+@pytest.mark.parametrize("branch", ["private-value\ntrailer", "x" * 201, 1, {}, ["private-value"]],
+    ids=["multiline", "over-label-limit", "integer", "object", "array"])
+def test_malformed_stored_branch_is_per_item_not_queue_failure(make_store, branch):
+    root = make_store
+    path, revision, _, moment = stored_branch_item(root, branch, "active")
+    result = queue.audit(root, now=moment)
+    assert not result["refused"], result
+    assert [row["code"] for row in result["findings"]] == ["CLAIM-BRANCH-UNSUPPORTED"]
+    assert "private-value" not in json.dumps(result["findings"])
+    assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+    released = queue.release(root, "ONE", expect=revision, lane="alpha", now=moment)
+    assert not released["refused"], released
+    assert queue.audit(root, now=moment)["findings"] == []
+
+
+@pytest.mark.parametrize("lease_state,lease_code", [
+    ("missing", "LANE-NO-LEASE"), ("branchless", "LEASE-BRANCH-UNKNOWN"),
+    ("unreadable", "LEASE-UNREADABLE"), ("healthy", None),
+])
+def test_unsupported_branch_preserves_independent_lease_findings(make_store, lease_state, lease_code):
+    from aegis_core import gitsafe
+
+    root = make_store
+    branch = "refs/heads/refs/tags/private-value"
+    path, _, _, moment = stored_branch_item(root, branch, "active")
+    current = team.read_leases(root).get("alpha")
+    team.release(root, "alpha", current.oid, caller="owner")
+    if lease_state == "unreadable":
+        bad = gitsafe.write_blob(root, b"{}")
+        gitsafe.update_ref(root, team.lane_ref("alpha"), bad, None)
+    elif lease_state != "missing":
+        # A different healthy branch must not produce a mismatch when the
+        # claim's stored branch evidence is unsupported.
+        team.claim(root, "alpha", ["src/**"], owner="owner", now=100,
+                   branch=None if lease_state == "branchless" else "other/branch")
+    result = queue.audit(root, now=moment)
+    assert not result["refused"], result
+    findings = result["findings"]
+    expected = ["CLAIM-BRANCH-UNSUPPORTED"] + ([lease_code] if lease_code else [])
+    assert [row["code"] for row in findings] == expected
+    assert all(row["item_id"] == "ONE" and row["lane"] == "alpha" and
+               row["refused"] and row["reason"] and row["next_action"] for row in findings)
+    assert "private-value" not in json.dumps(findings)
+    assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+
+
+def _pending_state(root):
+    revision = add(root)
+    claimed = claim(root, revision)
+    assert not claimed["refused"], claimed
+    path = root / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    row = state["items"]["ONE"]
+    state["unclaim"] = {
+        "id": "ONE", "revision": row["revision"], "lane": row["lane"], "caller": "owner",
+        "reason": "Waiting", "lease_oid": None, "to_revision": "ab" * 32}
+    return path, state, row
+
+
+def _write_state(path, state):
+    raw = json.dumps(state, separators=(",", ":")).encode("ascii")
+    path.write_bytes(raw)
+    return raw
+
+
+def race_list(arguments):
+    root, moment = arguments
+    return queue.list(root, now=moment)
+
+
+def _blocked_race_list(arguments):
+    original = queue._read
+
+    def blocked(*args, **kwargs):
+        delay = getattr(_RACE_CONTROL, "startup_delay", 0)
+        if delay:
+            from threading import Event
+            Event().wait(delay)  # Injected before readiness; the fault clock starts later.
+        _RACE_CONTROL.entered.set()
+        assert _RACE_CONTROL.release.wait(30), "queue.list read was not released"
+        return original(*args, **kwargs)
+
+    with queue_patch.object(queue, "_read", blocked):
+        return race_list(arguments)
+
+
+@pytest.mark.parametrize("startup_delay,launch_delay", [(0, 0), (3, 0), (3, 3)])
+def test_race_list_blocked_inside_queue_list_is_reaped(make_store, startup_delay, launch_delay):
+    add(make_store)
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        fault_timeout = 2
+        phase = _PhaseStart()
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=fault_timeout, cleanup=_REAP_LIMIT, phase=phase)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                _spawn_race(_blocked_race_list, [(make_store, 101), (make_store, 102)],
+                            timeout=fault_timeout, ready=entered,
+                            initializer=_race_control_init,
+                            initargs=(entered, controls.worker_release, startup_delay),
+                            launch_delay=launch_delay, phase=phase)
+            assert entered.is_set(), "queue.list did not reach the read boundary"
+            assert not rescued.is_set(), "queue.list cleanup waited for the blocked read"
+            assert multiprocessing.active_children() == []
+        finally:
+            finish()
+            if watchdog.ident is not None:
+                watchdog.join(_READY_LIMIT + 2)
+            assert not watchdog.is_alive()
+
+
+def _rescue_grace_on_blocked_list(root):
+    """Shared with the start-failure regression. root is used only after setup."""
+    fault, cleanup = 2, _REAP_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_blocked_race_list, [(root, 101), (root, 102)],
+                                timeout=fault, ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert entered.is_set(), "queue.list did not reach the read boundary"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def test_rescue_grace_on_race_list(make_store):
+    """Startup expiry before publication is not a rescue for the blocked queue.list."""
+    add(make_store)
+    _rescue_grace_on_blocked_list(make_store)
+
+
+@pytest.mark.parametrize("caller,fail_at", [
+    ("grace-consumed-byte", 1), ("grace-consumed-byte", 3),
+    ("grace-byte-before-poll", 1), ("grace-byte-before-poll", 3),
+    ("grace-preemption", 1), ("grace-preemption", 2),
+    ("grace-blocked-spawn", 1), ("grace-blocked-spawn", 2),
+    ("grace-spawn-failure", 1), ("grace-spawn-failure", 2),
+    ("grace-race-list", 1), ("grace-race-list", 2),
+    ("before-poll", 1), ("before-poll", 2),
+    ("consumer-byte", 1), ("consumer-byte", 2), ("consumer-byte", 3),
+    ("grace-byte-before-poll", 4)])
+def test_setup_start_failure_leaves_no_hook_or_thread(monkeypatch, caller, fail_at):
+    """Thread.start raising RuntimeError leaves no phase hook and no live thread.
+
+    fail_at 1 is the first start (the pause thread, or the watchdog when that
+    caller has no pause). A later index is a partial start: every thread that
+    did start is finished. consumer-byte 3 and grace-byte-before-poll 4 are the
+    result reader, after the consumer is already waiting. Cleanup cancels that
+    wait and joins the consumer before either pipe closes.
+    """
+    from time import monotonic
+    original = threading.Thread.start
+    seen = {"n": 0}
+
+    def start(self):
+        seen["n"] += 1
+        if seen["n"] == fail_at:
+            raise RuntimeError("start failed")
+        return original(self)
+
+    monkeypatch.setattr("tests.unit.core.test_team_queue.threading.Thread.start", start)
+    before = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    with pytest.raises(RuntimeError, match="^start failed$"):
+        if caller == "grace-consumed-byte":
+            test_rescue_grace_on_consumed_readiness_byte()
+        elif caller == "grace-byte-before-poll":
+            test_rescue_grace_on_byte_consumed_before_observer_poll()
+        elif caller == "grace-preemption":
+            test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue()
+        elif caller == "grace-blocked-spawn":
+            test_rescue_grace_on_blocked_spawn()
+        elif caller == "grace-spawn-failure":
+            test_rescue_grace_before_publication_on_spawn_failure("blocked")
+        elif caller == "grace-race-list":
+            _rescue_grace_on_blocked_list(None)
+        elif caller == "before-poll":
+            test_is_set_before_helper_poll_is_not_a_false_rescue()
+        else:
+            test_byte_consumed_before_observer_poll_is_not_a_false_rescue()
+    living = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    assert living <= before
+    ready = threading.Event()
+    phase = _PhaseStart()
+    started = monotonic()
+    _latch_ready(ready, phase)
+    assert ready.is_set() and phase.before_ready is None and phase.before_poll is None
+    assert phase.after_pipe is None and monotonic() - started < 1
+
+
+def test_valid_pending_intent_stays_recoverable(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    assert listed["reason"] == "unclaim_recovery_required" and listed["exit_code"] == 1
+    assert listed["blockers"][0]["reason_text"] == "Waiting"
+    assert "--workspace" in listed["blockers"][0]["next_action"]
+    assert str(make_store) in listed["blockers"][0]["next_action"]
+    assert path.read_bytes() == before
+    state.pop("unclaim")
+    _write_state(path, state)
+    restored = queue.list(make_store, now=102)
+    assert not restored["refused"], restored
+    assert restored["items"][0]["id"] == "ONE"
+    assert "aegis team queue unclaim" not in json.dumps(restored)
+
+
+def test_concurrent_pending_lists_name_the_same_workspace(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
+    assert path.read_bytes() == before
+    commands = []
+    for result in results:
+        assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1
+        blocker = result["blockers"][0]
+        assert (blocker["caller"], blocker["reason_text"]) == ("owner", "Waiting")
+        commands.append(blocker["next_action"])
+    assert commands[0] == commands[1]
+    assert "--workspace" in commands[0] and str(make_store) in commands[0]
+
+
+@pytest.mark.parametrize("shape", [
+    "non-dict", "missing-key", "extra-key", "bad-id", "bad-lane", "bad-revision", "bad-to-revision",
+    "bad-lease-oid", "bad-lease-type", "writer-stopped", "released-other", "released-shape",
+    "released-without-oid", "reason-length", "reason-multiline", "reason-credential", "caller-length",
+    "caller-multiline", "stale-revision", "not-claimed", "lane-mismatch"])
+def test_malformed_pending_intent_is_invalid_queue_state(make_store, shape):
+    path, state, row = _pending_state(make_store)
+    intent = state["unclaim"]
+    hostile = "private-value"
+    if shape == "non-dict":
+        state["unclaim"] = hostile
+    elif shape == "missing-key":
+        del intent["caller"]
+    elif shape == "extra-key":
+        intent["note"] = hostile
+    elif shape == "bad-id":
+        intent["id"] = "../" + hostile
+    elif shape == "bad-lane":
+        intent["lane"] = "BETA"
+    elif shape == "bad-revision":
+        intent["revision"] = hostile
+    elif shape == "bad-to-revision":
+        intent["to_revision"] = hostile
+    elif shape == "bad-lease-oid":
+        intent["lease_oid"] = hostile
+    elif shape == "bad-lease-type":
+        intent["lease_oid"] = 1
+    elif shape == "writer-stopped":
+        intent["writer_stopped"] = hostile
+    elif shape == "released-other":
+        intent["lease_oid"] = "cd" * 20
+        intent["released_lease_ids"] = [hostile]
+    elif shape == "released-shape":
+        intent["released_lease_ids"] = hostile
+    elif shape == "released-without-oid":
+        intent["released_lease_ids"] = ["ab" * 20]
+    elif shape == "reason-length":
+        intent["reason"] = hostile + ("x" * queue.MAX_TEXT)
+    elif shape == "reason-multiline":
+        intent["reason"] = hostile + "\ntrailer"
+    elif shape == "reason-credential":
+        intent["reason"] = "token=" + hostile
+    elif shape == "caller-length":
+        intent["caller"] = hostile + ("c" * 200)
+    elif shape == "caller-multiline":
+        intent["caller"] = hostile + "\ntrailer"
+    elif shape == "stale-revision":
+        intent["revision"] = "f" * 64
+    elif shape == "not-claimed":
+        row["state"] = "queued"
+        row["lane"] = None
+        row["expires_at"] = None
+    elif shape == "lane-mismatch":
+        intent["lane"] = "beta"
+    else:
+        raise AssertionError(shape)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    again = queue.list(make_store, now=102)
+    refused = queue.unclaim(make_store, "ONE", expect="0" * 64, lane="alpha", now=103,
+                            caller="owner", writer_stopped=True)
+    for result in (listed, again, refused):
+        assert result["reason"] == "invalid_queue_state" and result["exit_code"] == 1, result
+        rendered = json.dumps(result)
+        assert hostile not in rendered and "trailer" not in rendered, rendered
+        assert "Waiting" not in rendered and "f" * 64 not in rendered
+        if shape == "bad-lane":
+            assert "BETA" not in rendered
+        if shape == "lane-mismatch":
+            assert "beta" not in rendered
+        assert "\n" not in rendered
+    assert path.read_bytes() == before
+
+
+def test_malformed_pending_intent_retries_after_repair(make_store):
+    path, state, _row = _pending_state(make_store)
+    state["unclaim"] = "private-value"
+    before = _write_state(path, state)
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
+    assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
+    assert all("private-value" not in json.dumps(result) for result in results)
+    assert path.read_bytes() == before
+    repaired = json.loads(before)
+    repaired.pop("unclaim")
+    _write_state(path, repaired)
+    restored = queue.list(make_store, now=103)
+    assert not restored["refused"], restored
+
+
+_PUBLIC_PREDICATES = ("valid_key", "valid_lane", "valid_revision", "check_capabilities", "normalize_branch")
+_QUEUE_ARGUMENT_NEXT = "Use the documented queue arguments and the revision returned by list."
+_ITEM_NEXT = "Supply a bounded queue item with the documented fields and single-line values."
+
+
+def _predicate_result(kind, value):
+    """One public predicate outcome. Refusal codes stay fixed; values are not echoed."""
+    if kind == "key":
+        return queue.valid_key(value)
+    if kind == "lane":
+        return queue.valid_lane(value)
+    if kind == "revision":
+        return queue.valid_revision(value)
+    if kind == "capabilities":
+        try:
+            checked = queue.check_capabilities(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_item" and str(error) == "invalid_item"
+            return error.reason
+        assert checked == value
+        return "ok"
+    if kind == "branch":
+        try:
+            return queue.normalize_branch(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_arguments" and str(error) == "invalid_arguments"
+            assert type(error) is queue.QueueRefusal
+            return error.reason
+    raise AssertionError(kind)
+
+
+def _predicate_spy(order, name, real):
+    def spy(*args, **kwargs):
+        order.append(name)
+        return real(*args, **kwargs)
+
+    return spy
+
+
+def _watch_predicates(monkeypatch):
+    """Spy the public predicates through literal module attributes."""
+    order = []
+    key, lane = queue.valid_key, queue.valid_lane
+    revision, capabilities = queue.valid_revision, queue.check_capabilities
+    branch = queue.normalize_branch
+    monkeypatch.setattr(queue, "valid_key", _predicate_spy(order, "valid_key", key))
+    monkeypatch.setattr(queue, "valid_lane", _predicate_spy(order, "valid_lane", lane))
+    monkeypatch.setattr(queue, "valid_revision", _predicate_spy(order, "valid_revision", revision))
+    monkeypatch.setattr(queue, "check_capabilities", _predicate_spy(order, "check_capabilities", capabilities))
+    monkeypatch.setattr(queue, "normalize_branch", _predicate_spy(order, "normalize_branch", branch))
+    return order
+
+
+def _refuse_workspace_io(monkeypatch):
+    def unavailable(*args, **kwargs):
+        pytest.fail("field validation must finish before workspace IO")
+
+    # descriptor_supported is the public probe _root calls before any descriptor I/O.
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+
+
+def _assert_fixed_refusal(result, reason, action):
+    rendered = json.dumps(result)
+    assert result["reason"] == reason and result["exit_code"] == 2 and result["refused"] is True
+    assert result["next_action"] == action and result["status"] == "refused"
+    assert "\n" not in rendered and "\r" not in rendered
+    assert "private-value" not in rendered and "injected" not in rendered
+    assert "private-value injected" not in rendered and "private-valueinjected" not in rendered
+    return rendered
+
+
+def test_field_predicates_are_one_public_source():
+    for name in _PUBLIC_PREDICATES:
+        assert name in queue.__all__
+    assert queue._key is queue.valid_key
+    assert queue._lane is queue.valid_lane
+    assert queue._branch_name is queue.normalize_branch
+    assert queue.valid_key("ONE") is True and queue.valid_key("A" * 64) is True
+    assert queue.valid_key("A" * 65) is False and queue.valid_key("bad id") is False
+    assert queue.valid_key("ONE\ninjected") is False and queue.valid_key("") is False
+    assert queue.valid_key(None) is False and queue.valid_key(1) is False
+    assert queue.valid_lane("alpha") is True and queue.valid_lane("Alpha") is False
+    assert queue.valid_lane("a..b") is False and queue.valid_lane("alpha.lock") is False
+    assert queue.valid_lane("a" * 64) is False and queue.valid_lane("alpha\ninjected") is False
+    assert queue.valid_revision("a" * 64) is True and queue.valid_revision("ab" * 32) is True
+    assert queue.valid_revision("A" * 64) is False and queue.valid_revision("a" * 63) is False
+    assert queue.valid_revision("a" * 63 + "\n") is False and queue.valid_revision("g" * 64) is False
+    assert queue.valid_revision(None) is False and queue.valid_revision(b"a" * 64) is False
+    assert queue.check_capabilities(["core", "review"]) == ["core", "review"]
+    assert queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS + 1)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core", "core"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(("core",))
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["bad id"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core\ninjected"])
+    assert queue.normalize_branch(None) is None
+    assert queue.normalize_branch("lane/alpha") == "lane/alpha"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    for branch in ("refs/tags/private-value", "refs/heads/HEAD", "HEAD", "refs/heads/",
+                   "private-value topic", "private-value\ninjected", "", 1):
+        with pytest.raises(queue.QueueRefusal, match="^invalid_arguments$") as caught:
+            queue.normalize_branch(branch)
+        assert caught.value.reason == "invalid_arguments"
+        assert "private-value" not in str(caught.value) and "injected" not in str(caught.value)
+        assert "\n" not in str(caught.value)
+
+
+def test_public_predicates_are_stable_across_threads():
+    cases = (
+        ("key", "ONE", True), ("key", "bad id", False), ("key", "ONE\ninjected", False),
+        ("lane", "alpha", True), ("lane", "a..b", False), ("lane", "alpha.lock", False),
+        ("revision", "a" * 64, True), ("revision", "A" * 64, False), ("revision", None, False),
+        ("capabilities", ["core", "review"], "ok"), ("capabilities", ["core", "core"], "invalid_item"),
+        ("capabilities", ["core\ninjected"], "invalid_item"),
+        ("branch", None, None), ("branch", "refs/heads/lane/alpha", "lane/alpha"),
+        ("branch", "refs/tags/private-value", "invalid_arguments"),
+        ("branch", "private-value topic", "invalid_arguments"),
+        ("branch", "private-value\ninjected", "invalid_arguments"),
+    )
+    expected = [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    def batch(_index):
+        return [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(batch, range(8))) == [expected] * 8
+
+
+@pytest.mark.parametrize("identifier,revision,lane", [
+    ("bad id", "a" * 64, "alpha"),
+    ("ONE\ninjected", "a" * 64, "alpha"),
+    ("", "a" * 64, "alpha"),
+    ("A" * 65, "a" * 64, "alpha"),
+    ("ONE", "A" * 64, "alpha"),
+    ("ONE", "a" * 63, "alpha"),
+    ("ONE", "a" * 63 + "\ninjected", "alpha"),
+    ("ONE", "g" * 64, "alpha"),
+    ("ONE", None, "alpha"),
+    ("ONE", "a" * 64, "a..b"),
+    ("ONE", "a" * 64, "alpha.lock"),
+    ("ONE", "a" * 64, "Alpha"),
+    ("ONE", "a" * 64, "alpha\ninjected"),
+    ("ONE", "a" * 64, ""),
+], ids=["spaced-id", "multiline-id", "empty-id", "long-id", "upper-revision", "short-revision",
+        "multiline-revision", "nonhex-revision", "revision-type", "parent-lane", "lock-lane",
+        "upper-lane", "multiline-lane", "empty-lane"])
+def test_malformed_claim_fields_share_predicates_before_io(monkeypatch, identifier, revision, lane):
+    key_ok, revision_ok = queue.valid_key(identifier), queue.valid_revision(revision)
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", identifier, expect=revision, lane=lane,
+                         capabilities=["core"], branch="lane/alpha", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order and order[0] == "valid_key"
+    if not key_ok:
+        assert order == ["valid_key"]
+    elif not revision_ok:
+        assert order == ["valid_key", "valid_revision"]
+    else:
+        assert order[:4] == ["valid_key", "valid_revision", "check_capabilities", "valid_lane"]
+        assert "normalize_branch" not in order
+
+
+@pytest.mark.parametrize("branch", ["refs/tags/private-value", "refs/remotes/origin/x", "HEAD",
+    "refs/heads/HEAD", "refs/heads/", "private-value topic", "private-value\ninjected", "", 1],
+    ids=["tags", "remote", "head", "heads-head", "empty-name", "spaces", "multiline", "empty", "type"])
+def test_invalid_branch_uses_public_normalizer_before_io(monkeypatch, branch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch=branch, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "normalize_branch"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+
+
+def test_duplicate_capabilities_precede_lane_branch_and_io(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="a..b", capabilities=["core", "core"],
+                         branch="refs/tags/private-value", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key", "valid_revision", "check_capabilities"]
+    listed = queue.list("/workspace", capabilities=["core", "core"], now=100)
+    _assert_fixed_refusal(listed, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "check_capabilities"
+    added = queue.add("/workspace", item(capabilities=["core", "core"]), now=100)
+    _assert_fixed_refusal(added, "invalid_item", _ITEM_NEXT)
+
+
+def test_invalid_ttl_precedes_branch_normalization(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/tags/private-value", ttl_s=0, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert "normalize_branch" not in order and "valid_lane" in order
+
+
+@pytest.mark.parametrize("verb", ["claim", "release", "unclaim", "done"])
+def test_mutation_verbs_use_public_key_before_io(monkeypatch, verb):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    arguments = {"expect": "a" * 64, "now": 100}
+    if verb == "claim":
+        arguments.update(lane="alpha", capabilities=["core"])
+    elif verb == "unclaim":
+        arguments.update(lane="alpha", writer_stopped=True, reason="private-value\ninjected")
+    elif verb == "done":
+        arguments.update(lane="alpha")
+    result = getattr(queue, verb)("/workspace", "bad id", **arguments)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key"]
+
+
+def test_capability_refusal_keeps_caller_category(monkeypatch):
+    _refuse_workspace_io(monkeypatch)
+    secret = "sk-" + "a" * 24
+    added = queue.add("/workspace", item(capabilities=[secret]), now=100)
+    claimed = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha",
+                          capabilities=[secret], now=100)
+    listed = queue.list("/workspace", capabilities=[secret], now=100)
+    assert added["reason"] == "invalid_item" and added["exit_code"] == 2
+    assert claimed["reason"] == "invalid_arguments" and claimed["exit_code"] == 2
+    assert listed["reason"] == "invalid_arguments" and listed["exit_code"] == 2
+    rendered = json.dumps((added, claimed, listed))
+    assert secret not in rendered and "\n" not in rendered
+
+
+def test_valid_predicates_hit_unsupported_platform_probe(tmp_path, monkeypatch):
+    probed = []
+
+    def unsupported():
+        probed.append("platform")
+        return False
+
+    monkeypatch.setattr(queue, "descriptor_supported", unsupported)
+    assert queue.valid_key("ONE") and queue.valid_lane("alpha") and queue.valid_revision("a" * 64)
+    assert queue.check_capabilities(["core"]) == ["core"]
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    result = queue.claim(tmp_path, "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/heads/lane/alpha", now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+    assert probed == ["platform"]
+    assert "refs/heads/lane/alpha" not in json.dumps(result)
+    assert result["next_action"]
+
+
+def test_predicate_failures_leave_state_and_retry(make_store):
+    revision = add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    refusals = [
+        {"identifier": "bad id"},
+        {"identifier": "ONE\ninjected"},
+        {"expect": "A" * 64},
+        {"expect": "a" * 63 + "\ninjected"},
+        {"lane": "a..b"},
+        {"lane": "alpha\ninjected"},
+        {"capabilities": ["core", "core"]},
+        {"branch": "refs/tags/private-value"},
+        {"branch": "private-value topic"},
+        {"branch": "private-value\ninjected"},
+    ]
+    for override in refusals:
+        arguments = {"identifier": "ONE", "expect": revision, "lane": "alpha", "capabilities": ["core"],
+                     "branch": "lane/alpha", "now": 101}
+        arguments.update(override)
+        identifier = arguments.pop("identifier")
+        result = queue.claim(make_store, identifier, **arguments)
+        _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+        assert path.read_bytes() == before
+    claimed = queue.claim(make_store, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                          branch="refs/heads/lane/alpha", now=101)
+    assert not claimed["refused"], claimed
+    assert claimed["item"]["branch"] == "lane/alpha"
+    released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not released["refused"], released
+    again = queue.claim(make_store, "ONE", expect=released["item"]["revision"], lane="alpha",
+                        capabilities=["core", "review"], branch="lane/alpha", now=103)
+    assert not again["refused"] and again["item"]["branch"] == "lane/alpha"
+
+
+def race_public_predicate_claim(arguments):
+    root, revision, mode = arguments
+    if mode == "accept":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="refs/heads/lane/alpha", ttl_s=10, now=101)
+    elif mode == "id":
+        result = queue.claim(root, "bad id", expect=revision, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "revision":
+        result = queue.claim(root, "ONE", expect="A" * 64, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "lane":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha\ninjected", capabilities=["core"], now=101)
+    elif mode == "capabilities":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core", "core"], now=101)
+    elif mode == "branch":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="private-value\ninjected", now=101)
+    else:
+        raise AssertionError(mode)
+    item_view = result.get("item")
+    return {"refused": result["refused"], "reason": result.get("reason"), "exit_code": result.get("exit_code"),
+            "branch": None if item_view is None else item_view.get("branch")}
+
+
+def test_concurrent_predicate_refusals_leave_one_claim(make_store):
+    revision = add(make_store)
+    modes = ["accept", "id", "revision", "lane", "capabilities", "branch"]
+    results = _spawn_race(race_public_predicate_claim, [(make_store, revision, mode) for mode in modes])
+    rendered = json.dumps(results)
+    assert "private-value" not in rendered and "injected" not in rendered and "\n" not in rendered
+    refused = [row for row in results if row["refused"]]
+    accepted = [row for row in results if not row["refused"]]
+    assert [row["reason"] for row in refused] == ["invalid_arguments"] * 5
+    assert [row["exit_code"] for row in refused] == [2] * 5
+    assert accepted == [{"refused": False, "reason": None, "exit_code": 0, "branch": "lane/alpha"}]
+    stored = queue.list(make_store, now=102)["items"][0]
+    assert stored["branch"] == "lane/alpha" and stored["state"] == "claimed"
+    retry = queue.claim(make_store, "ONE", expect=stored["revision"], lane="alpha",
+                        capabilities=["core"], branch="lane/alpha", now=112)
+    assert not retry["refused"] and retry["item"]["branch"] == "lane/alpha"

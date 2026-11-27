@@ -26,7 +26,7 @@ so the same report retried from another worktree is the same row.
   workspace lock outside git); nothing ever rewrites a row. A migration appends an epoch
   row instead. A caller that holds the worktree lock takes it first.
 
-Readers accept v1 rows (the ``cell``/``rule_id`` + ``signal`` shape of the v3
+Readers accept v1 rows (the ``rule_id`` + ``signal`` shape of the v3
 ``signals.jsonl``) and convert them in memory; see ``normalize_rows``.
 """
 from __future__ import annotations
@@ -42,11 +42,20 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_core import atomicio, credit_memo, gitsafe, storage
 from aegis_core.errors import PathTraversalError
-from aegis_core.primitives import utc_stamp
-from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl
+from aegis_core.primitives import is_within, utc_stamp
+from aegis_core.storage import (
+    FileReport, RowsResult, append_jsonl, append_jsonl_with_report,
+    ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label,
+)
+from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
+    "WorktreeMergePlan",
+    "plan_worktree_merge",
+    "pending_worktree_rows",
+    "merge_worktree_ledgers",
     "LEDGER_VERSION",
     "OUTCOMES",
     "SOURCES",
@@ -57,13 +66,19 @@ __all__ = [
     "append",
     "append_epoch",
     "append_rows",
+    "append_rows_with_report",
+    "credit_event_rows",
     "incomplete",
     "is_ambient_session_row",
     "ledger_path",
     "merge_rows",
     "normalize_rows",
+    "ordered_history",
     "plan_merge",
+    "positive_tp",
     "read",
+    "report_row_unusable",
+    "row_version",
 ]
 
 LEDGER_VERSION = 2
@@ -103,14 +118,8 @@ def _weight(row: Dict[str, Any]) -> Optional[Decimal]:
 # ── v1 compatibility ─────────────────────────────────────────────────────────
 
 def _v1_rule(row: Dict[str, Any]) -> Optional[str]:
-    for key in ("rule_id", "cell", "cell_id"):
-        value = row.get(key)
-        if isinstance(value, str) and value:
-            return value
-    used = row.get("cells_used")
-    if isinstance(used, list) and used and isinstance(used[0], str) and used[0]:
-        return used[0]
-    return None
+    value = row.get("rule_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _v1_to_v2(row: Dict[str, Any], origin: Any = "v1") -> Optional[Dict[str, Any]]:
@@ -147,57 +156,164 @@ def is_ambient_session_row(row: Mapping[str, Any]) -> bool:
             and row.get("outcome") in ("tp", "fp") and "from" not in row)
 
 
+def _row_header(row: Mapping[str, Any]) -> Tuple[Optional[int], Any]:
+    version = row.get("v", 1)
+    return (version if type(version) is int else None), row.get("event")
+
+
+def row_version(row: Mapping[str, Any]) -> Optional[int]:
+    """Legacy rows may omit the version. Unknown versions have no outcome semantics here."""
+    version, _ = _row_header(row)
+    return version if version in (1, LEDGER_VERSION) else None
+
+
+def _credit_kind(version: Optional[int], event: Any) -> Optional[str]:
+    if version == LEDGER_VERSION and isinstance(event, str) and event in _CREDIT_EVENTS:
+        return event
+    return None
+
+
+def credit_event_rows(rows: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+    """Read only registered credit events in the supported credit schema."""
+    return (row for row in rows if isinstance(row, dict) and _credit_kind(*_row_header(row)) is not None)
+
+
+def report_identity(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    """The check and rule of a usable report, independent of its stored append key."""
+    check, primary, alias = row.get("check"), row.get("rule"), row.get("for_rule")
+    rule = primary or alias
+    if (not isinstance(check, str) or not check or not isinstance(rule, str) or not rule
+            or (primary is not None and alias is not None and primary != alias)):
+        return None
+    tree = row.get("tree")
+    if tree is not None and (not isinstance(tree, str) or not tree):
+        return None
+    if row.get("witness") not in (None, "aegis") or ("result" in row and row["result"] not in OUTCOMES):
+        return None
+    if any(field in row for field in ("scan_ref", "rule_revision", "rule_type")):
+        from aegis_core.rule_integrity import valid_report_policy
+        if not valid_report_policy(row):
+            return None
+    return check, rule
+
+
+def checked_reports(rows: Sequence[Mapping[str, Any]]) -> Iterable[
+        Tuple[Tuple[str, str], Mapping[str, Any], Mapping[str, Any]]]:
+    """Yield the first valid report per check/rule alongside its check."""
+    checks = {r["id"]: r for r in rows if r.get("event") == "check" and isinstance(r.get("id"), str)}
+    seen = set()
+    for report in (row for row in rows if row.get("event") == "report"):
+        identity = report_identity(report)
+        if identity is None or identity in seen:
+            continue
+        check = checks.get(identity[0])
+        if check is None or report.get("tree") not in (None, check.get("tree")):
+            continue
+        seen.add(identity)
+        yield identity, report, check
+
+
+def report_row_unusable(row: Mapping[str, Any], tree: Optional[str], check_id: Optional[str], report_key: str) -> bool:
+    """Identify malformed evidence that could affect report selection or deduplication."""
+    version, event = _row_header(row)
+    if event is None or (version is not None and version != LEDGER_VERSION):
+        return False
+    if not isinstance(event, str):
+        return True
+    if event not in ("check", "report", "claimed"):
+        return False
+    row_tree = row.get("tree")
+    if (isinstance(row_tree, str) and row_tree and row_tree != tree and row.get("report_key") != report_key
+            and (event != "report" or row.get("check") != check_id)):
+        return False
+    if version is None:
+        return True
+    if event == "check":
+        return (not isinstance(row_tree, str) or not row_tree or type(row.get("passed")) is not bool
+                or not isinstance(row.get("id"), str) or not row["id"]
+                or (row.get("tests") is not None and not isinstance(row["tests"], dict)))
+    if event == "claimed":
+        return row_tree is not None and not isinstance(row_tree, str)
+    return (report_identity(row) is None
+            or (row.get("check") == check_id and row_tree is not None and row_tree != tree))
+
+
+def _valid_outcome(row: Dict[str, Any]) -> bool:
+    return (isinstance(row.get("rule"), str) and bool(row["rule"])
+            and row.get("outcome") in OUTCOMES and _weight(row) is not None)
+
+
+def positive_tp(row: Dict[str, Any]) -> bool:
+    """A usable, normalized ordinary outcome can reinforce only at positive TP weight."""
+    return row.get("outcome") == "tp" and bool(_weight(row))
+
+
 def normalize_rows(
     rows: Iterable[Dict[str, Any]], origins: Optional[List[Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Return ``(v2 outcome rows, unusable row count)`` for raw ledger rows of any version.
+    """Return usable ordinary outcomes in storage order and the unusable row count.
 
-    v2 rows pass through (``is_ambient_session_row`` rows as triggers); rows without
-    ``rule`` and ``outcome`` (an epoch row) are dropped without counting as unusable. v1 rows are converted in memory, never
-    rewritten on disk. v1 counted triggers in separate ``trigger`` rows (v3 ``aegis
-    check`` wrote one trigger row and one outcome row per rule and run), while a v2
-    outcome row is itself a trigger. So per rule, a v1 trigger row is dropped for each
-    v1 outcome row it pairs with: the rule ends with max(v1 triggers, v1 outcomes)
-    triggers, as v3 readers counted it. The trigger rows kept are the latest ones, so
-    the last trigger time survives. v1 MCP rows (``source: "mcp"``) never pair: v3
-    wrote a report as one outcome row, and a "partial" as one trigger row.
-
-    ``origins``, parallel to ``rows``, gives each converted row's ``from`` (provenance,
-    e.g. the v3 file and line ``aegis migrate`` read it from); the default is "v1".
+    Ambient v2 verdicts become triggers. Legacy v1 rows convert in memory and pair.
+    Paired triggers are dropped oldest first, retaining
+    v3's max(v1 triggers, v1 outcomes) count. v1 MCP rows never pair.
+    Parallel ``origins`` supplies each converted row's ``from`` value, defaulting to "v1".
     """
+    history, unusable = _classify_rows(rows, origins)
+    return _outcomes(history), unusable
+
+
+def _outcomes(history: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [row for row in history if row.get("event") is None]
+
+
+def _outcome_identity(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    key, rule = row.get("key"), row.get("rule")
+    return (key, rule) if isinstance(key, str) and key and isinstance(rule, str) and rule else None
+
+
+def _classify_rows(rows: Iterable[Dict[str, Any]], origins: Optional[List[Any]] = None, *, first_wins: bool = False
+                   ) -> Tuple[List[Dict[str, Any]], int]:
+    """Normalize outcomes and retain registered events in their original ledger order."""
     out: List[Dict[str, Any]] = []
     unusable = 0
-    v1_triggers: Dict[str, List[Dict[str, Any]]] = {}
+    v1_triggers: Dict[str, List[int]] = {}
     v1_outcomes: Dict[str, int] = {}
+    seen = set()
     for index, row in enumerate(rows):
-        if isinstance(row, dict) and row.get("event") in _CREDIT_EVENTS and "outcome" not in row:
-            continue
-        if row.get("v") == LEDGER_VERSION:
-            if "rule" not in row and "outcome" not in row:
-                continue  # epoch or other bookkeeping row
-            if (
-                isinstance(row.get("rule"), str) and row["rule"]
-                and row.get("outcome") in OUTCOMES and _weight(row) is not None
-            ):
-                out.append(dict(row, outcome="trigger") if is_ambient_session_row(row) else row)
-            else:
-                unusable += 1
-            continue
-        converted = _v1_to_v2(row, origins[index] if origins is not None else "v1")
-        if converted is None or _weight(converted) is None:
+        version, event = _row_header(row) if isinstance(row, dict) else (None, None)
+        if version not in (1, LEDGER_VERSION):
             unusable += 1
             continue
-        rule = converted["rule"]
-        if converted["source"] == "mcp":
-            out.append(converted)
-        elif converted["outcome"] == "trigger":
-            v1_triggers.setdefault(rule, []).append(converted)
+        if event is not None:
+            if _credit_kind(version, event) is None:
+                unusable += 1
+            else:
+                out.append(row)
+            continue
+        if version == LEDGER_VERSION:
+            if "rule" not in row and "outcome" not in row:
+                continue  # epoch or other bookkeeping row
+            normalized = dict(row, outcome="trigger") if is_ambient_session_row(row) else row
         else:
-            v1_outcomes[rule] = v1_outcomes.get(rule, 0) + 1
-            out.append(converted)
-    for rule, triggers in v1_triggers.items():
-        paired = min(len(triggers), v1_outcomes.get(rule, 0))
-        out.extend(triggers[paired:])
+            normalized = _v1_to_v2(row, origins[index] if origins is not None else "v1")
+        if normalized is None or not _valid_outcome(normalized):
+            unusable += 1
+            continue
+        identity = _outcome_identity(normalized) if first_wins else None
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        if version == 1 and normalized["source"] != "mcp":
+            rule = normalized["rule"]
+            if normalized["outcome"] == "trigger":
+                v1_triggers.setdefault(rule, []).append(len(out))
+            else:
+                v1_outcomes[rule] = v1_outcomes.get(rule, 0) + 1
+        out.append(normalized)
+    paired = {index for rule, triggers in v1_triggers.items() for index in triggers[:v1_outcomes.get(rule, 0)]}
+    if paired:
+        out = [row for index, row in enumerate(out) if index not in paired]
     return out, unusable
 
 
@@ -216,6 +332,8 @@ class LedgerView:
     # Every row as read (events included), for the other readers of the same call: one snapshot,
     # one parse. None on a view that never read the file; such a reader reads it and says why not.
     raw_rows: Optional[Tuple[Dict[str, Any], ...]] = field(default=None, repr=False, compare=False)
+    _history: Optional[Tuple[Tuple[Dict[str, Any], ...], Tuple[Dict[str, Any], ...]]] = field(
+        default=None, repr=False, compare=False)
 
     def health(self) -> Dict[str, Any]:
         """What the read could not use, as derived.json and ``aegis status`` record it."""
@@ -261,9 +379,17 @@ def read(workspace: Any) -> LedgerView:
     except OSError as exc:  # the shared state dir cannot be listed for its confinement check
         return LedgerView([], error=f"cannot read {exc.filename or 'the ledger directory'}: {exc.strerror or exc}")
     raw = read_jsonl(path)
-    rows, unusable = normalize_rows(raw.rows)
-    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path,
-                      None if raw.error else tuple(raw.rows))
+    history, unusable = _classify_rows(raw.rows, first_wins=True)
+    raw_rows = None if raw.error else tuple(raw.rows)
+    snapshot = (raw_rows, tuple(history)) if raw_rows is not None else None
+    return LedgerView(_outcomes(history), list(raw.skipped_lines), unusable, raw.torn_tail, raw.error,
+                      path, raw_rows, snapshot)
+
+
+def ordered_history(rows: Sequence[Dict[str, Any]], view: Any = None) -> Sequence[Dict[str, Any]]:
+    """Reuse the classified snapshot when it describes the requested ledger rows."""
+    cached = view._history if isinstance(view, LedgerView) else None
+    return cached[1] if cached is not None and cached[0] is rows else _classify_rows(rows, first_wins=True)[0]
 
 
 def _plain(value: Decimal) -> Any:
@@ -285,6 +411,8 @@ def aggregate_rows(rows: Iterable[Dict[str, Any]], rule: Optional[str] = None) -
     """aggregate() over rows already read (normalized v2 outcome rows)."""
     sums: Dict[str, Dict[str, Any]] = {}
     for row in rows:
+        if row.get("event") is not None:
+            continue
         name = row["rule"]
         if rule is not None and name != rule:
             continue
@@ -312,38 +440,39 @@ def _payload_digest(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("ascii")).hexdigest()
 
 
-# How many indexed bytes before the offset are re-read to confirm the cached index still
-# describes this file: (device, inode) alone passes a ledger deleted and recreated on a
-# reused inode, or rewritten in place, as long as it is at least as large as before.
-_TAIL_CHECK_BYTES = 256
+_AppendKey = Tuple[Optional[str], str, str]
+
+
+def _append_key(row: Mapping[str, Any], kind: Optional[str]) -> Optional[_AppendKey]:
+    identity = report_identity(row) if kind == "report" else _outcome_identity(row)
+    return (kind, *identity) if identity is not None else None
 
 
 @dataclass
 class _Index:
-    """What appends need from the ledger: the next seq and the (key, rule) identities.
+    """The next sequence number and identities scoped to each row kind.
 
-    Cached per ledger file and refreshed from the bytes appended since the last look,
-    so an append in a long-lived process reads only the new tail. ``tail`` holds the
-    last indexed bytes (up to _TAIL_CHECK_BYTES before ``offset``).
+    Reuse only an unchanged generation captured by a settled read. An append or
+    rewrite rebuilds the index: matching end bytes cannot prove prefix continuity.
     """
 
     device: int = -1
     inode: int = -1
     offset: int = 0
     last_seq: int = 0
-    keyed: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)
-    tail: bytes = b""
+    keyed: Dict[_AppendKey, Dict[str, Any]] = field(default_factory=dict)
+    report: Optional[FileReport] = None
 
-    def absorb(self, raw_rows: Iterable[Dict[str, Any]]) -> None:
+    def absorb(self, raw_rows: Sequence[Dict[str, Any]]) -> None:
         for raw in raw_rows:
             seq = raw.get("seq")
             if isinstance(seq, int) and not isinstance(seq, bool) and seq > self.last_seq:
                 self.last_seq = seq
-        rows, _ = normalize_rows(raw_rows)
+        rows, _ = _classify_rows(raw_rows)
         for row in rows:
-            key = row.get("key")
-            if isinstance(key, str) and key:
-                self.keyed.setdefault((key, row["rule"]), row)
+            identity = _append_key(row, row.get("event"))
+            if identity is not None:
+                self.keyed.setdefault(identity, row)
 
 
 _INDEX_GUARD = threading.Lock()
@@ -365,24 +494,37 @@ def _parse_tail(data: bytes) -> List[Dict[str, Any]]:
     return rows
 
 
-def _unread(path: Path, index: Optional[_Index], st: os.stat_result) -> Tuple[_Index, bytes]:
+def _unread(path: Path, index: Optional[_Index], st: os.stat_result,
+            clock_path: Path) -> Tuple[_Index, bytes]:
     """The cached index if it still describes ``path``, else a new one; plus the bytes
     after its offset."""
-    with open(path, "rb") as fh:
-        if (
-            index is not None
-            and (index.device, index.inode) == (st.st_dev, st.st_ino)
-            and st.st_size >= index.offset
-        ):
-            fh.seek(index.offset - len(index.tail))
+    generation = storage.file_generation(st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    fd = atomicio.open_regular(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        opened = os.fstat(fd)
+        same_descriptor = ((opened.st_dev, opened.st_ino) == (st.st_dev, st.st_ino)
+                           and storage.file_generation(opened.st_size, opened.st_mtime_ns,
+                                                       opened.st_ctime_ns) == generation)
+        if (same_descriptor and index is not None and index.report is not None
+                and (index.device, index.inode) == (st.st_dev, st.st_ino)
+                and index.offset == st.st_size
+                and credit_memo.settled(index.report)
+                and storage.file_generation(index.report.size, index.report.mtime_ns,
+                                            index.report.ctime_ns) == generation):
+            return index, b""
+        started_ns = credit_memo.filesystem_now(clock_path, opened.st_dev)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
             data = fh.read()
-            if data.startswith(index.tail):
-                return index, data[len(index.tail):]
-            fh.seek(0)
-        return _Index(device=st.st_dev, inode=st.st_ino), fh.read()
+            report = storage.file_report(fh.fileno(), data, started_ns=started_ns)
+        if (report is not None and (not same_descriptor or report.identity != (st.st_dev, st.st_ino)
+                or storage.file_generation(report.size, report.mtime_ns, report.ctime_ns) != generation)):
+            report = None  # A read spanning a generation change cannot certify a later hit.
+        return _Index(device=opened.st_dev, inode=opened.st_ino, report=report), data
+    finally:
+        os.close(fd)
 
 
-def _current_index(path: Path) -> _Index:
+def _current_index(path: Path, clock_path: Path) -> _Index:
     """The index of ``path`` as it is on disk now. Call with the workspace lock held.
 
     A final line without a newline is read on every call and never cached: a torn
@@ -400,31 +542,31 @@ def _current_index(path: Path) -> _Index:
         with _INDEX_GUARD:
             _INDEXES[key] = index
         return index
-    index, data = _unread(path, index, st)
+    index, data = _unread(path, index, st, clock_path)
     complete = data.rfind(b"\n") + 1
     if complete:
         index.absorb(_parse_tail(data[:complete]))
         index.offset += complete
-        index.tail = (index.tail + data[:complete])[-_TAIL_CHECK_BYTES:]
     with _INDEX_GUARD:
         _INDEXES[key] = index
     unterminated = _parse_tail(data[complete:])
     if not unterminated:
         return index
-    view = _Index(index.device, index.inode, index.offset, index.last_seq, dict(index.keyed), index.tail)
+    view = _Index(index.device, index.inode, index.offset, index.last_seq, dict(index.keyed), index.report)
     view.absorb(unterminated)
     return view
 
 
-def _write(path: Path, rows: List[Dict[str, Any]]) -> None:
-    """Append rows and absorb them into the index. Call with the workspace lock held."""
+def _write(path: Path, rows: List[Dict[str, Any]]) -> Optional[FileReport]:
+    """Append rows and invalidate the index. Call with the workspace lock held."""
     try:
-        append_jsonl(path, rows)
-    except BaseException:
+        written = append_jsonl_with_report(path, rows)
+    finally:
         with _INDEX_GUARD:
-            _INDEXES.pop(str(path), None)  # the file may hold part of the write: re-read it next time
-        raise
-    _current_index(path)
+            _INDEXES.pop(str(path), None)  # A failed write may also have changed the file.
+    if written.count != len(rows):
+        raise OSError("ledger append did not persist all rows")
+    return written.report
 
 
 def _validated(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -487,14 +629,14 @@ def append(workspace: Any, events: Iterable[Dict[str, Any]]) -> List[Dict[str, A
         return []
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
-        seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        index = _current_index(path, site.lock)
+        seen: Dict[_AppendKey, Dict[str, Any]] = {}
         results: List[Dict[str, Any]] = []
         new_rows: List[Dict[str, Any]] = []
         seq = index.last_seq
         stamp = utc_stamp()
         for row in planned:
-            identity = (row["key"], row["rule"]) if row["key"] else None
+            identity = _append_key(row, None)
             existing = None
             if identity is not None:
                 existing = seen.get(identity) or index.keyed.get(identity)
@@ -524,7 +666,7 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("note must be a mapping")
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
+        index = _current_index(path, site.lock)
         row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": utc_stamp(), "epoch": note}
         if site.worktree is not None:
             row["worktree"] = site.worktree
@@ -533,20 +675,25 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Append already-formed v2 outcome rows (``aegis migrate``), renumbering their seq.
+    """Append v2 rows, skipping duplicates; return the plain list of rows written."""
+    return append_rows_with_report(workspace, rows).rows
 
-    Rows whose ``(key, rule)`` is already in the ledger are skipped, so a re-run adds
-    nothing. Returns the rows written.
+
+def append_rows_with_report(workspace: Any, rows: List[Dict[str, Any]]) -> RowsResult:
+    """Append already-formed v2 rows, renumbering their sequence numbers.
+
+    A keyed row deduplicates within its own kind. Returns the rows written and
+    optional write-descriptor evidence.
     """
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
+        index = _current_index(path, site.lock)
         seq = index.last_seq
         seen = set(index.keyed)
         new_rows = []
         for row in rows:
-            key = row.get("key")
-            identity = (key, row.get("rule")) if isinstance(key, str) and key else None
+            kind = _credit_kind(LEDGER_VERSION, row.get("event"))
+            identity = _append_key(row, kind) if kind is not None or (row.get("event") is None and _valid_outcome(row)) else None
             if identity is not None and identity in seen:
                 continue
             seq += 1
@@ -556,9 +703,8 @@ def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, An
             new_rows.append(written)
             if identity is not None:
                 seen.add(identity)
-        if new_rows:
-            _write(path, new_rows)
-        return new_rows
+        report = _write(path, new_rows) if new_rows else None
+        return RowsResult(new_rows, report)
 
 
 # ── Merging the ledgers of several worktrees (v4.2 #7) ───────────────────────
@@ -683,3 +829,169 @@ def merge_rows_report(
         existing, _unusable = normalize_rows(read_jsonl(site.path).rows)
         added, duplicates, conflicts = plan_merge_report(existing, sources)
         return (append_rows(workspace, added) if added else []), duplicates, conflicts
+
+
+@dataclass
+class WorktreeMergePlan:
+    """Inputs, health and pending rows for a v4 shared-ledger merge."""
+
+    root: Path
+    worktree_sources: List[Tuple[str, Path]] = field(default_factory=list)
+    worktree_pending: int = 0
+    worktree_stats: Dict[str, Any] = field(default_factory=dict)
+    unreadable: List[str] = field(default_factory=list)
+    skipped: List[Dict[str, str]] = field(default_factory=list)
+    refusal: Optional[str] = None
+
+
+@dataclass
+class _WorktreeLedger:
+    """One worktree's own ledger as read for the merge: its usable rows (each with the
+    ``worktree`` it came from) and what could not be used, or why it was not read."""
+
+    label: str
+    workspace: Path
+    path: Path
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    skipped_lines: int = 0
+    unusable_rows: int = 0
+    problem: Optional[Tuple[str, str, str]] = None
+
+
+def _listed_worktrees(root: Path) -> List[Path]:
+    """The work trees ``git worktree list`` names (a bare repository has none)."""
+    for args, sep in ((["worktree", "list", "--porcelain", "-z"], b"\0"), (["worktree", "list", "--porcelain"], b"\n")):
+        try:
+            done = gitsafe.run(args, root)
+        except gitsafe.GitError:
+            return []
+        if done.returncode == 0:  # -z needs git 2.36; older git exits 129 and the second form answers
+            break
+    else:
+        return []
+    paths: List[Path] = []
+    for token in done.stdout.split(sep):
+        if token.startswith(b"worktree "):
+            paths.append(Path(os.fsdecode(token[len(b"worktree "):])))
+        elif token == b"bare" and paths:
+            paths.pop()
+    return paths
+
+
+def _worktree_roots(root: Path) -> List[Tuple[str, Path]]:
+    """(label, workspace root) of ``root`` in every worktree of its repository, this one
+    included, sorted by label; only worktrees whose directory exists. Empty outside git."""
+    top = gitsafe.toplevel(root)
+    relative = workspace_relative(root)
+    if top is None or relative is None:
+        return []
+    found: Dict[str, Path] = {}
+    for tree in [top, *_listed_worktrees(root)]:
+        resolved = Path(os.path.realpath(tree))
+        if not resolved.is_dir():
+            continue  # a worktree whose directory was removed (git calls it prunable)
+        found[worktree_label(resolved)] = resolved if relative == "." else resolved.joinpath(*relative.split("/"))
+    return sorted(found.items())
+
+
+def _read_worktree_ledger(label: str, workspace: Path) -> Optional[_WorktreeLedger]:
+    """The ledger ``workspace`` (the workspace root inside one worktree) keeps, or None when
+    it has none. Read only, and never through a link: another worktree's ``.aegis`` or
+    ``.aegis/state`` is whatever its commits put there."""
+    layout = WorkspaceLayout(workspace)
+    source = _WorktreeLedger(label, workspace, layout.ledger_file)
+    for directory in (layout.aegis_dir, layout.state_dir):
+        outside = os.path.lexists(directory) and not is_within(directory, workspace, unresolvable=False)
+        if directory.is_symlink() or outside:
+            why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
+            source.problem = ("skipped", directory.as_posix(),
+                              f"{why}; its ledger was not read (aegis migrate reads and writes only inside the workspace)")
+            return source
+    if not os.path.lexists(layout.ledger_file):
+        return None
+    read = read_jsonl(layout.ledger_file)
+    if read.error:
+        source.problem = ("unreadable", layout.ledger_file.as_posix(), read.error)
+        return source
+    rows, unusable = normalize_rows(read.rows)
+    for row in rows:
+        stamp = row["worktree"] if isinstance(row.get("worktree"), str) and row["worktree"] else label
+        source.rows.append(dict(row, worktree=stamp))
+    source.skipped_lines = read.skipped
+    source.unusable_rows = unusable
+    return source
+
+
+def plan_worktree_merge(result: WorktreeMergePlan) -> None:
+    layout = WorkspaceLayout(result.root)
+    roots = _worktree_roots(layout.root)
+    if not roots:
+        return  # not in git: the ledger is .aegis/state/ledger.jsonl and nothing is shared
+    try:
+        ledger_site(layout.root, create=False)
+    except PathTraversalError as exc:
+        result.refusal = str(exc)
+        return
+    except OSError as exc:
+        result.refusal = f"cannot use the shared ledger directory: {exc.strerror or exc}"
+        return
+    sources: List[_WorktreeLedger] = []
+    for label, workspace in roots:
+        found = _read_worktree_ledger(label, workspace)
+        if found is None:
+            continue
+        if found.problem is not None:
+            kind, path, reason = found.problem
+            if kind == "unreadable":
+                result.unreadable.append(path)
+            else:
+                result.skipped.append({"path": path, "reason": reason})
+            continue
+        sources.append(found)
+    if not sources:
+        return
+    shared = read(layout.root)
+    if shared.error:
+        result.refusal = f"cannot merge into the shared ledger: {shared.error}"
+        return
+    added, duplicates, conflicts = plan_merge_report(shared.rows, [source.rows for source in sources])
+    result.worktree_sources = [(source.label, source.workspace) for source in sources]
+    result.worktree_pending = len(added)
+    result.worktree_stats = {
+        "sources": [source.path.as_posix() for source in sources],
+        "rows": len(added),
+        "duplicates": duplicates,
+        "conflicts": conflicts,
+        "unusable_rows": sum(source.unusable_rows for source in sources),
+        "skipped_lines": sum(source.skipped_lines for source in sources),
+    }
+
+
+def merge_worktree_ledgers(root: Path, sources: List[Tuple[str, Path]]) -> int:
+    """Merge the ledgers ``sources`` name into the shared ledger of ``root``, reading them
+    again now: a row appended since the plan is merged too. Returns the rows written."""
+    read: List[_WorktreeLedger] = []
+    for label, workspace in sources:
+        found = _read_worktree_ledger(label, workspace)
+        if found is not None and found.problem is None:
+            read.append(found)
+    written, duplicates, conflicts = merge_rows_report(root, [found.rows for found in read])
+    if written:
+        append_epoch(root, {
+            "migration": "worktree-ledgers",
+            "sources": sorted(found.label for found in read),
+            "rows": len(written),
+            "duplicates": duplicates,
+            **({"conflicts": conflicts} if conflicts else {}),
+        })
+    return len(written)
+
+
+def pending_worktree_rows(root: Any) -> int:
+    """Count pending v4 worktree rows without writing; unavailable repositories yield zero."""
+    result = WorktreeMergePlan(Path(os.fspath(root)).resolve())
+    try:
+        plan_worktree_merge(result)
+    except OSError:
+        return 0
+    return result.worktree_pending

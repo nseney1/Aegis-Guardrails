@@ -94,7 +94,7 @@ class TestSuggestions:
 
 
 class TestPromoteAndDemote:
-    def test_find_cell_file(self, workspace: Path):
+    def test_find_rule_file(self, workspace: Path):
         trap = _rule(workspace, "traps", "test-v", "trap")
         assert find_rule_file(workspace, "test-v") == (trap, "trap")
         assert find_rule_file(workspace, "../etc/passwd") == (None, None)
@@ -168,7 +168,7 @@ def test_generate_slug_names_a_rule_from_its_hypothesis():
     ("true", ["null", "#tag"], ["it's/*.py", "**"]),
     ("12", ["- dash"], ['say "hi"/*.md']),
 ])
-def test_create_cell_writes_every_value_back_exactly_as_given(tmp_path, domain, tags, target_paths):
+def test_create_rule_writes_every_value_back_exactly_as_given(tmp_path, domain, tags, target_paths):
     """create_rule serializes through the one frontmatter writer (defense #30): a value that
     looks like a comment, a boolean, a number or a list item is quoted, never reinterpreted."""
     from aegis_core.lifecycle.creation import create_rule

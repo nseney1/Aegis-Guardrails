@@ -1,17 +1,244 @@
 """aegis_core.storage atomic writes and JSONL I/O (ADR 0005 AD-3 L0)."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from aegis_core import storage
 from aegis_core.storage import append_jsonl, atomic_write_bytes, atomic_write_text, read_jsonl
+from tests.conftest import symlink_or_skip
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+anchored_locks_only = pytest.mark.skipif(
+    os.name != "posix" or os.open not in os.supports_dir_fd
+    or not getattr(os, "O_NOFOLLOW", 0) or not getattr(os, "O_DIRECTORY", 0),
+    reason="POSIX descriptor-relative locks require dir_fd and O_NOFOLLOW",
+)
+byte_range_locks_only = pytest.mark.skipif(
+    storage.fcntl is not None or storage.msvcrt is None,
+    reason="Windows byte-range lock primitive required",
+)
+
+
+# ── Descriptor-anchored file locks ───────────────────────────────────────────
+
+@pytest.fixture
+def lock_directory():
+    descriptors = []
+
+    def open_directory(path):
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(descriptor)
+        return descriptor
+
+    yield open_directory
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+
+
+def _contend_for_file_lock(path):
+    """Use another process so a thread lock cannot conceal a missing OS lock."""
+    env = {"HOME": str(path.parent), "USERPROFILE": str(path.parent),
+           "PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", """
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.errors import LockTimeoutError
+from aegis_core.storage import file_lock
+try:
+    with file_lock(Path(sys.argv[2]), timeout=0.0):
+        print("acquired")
+except LockTimeoutError as exc:
+    print(exc.code)
+""", str(Path(__file__).resolve().parents[3]), str(path)],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True, text=True, timeout=5, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+@anchored_locks_only
+def test_anchored_file_lock_still_locks_after_an_ancestor_swap(tmp_path, lock_directory):
+    from aegis_core.storage import file_lock
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for parent in (a, b):
+        (parent / "private").mkdir(parents=True)
+    a_fd = lock_directory(a / "private")
+    b_fd = lock_directory(b / "private")
+    moved_b = tmp_path / "original-b"
+
+    with file_lock(a / "private" / "log.lock", dir_fd=a_fd):
+        b.rename(moved_b)
+        symlink_or_skip(a, b, target_is_directory=True)
+        with file_lock(b / "private" / "log.lock", timeout=0.0, dir_fd=b_fd):
+            assert _contend_for_file_lock(moved_b / "private" / "log.lock") == "LOCK_TIMEOUT"
+        with file_lock(moved_b / "private" / "log.lock", timeout=0.0):
+            pass
+
+
+@anchored_locks_only
+@pytest.mark.parametrize("alternate_spelling", [False, True], ids=["same-path", "different-path"])
+def test_anchored_file_lock_reenters_the_same_file(
+        tmp_path, lock_directory, alternate_spelling):
+    from aegis_core.storage import file_lock
+
+    directory = lock_directory(tmp_path)
+    lock = tmp_path / "log.lock"
+    nested = tmp_path / "unused-parent" / lock.name if alternate_spelling else lock
+    with file_lock(lock, dir_fd=directory):
+        with file_lock(nested, timeout=0.0, dir_fd=directory):
+            pass
+        assert _contend_for_file_lock(lock) == "LOCK_TIMEOUT"
+    with file_lock(lock, timeout=0.0):
+        pass
+
+
+@anchored_locks_only
+@pytest.mark.parametrize("outer_anchored", [False, True], ids=["path-first", "anchored-first"])
+def test_file_lock_reenters_across_acquisition_modes(tmp_path, lock_directory, outer_anchored):
+    from aegis_core.storage import file_lock
+
+    directory = lock_directory(tmp_path)
+    lock = tmp_path / "log.lock"
+    with file_lock(lock, dir_fd=directory if outer_anchored else None):
+        with file_lock(lock, timeout=0.0, dir_fd=None if outer_anchored else directory):
+            pass
+        assert _contend_for_file_lock(lock) == "LOCK_TIMEOUT"
+    with file_lock(lock, timeout=0.0):
+        pass
+
+
+@anchored_locks_only
+@pytest.mark.parametrize("outer_anchored", [False, True], ids=["path-first", "anchored-first"])
+@pytest.mark.parametrize("inner_anchored", [False, True], ids=["path-inner", "anchored-inner"])
+def test_file_lock_does_not_reenter_a_replacement_inode(
+        tmp_path, lock_directory, outer_anchored, inner_anchored):
+    from aegis_core.storage import file_lock
+
+    directory = lock_directory(tmp_path)
+    lock = tmp_path / "log.lock"
+    with file_lock(lock, dir_fd=directory if outer_anchored else None):
+        original = lock.stat()
+        lock.rename(tmp_path / "original.lock")
+        lock.touch()
+        replacement = lock.stat()
+        assert (original.st_dev, original.st_ino) != (replacement.st_dev, replacement.st_ino)
+        with file_lock(lock, timeout=0.0, dir_fd=directory if inner_anchored else None):
+            assert _contend_for_file_lock(lock) == "LOCK_TIMEOUT"
+        with file_lock(lock, timeout=0.0):
+            pass
+
+
+def test_anchored_file_lock_refuses_an_unsupported_platform(tmp_path, monkeypatch):
+    from aegis_core import storage
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(name="nt", fspath=os.fspath))
+    with pytest.raises(ValueError, match="^dir_fd requires a POSIX directory descriptor$"):
+        with storage.file_lock(tmp_path / "log.lock", dir_fd=0):
+            pytest.fail("unsupported descriptor-relative lock was accepted")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_byte_range_file_lock_does_not_reenter_a_distinct_stream(tmp_path, monkeypatch):
+    """Model stream identity and contention at the OS boundary on every platform."""
+    from aegis_core.errors import LockTimeoutError
+
+    one, two = tmp_path / "one.lock", tmp_path / "two.lock"
+    one.write_bytes(b"1")
+    two.write_bytes(b"2")
+    held_elsewhere = True
+
+    def stream_fstat(fd):
+        return SimpleNamespace(st_dev=1, st_ino=1)
+
+    def locking(fd, operation, count):
+        # The fixture bytes distinguish streams independently of stat/fstat's
+        # platform-specific identity fields. _try_os_lock seeks to byte zero.
+        if operation == 2 and held_elsewhere and os.read(fd, count) == b"2":
+            raise OSError("stream held by another process")
+
+    monkeypatch.setattr(storage, "fcntl", None)
+    monkeypatch.setattr(storage, "msvcrt", SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking))
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**{**vars(os), "fstat": stream_fstat}))
+    with storage.file_lock(one):
+        with storage.file_lock(one, timeout=0.0):
+            pass
+        with pytest.raises(LockTimeoutError) as error:
+            with storage.file_lock(two, timeout=0.0):
+                pytest.fail("a distinct stream bypassed the OS lock")
+        assert error.value.code == "LOCK_TIMEOUT"
+    held_elsewhere = False
+    with storage.file_lock(two, timeout=0.0):
+        pass
+
+
+@byte_range_locks_only
+def test_windows_file_lock_does_not_reenter_a_contended_alternate_stream(tmp_path):
+    from aegis_core.errors import LockTimeoutError
+
+    base = tmp_path / "p.lock"
+    base.touch()
+    one, two = tmp_path / "p.lock:one", tmp_path / "p.lock:two"
+    one.write_bytes(b"1")
+    two.write_bytes(b"2")
+    one_info, two_info = one.stat(), two.stat()
+    assert (one_info.st_dev, one_info.st_ino) == (two_info.st_dev, two_info.st_ino)
+    ready = tmp_path / "held"
+    repo = Path(__file__).resolve().parents[3]
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+           "PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", """
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.storage import file_lock
+with file_lock(Path(sys.argv[2]), timeout=0.0):
+    Path(sys.argv[3]).write_text("held", encoding="ascii")
+    sys.stdin.buffer.read(1)
+""", str(repo), str(two), str(ready)],
+        cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            if child.poll() is not None:
+                _, err = child.communicate(timeout=5)
+                pytest.fail(f"stream holder exited before acquiring its lock: {err!r}")
+            assert time.monotonic() < deadline, "stream holder did not acquire its lock"
+            time.sleep(0.01)
+        with storage.file_lock(one, timeout=0.0):
+            with storage.file_lock(one, timeout=0.0):
+                pass
+            with pytest.raises(LockTimeoutError) as error:
+                with storage.file_lock(two, timeout=0.0):
+                    pytest.fail("a contended alternate stream was treated as reentrant")
+            assert error.value.code == "LOCK_TIMEOUT"
+            assert _contend_for_file_lock(one) == "LOCK_TIMEOUT"
+    finally:
+        try:
+            _, err = child.communicate(input=b"x" if child.poll() is None else None, timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate(timeout=5)
+            pytest.fail("stream holder did not exit after release")
+    assert child.returncode == 0, err
+    with storage.file_lock(two, timeout=0.0):
+        pass
 
 
 @pytest.fixture
@@ -138,6 +365,70 @@ def test_append_jsonl_writes_one_object_per_line(tmp_path: Path):
     ]
 
 
+@pytest.mark.parametrize("prefix", [None, b'{"old":'])
+def test_jsonl_reports_the_descriptor_identity_and_end_offset(tmp_path, monkeypatch, prefix):
+    path = tmp_path / "ledger.jsonl"
+    if prefix is not None:
+        path.write_bytes(prefix)
+    real_fsync = os.fsync
+    written_through = []
+
+    def fsync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            written_through.append(((info.st_dev, info.st_ino), info.st_size))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fsync=fsync)))
+    row = {"note": "café", "padding": "x" * 512}
+    written = storage.append_jsonl_with_report(path, [row])
+    data = path.read_bytes()
+
+    assert written.count == 1 and not isinstance(written, int)
+    assert written.report.identity == written_through[0][0]
+    assert written.report.size == written_through[0][1] == len(data)
+    assert written.report.added == len(data) - len(prefix or b"")
+    assert not hasattr(written.report, "tail")
+    assert not hasattr(written.report, "head")
+    read = read_jsonl(path)
+    assert read.rows == [row]
+    assert read.report.identity == written.report.identity
+    assert read.report.size == len(data)
+    assert not hasattr(read.report, "tail")
+    assert not hasattr(read.report, "head")
+
+
+def test_jsonl_reports_generation_without_process_clock_or_extra_append_reads(tmp_path, monkeypatch):
+    from aegis_core import storage
+
+    path = tmp_path / "ledger.jsonl"
+    append_jsonl(path, [{"padding": "x" * 512}])
+    reads, real_read = [], os.read
+    opens, real_open = [], storage._open_regular
+
+    def open_file(*args, **kwargs):
+        opens.append(args[0])
+        return real_open(*args, **kwargs)
+
+    def read(fd, size):
+        reads.append(size)
+        return real_read(fd, size)
+
+    # Replace only storage's reference, leaving pytest's own OS operations alone.
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), read=read)))
+    monkeypatch.setattr(storage, "_open_regular", open_file)
+    written = storage.append_jsonl_with_report(path, [{"rule": "a"}])
+    after = path.stat()
+    assert reads == [1]
+    assert written.report.size == after.st_size
+    assert written.report.started_ns is None
+    assert (written.report.mtime_ns, written.report.ctime_ns) == (0, 0)
+    report = read_jsonl(path).report
+    assert storage.file_generation(report.size, report.mtime_ns, report.ctime_ns) == storage.file_generation(after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    assert report.started_ns is None
+    assert opens == [path, path]
+
+
 def test_append_jsonl_keeps_the_file_valid_utf8(tmp_path: Path):
     path = tmp_path / "ledger.jsonl"
     append_jsonl(path, [{"note": "café \ud800  "}])
@@ -251,6 +542,37 @@ def test_read_jsonl_reports_an_unreadable_file_without_raising(tmp_path: Path):
     result = read_jsonl(path)
     assert result.rows == []
     assert result.error is not None and str(path) in result.error
+
+
+def test_read_jsonl_closes_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    path.write_bytes(b'{"a":1}\n')
+    descriptors, real_open = [], storage._open_regular
+
+    def opened(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        descriptors.append(fd)
+        return fd
+
+    def refused(*args, **kwargs):
+        raise OSError(errno.EIO, "injected fdopen failure")
+
+    monkeypatch.setattr(storage, "_open_regular", opened)
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fdopen=refused)))
+    try:
+        result = read_jsonl(path)
+        assert result.rows == [] and result.report is None
+        assert result.error == f"cannot read {path}: injected fdopen failure"
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptors[0])
+        assert caught.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
 
 
 # ── Never through a link (review B2a round 3, F1) ────────────────────────────
@@ -585,3 +907,61 @@ def test_create_private_file_removes_a_partial_file_when_the_write_fails(tmp_pat
     with pytest.raises(OSError, match="No space"):
         storage.create_private_file(tmp_path / "link.key", b"k" * 32)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_append_jsonl_evidence_is_opt_in(tmp_path, monkeypatch, reported):
+    path = tmp_path / "rows.jsonl"
+    calls, real_report = [], storage.file_report
+
+    def report(*args, **kwargs):
+        calls.append(True)
+        return real_report(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "file_report", report)
+    append = storage.append_jsonl_with_report if reported else storage.append_jsonl
+    result = append(path, [{"a": 1}])
+    assert calls == ([True] if reported else [])
+    assert read_jsonl(path).rows == [{"a": 1}]
+    if reported:
+        assert result.count == 1 and result.report.size == path.stat().st_size
+    else:
+        assert type(result) is int and result == 1
+
+
+def test_append_jsonl_explicit_empty_result_creates_nothing(tmp_path):
+    path = tmp_path / "absent" / "rows.jsonl"
+    result = storage.append_jsonl_with_report(path, [])
+    assert result.count == 0 and result.report is None
+    assert not path.parent.exists()
+
+
+def test_append_jsonl_missing_optional_evidence_still_succeeds(tmp_path, monkeypatch):
+    path = tmp_path / "rows.jsonl"
+    real_fstat, calls = os.fstat, []
+
+    def fstat(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError("injected evidence failure")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fstat=fstat)))
+    result = storage.append_jsonl_with_report(path, [{"a": 1}])
+    assert result.count == 1 and result.report is None
+    assert read_jsonl(path).rows == [{"a": 1}]
+    with pytest.raises(OSError) as error:
+        real_fstat(calls[0])
+    assert error.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("bad, error, message", [
+    ([{"bad": object()}], TypeError, "Object of type object is not JSON serializable"),
+    ([["not an object"]], ValueError, "a JSONL row must be a JSON object, got list"),
+])
+def test_append_jsonl_explicit_result_serializes_before_writing(tmp_path, bad, error, message):
+    path = tmp_path / "rows.jsonl"
+    path.write_bytes(b'{"a":1}\n')
+    with pytest.raises(error, match="^" + message + "$"):
+        storage.append_jsonl_with_report(path, bad)
+    assert path.read_bytes() == b'{"a":1}\n'

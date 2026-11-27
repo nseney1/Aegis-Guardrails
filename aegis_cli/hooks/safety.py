@@ -7,6 +7,7 @@ tests/unit/core/test_command_safety.py pins every row where they differ and why.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 import re
 import shlex
@@ -70,7 +71,7 @@ def log_gate_event(cmd: str, decision: str, reason: str, workspace: Path) -> Non
 
 def run_safety_gate(
     cmd: str | None = None,
-    payload: dict[str, Any] | None = None,
+    payload: object = None,
     workspace: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Evaluate a tool-use command against destructive patterns.
@@ -78,13 +79,15 @@ def run_safety_gate(
     Fail-closed: if unable to parse the command or command is empty, returns force_ask.
     """
     root = workspace or Path.cwd()
-    if cmd is None and payload is not None:
-        tc = payload.get("toolCall", {})
-        args = tc.get("args", {})
-        cmd = args.get("CommandLine", "")
+    if cmd is None and isinstance(payload, Mapping):
+        tool_call = payload.get("toolCall")
+        if isinstance(tool_call, Mapping):
+            args = tool_call.get("args")
+            if isinstance(args, Mapping):
+                cmd = args.get("CommandLine")
     if not cmd or not isinstance(cmd, str) or not cmd.strip():
         reason = "Unable to parse command — requesting confirmation"
-        log_gate_event(cmd or "", "BLOCKED", reason, root)
+        log_gate_event(cmd if isinstance(cmd, str) else "", "BLOCKED", reason, root)
         return 0, {
             "decision": "force_ask",
             "reason": f"🛡️ Safety Gate: {reason}",

@@ -10,9 +10,9 @@ import math
 import os
 from pathlib import Path
 import re
-import shlex
 from typing import Mapping, Sequence
 
+from aegis_core.argv import split_command
 from aegis_core.config import read_user_config
 from aegis_core.pathlookup import is_bare, which
 from aegis_core.primitives import is_within, key_within
@@ -51,7 +51,7 @@ def language_settings(workspace: Path, language: str, *, coverage: bool = False)
         words = settings["command"]
         if isinstance(words, str):
             try:
-                words = shlex.split(words, posix=os.name != "nt")
+                words = split_command(words)
             except ValueError as exc:
                 raise ValueError(f"invalid {prefix}.command") from exc
         if not isinstance(words, list) or not words or not all(

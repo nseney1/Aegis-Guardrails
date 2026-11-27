@@ -156,66 +156,10 @@ class TestResolveBackend:
         assert resolve_backend(None, environ=env) is None
 
     def test_unbalanced_quotes_are_an_error(self):
-        with pytest.raises(LLMCommandError, match="AEGIS_LLM_CMD|--llm-cmd"):
-            resolve_backend("claude -p 'unterminated", environ={})
-
-    def test_windows_command_keeps_the_backslashes_of_native_paths(self, monkeypatch):
-        # POSIX shlex reads '\' as an escape: C:\tools\llm.exe became C:toolsllm.exe.
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        backend = resolve_backend(None, environ={ENV_VAR: r"C:\Python312\python.exe C:\tools\llm.py -p"})
-        assert backend.argv == [r"C:\Python312\python.exe", r"C:\tools\llm.py", "-p"]
-
-    def test_windows_command_groups_a_double_quoted_path_with_spaces(self, monkeypatch):
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        backend = resolve_backend(r'"C:\Program Files\nodejs\node.exe" D:\tools\llm.js --json', environ={})
-        assert backend.argv == [r"C:\Program Files\nodejs\node.exe", r"D:\tools\llm.js", "--json"]
-
-    def test_windows_command_accepts_posix_single_quoting(self, monkeypatch):
-        # What shlex.join (and docs written for a POSIX shell) produce for these paths.
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        backend = resolve_backend(r"'C:\Program Files\llm.exe' 'C:\tools\x.py' ship", environ={})
-        assert backend.argv == [r"C:\Program Files\llm.exe", r"C:\tools\x.py", "ship"]
-
-    def test_windows_command_with_unbalanced_quotes_is_an_error(self, monkeypatch):
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        with pytest.raises(LLMCommandError, match="AEGIS_LLM_CMD|--llm-cmd"):
-            resolve_backend(r'"C:\Program Files\llm.exe -p', environ={})
-
-    @pytest.mark.parametrize("raw, argv", [
-        # A quoted span groups anywhere in a token, as CommandLineToArgvW reads it.
-        ('llm --flag="a b" -p', ["llm", "--flag=a b", "-p"]),
-        ('llm --title="say \\"hi\\"" x', ["llm", '--title=say "hi"', "x"]),
-        ('llm pre"fix mid"post', ["llm", "prefix midpost"]),
-        # 2n backslashes before a quote are n and the quote is syntax; 2n+1 escape it.
-        (r'llm "C:\dir with space\\" next', ["llm", "C:\\dir with space\\", "next"]),
-        (r'llm a\\\"b', ["llm", 'a\\"b']),
-        # Backslashes anywhere else are literal; an empty quoted span is an empty argument.
-        (r"llm C:\tools\ x", ["llm", "C:\\tools\\", "x"]),
-        ('llm "" x', ["llm", "", "x"]),
-    ])
-    def test_windows_command_splits_as_command_line_to_argv(self, monkeypatch, raw, argv):
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        assert resolve_backend(raw, environ={}).argv == argv
-
-    @pytest.mark.parametrize("argv", [
-        ["llm", "--flag=a b", "-p"],
-        [r"C:\Program Files\node.exe", r"D:\x y\llm.js", 'say "hi"', "trailing\\", "dir with\\", "", "100%"],
-        ["codex", "exec", "--skip-git-repo-check", r"\\server\share\x", 'a\\"b'],
-    ])
-    def test_windows_command_reads_back_what_list2cmdline_writes(self, monkeypatch, argv):
-        # subprocess.list2cmdline quotes for the C runtime; the split must undo it exactly.
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        assert resolve_backend(subprocess.list2cmdline(argv), environ={}).argv == argv
-
-    def test_windows_command_with_an_unclosed_mid_token_quote_is_an_error(self, monkeypatch):
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "nt")
-        with pytest.raises(LLMCommandError, match="AEGIS_LLM_CMD|--llm-cmd"):
-            resolve_backend('llm --flag="a b', environ={})
-
-    def test_posix_command_honors_shell_quoting_and_escapes(self, monkeypatch):
-        monkeypatch.setattr("aegis_core.inference_provider.os.name", "posix")
-        backend = resolve_backend(r"my\ llm -p 'two words'", environ={})
-        assert backend.argv == ["my llm", "-p", "two words"]
+        raw = "claude -p 'unterminated"
+        with pytest.raises(LLMCommandError) as caught:
+            resolve_backend(raw, environ={})
+        assert str(caught.value) == f"cannot parse --llm-cmd / {ENV_VAR} {raw!r}: No closing quotation"
 
     def test_missing_backend_message_names_both_sources(self):
         assert MISSING_BACKEND == "Layer 2 needs --llm-cmd or AEGIS_LLM_CMD"

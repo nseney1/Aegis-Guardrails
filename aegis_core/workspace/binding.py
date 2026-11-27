@@ -51,6 +51,7 @@ __all__ = [
     "Attested",
     "CONFIDENCE",
     "REGISTRY_VERSION",
+    "REASONS",
     "Registry",
     "WorkspaceBinding",
     "WorkspaceHold",
@@ -59,6 +60,8 @@ __all__ = [
     "denial",
     "denial_message",
     "git_boundary",
+    "git_discovery_ceiling",
+    "git_discovery_paths",
     "home_message",
     "read_registry",
     "resolve_binding",
@@ -80,6 +83,19 @@ CONFIDENCE: Mapping[str, str] = {
 }
 
 BOUND, UNBOUND, HOLD, ERROR = "bound", "unbound", "hold", "error"
+
+# Every refusal producer is checked against the wording contract's declared set.
+REASONS = frozenset({
+    "pin_missing", "pin_denied", "pin_not_a_workspace", "pin_conflicts_with_host_root",
+    "pin_conflicts_with_registry", "host_root_conflicts_with_registry", "host_roots_not_governed",
+    "ambiguous_host_roots", "cwd_conflicts_with_registry", "ambiguous_registry_selection",
+    "no_workspace", "pin_conflicts_with_target", "pin_conflicts_with_cwd",
+})
+
+
+def _require_reason(reason: str) -> None:
+    if reason not in REASONS:
+        raise ValueError("undeclared workspace binding reason")
 
 
 class Attested(NamedTuple):
@@ -105,6 +121,8 @@ class WorkspaceBinding:
     reason: Optional[str] = None
     message: str = ""
     details: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+    # Presentation variant, deliberately absent from the public as_dict schema.
+    kind: Optional[str] = None
 
     @property
     def bound(self) -> bool:
@@ -134,8 +152,11 @@ def _bound(root: Path, source: str) -> WorkspaceBinding:
     return WorkspaceBinding(BOUND, root, source, CONFIDENCE[source])
 
 
-def _not_bound(status: str, reason: str, message: str, source: Optional[str] = None, **details: Any) -> WorkspaceBinding:
-    return WorkspaceBinding(status, source=source, reason=reason, message=message, details=tuple(details.items()))
+def _not_bound(status: str, reason: str, message: str, source: Optional[str] = None,
+               *, kind: Optional[str] = None, **details: Any) -> WorkspaceBinding:
+    _require_reason(reason)
+    return WorkspaceBinding(status, source=source, reason=reason, message=message,
+                            details=tuple(details.items()), kind=kind)
 
 
 # ── denylist and the bounded walk-up ─────────────────────────────────────────
@@ -202,25 +223,105 @@ def denial_message(path: Path) -> Optional[str]:
     return None
 
 
+def _git_ceiling_entries() -> Iterable[str]:
+    """Git setup.c canonicalize_ceiling_entry: an empty entry ends resolution.
+
+    After that marker keep spelling intact, including slash direction on Windows;
+    Git's longest_ancestor_length compares it literally against its physical cwd.
+    No filesystem operation is performed on those later entries.
+    """
+    resolve = True
+    for entry in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep):
+        if not entry:
+            resolve = False
+            continue
+        if not os.path.isabs(entry):
+            continue
+        if resolve:
+            path = Path(entry)
+            try:
+                try:
+                    path = path.resolve(strict=True)
+                except FileNotFoundError:
+                    # Git permits a missing final component, not missing parents.
+                    path = path.parent.resolve(strict=True) / path.name
+                entry = path.as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
+        yield entry
+
+
+def _git_ceiling_for(physical: str) -> Optional[str]:
+    """The nearest matching ceiling spelling, sharing Git's entry semantics."""
+    nearest: Optional[str] = None
+    limit = -1
+    for entry in _git_ceiling_entries():
+        prefix = entry[:-1] if entry.endswith("/") else entry
+        length = len(prefix)
+        if physical == prefix or physical == entry:
+            return entry
+        if (physical.startswith(prefix) and physical[length:length + 1] == "/"
+                and physical[length + 1:] and length > limit):
+            nearest, limit = entry, length
+    return nearest
+
+
+def git_discovery_ceiling(start: Path) -> Optional[Path]:
+    """Nearest ceiling at or above physical ``start``, or None; unresolvable starts raise OSError."""
+    entry = _git_ceiling_for(_resolve(start).as_posix())
+    return Path(entry) if entry is not None else None
+
+
+def git_discovery_paths(start: Path) -> Iterable[Path]:
+    """Walk physical ancestors within the configured discovery ceilings.
+
+    Inspect the starting directory, stopping there if it equals a ceiling;
+    otherwise stop before Git's longest proper ceiling.
+    This limits discovery only; explicit workspace pins keep their authority.
+    """
+    try:
+        start = start.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return
+    ceiling = _git_ceiling_for(start.as_posix())
+    limit = -1 if ceiling is None else len(ceiling[:-1] if ceiling.endswith("/") else ceiling)
+    yield start
+    for parent in start.parents:
+        if len(parent.as_posix().rstrip("/")) <= limit:
+            break
+        yield parent
+
+
 def git_boundary(start: Path) -> Optional[Path]:
-    """The innermost repository root around ``start``: the nearer of the closest
+    """The innermost safe discovery boundary around ``start``: the nearer of the closest
     ancestor holding a ``.git`` entry and git's own toplevel (asked through gitsafe).
 
     The ``.git`` marker needs no subprocess and also bounds a broken or unreadable
-    repository; git's answer covers worktrees and ``GIT_DIR`` layouts. The deeper of
-    the two wins, so the bound is never looser than either.
+    repository; git's answer covers worktrees and explicit layouts. For implicit
+    discovery the deeper candidate within the ceiling-bounded walk wins. Explicit
+    ``GIT_DIR``/``GIT_WORK_TREE`` layouts bypass ceilings, retaining ancestor and
+    marker checks. Without a usable candidate they stop discovery at ``start``.
     """
     from aegis_core import gitsafe
 
-    marker = next((d for d in (start, *start.parents) if os.path.lexists(d / ".git")), None)
+    directories = tuple(git_discovery_paths(start))
+    if not directories:
+        return None
+    start = directories[0]
+    marker = next((d for d in directories if os.path.lexists(d / ".git")), None)
     top = gitsafe.toplevel(start)
     if top is not None:
         try:
             top = _resolve(top)
         except OSError:
             top = None
-    found = [p for p in (marker, top) if p is not None and (p == start or p in start.parents)]
-    return max(found, key=lambda p: len(p.parts)) if found else None
+    explicit = "GIT_DIR" in os.environ or "GIT_WORK_TREE" in os.environ
+    # Implicit Git discovery can walk above an equal ceiling; discard that answer.
+    found = [p for p in (marker, top) if p is not None and (p == start or p in start.parents)
+             and (explicit or p in directories)]
+    if found:
+        return max(found, key=lambda p: len(p.parts))
+    return start if explicit else None
 
 
 def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = None) -> Optional[Path]:
@@ -228,7 +329,8 @@ def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = 
     upwards, or None.
 
     The walk includes ``start``, stops at its git boundary (``git_boundary``) and
-    never reaches ``$HOME`` or the filesystem root, so a v3.3 ``~/.aegis/rules`` or a
+    never enters a GIT_CEILING_DIRECTORIES ancestor, ``$HOME`` or the filesystem root,
+    so a v3.3 ``~/.aegis/rules`` or a
     workspace that encloses the home directory is never chosen. Reads only.
     """
     accept = accept or is_aegis_workspace
@@ -243,9 +345,10 @@ def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = 
     if accept(current):
         return current
     bound = git_boundary(current)
-    while current != bound:
-        parent = current.parent
-        if parent == current or denial(parent):
+    parents = iter(git_discovery_paths(current))
+    next(parents)  # The starting directory was already checked.
+    for parent in parents:
+        if current == bound or denial(parent):
             return None
         current = parent
         if accept(current):
@@ -366,14 +469,24 @@ def home_message(home: Path) -> str:
     )
 
 
-def _pin_problem(pin: Path) -> Optional[Tuple[str, str]]:
+@dataclass(frozen=True)
+class _PinProblem:
+    reason: str
+    message: str
+    kind: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _require_reason(self.reason)
+
+
+def _pin_problem(pin: Path) -> Optional[_PinProblem]:
     denied = denial(pin)
     if denied:
-        return "pin_denied", f"AEGIS_WORKSPACE is set to {pin}, which is the {denied.replace('_', ' ')}"
+        return _PinProblem("pin_denied", f"AEGIS_WORKSPACE is set to {pin}, which is the {denied.replace('_', ' ')}", denied)
     if not pin.is_dir():
-        return "pin_missing", f"AEGIS_WORKSPACE is set to {pin}, which is not a directory"
+        return _PinProblem("pin_missing", f"AEGIS_WORKSPACE is set to {pin}, which is not a directory", "not_a_directory")
     if not is_aegis_workspace(pin):
-        return "pin_not_a_workspace", f"AEGIS_WORKSPACE is set to {pin}, which has no .aegis/ (run aegis init there)"
+        return _PinProblem("pin_not_a_workspace", f"AEGIS_WORKSPACE is set to {pin}, which has no .aegis/ (run aegis init there)")
     return None
 
 
@@ -398,7 +511,7 @@ def resolve_binding(
             return _not_bound(ERROR, "pin_missing", f"AEGIS_WORKSPACE is set to {raw_pin}, which cannot be resolved", "pin")
         problem = _pin_problem(pin_root)
         if problem:
-            return _not_bound(ERROR, problem[0], problem[1].replace(str(pin_root), raw_pin), "pin")
+            return _not_bound(ERROR, problem.reason, problem.message.replace(str(pin_root), raw_pin), "pin", kind=problem.kind)
         if attested:
             host_roots = sorted({_shown(a.path) for a in attested})
             # A host root agrees when it lies in the pinned workspace (its walk-up finds
@@ -505,7 +618,12 @@ def _cli_path(path: PathLike, base: Optional[Path] = None, what: str = "") -> Pa
     try:
         return _resolved(path, base)
     except OSError as exc:
-        raise WorkspaceNotFoundError(f"{what}{os.fspath(path)} cannot be resolved: {exc.__cause__ or exc}") from exc
+        kind = {"AEGIS_WORKSPACE ": "pin_resolution", "--workspace ": "target_resolution"}.get(what)
+        field = "pin" if kind == "pin_resolution" else "target"
+        binding = _not_bound(ERROR, "pin_missing" if field == "pin" else "no_workspace", "",
+                             kind=kind, **{field: os.fspath(path)})
+        raise WorkspaceNotFoundError(f"{what}{os.fspath(path)} cannot be resolved: {exc.__cause__ or exc}",
+                                     binding=binding) from exc
 
 
 def _pin_hold(explicit: PathLike, start: Path, pin_root: Path, accept: Optional[Callable[[Path], bool]]) -> None:
@@ -569,7 +687,7 @@ def resolve_cli_root(
     ``--workspace X`` (or the cwd) walks up no further than its git toplevel and never
     to ``$HOME`` or the filesystem root; an uninitialized directory resolves to itself
     so a command can say so. ``accept`` widens what the walk stops at (as in
-    ``bounded_walk_up``; ``aegis migrate`` also stops at a legacy ``.soma/``). An
+    ``bounded_walk_up``). An
     ``AEGIS_WORKSPACE`` pin must be a workspace (``.aegis/``, or what ``accept`` takes,
     as the server's resolver requires) and must agree with an explicit target, or
     without one with the cwd: the cwd's walk-up result, else its repository, must be the
@@ -583,10 +701,12 @@ def resolve_cli_root(
         raw_pin = os.fspath(pin)
         pin_root = _cli_path(raw_pin, base, "AEGIS_WORKSPACE ")
         problem = _pin_problem(pin_root)
-        if problem and problem[0] == "pin_not_a_workspace" and accept is not None and accept(pin_root):
-            problem = None  # accept may also raise, e.g. the upgrade message at a legacy .soma/
+        if problem and problem.reason == "pin_not_a_workspace" and accept is not None and accept(pin_root):
+            problem = None  # an explicit accept policy may also raise its own refusal
         if problem:
-            raise WorkspaceNotFoundError(problem[1].replace(str(pin_root), raw_pin))
+            message = problem.message.replace(str(pin_root), raw_pin)
+            binding = _not_bound(ERROR, problem.reason, message, "pin", kind=problem.kind, pin=raw_pin)
+            raise WorkspaceNotFoundError(message, binding=binding)
         if explicit:
             _pin_hold(explicit, start, pin_root, accept)
         else:
@@ -597,5 +717,6 @@ def resolve_cli_root(
         return found
     message = denial_message(start)
     if message:
-        raise WorkspaceNotFoundError(message)
+        binding = _not_bound(ERROR, "no_workspace", message, kind=denial(start), target=str(start))
+        raise WorkspaceNotFoundError(message, binding=binding)
     return start

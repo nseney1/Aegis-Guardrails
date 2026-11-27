@@ -27,7 +27,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import pytest
 
@@ -40,22 +40,56 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 # own __init__ (version only) is L0; it is not a prefix, so a new module has no layer.
 CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
+    "aegis_core.diagnostic_messages": 0,
+    "aegis_core.display_attribution": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
+    "aegis_core.merge_queue": 2,
+    "aegis_core.merge_queue_model": 1,
+    "aegis_core.merge_queue_types": 0,
+    # Canonical message records and untrusted views (stdlib only).
+    "aegis_core.message_codec": 0,
+    # Shared format primitives and anchored content-addressed storage.
+    "aegis_core.message_codec_format": 0,
+    "aegis_core.message_codec_store": 0,
+    # Streaming message views and rendered-size preflight (stdlib only).
+    "aegis_core.message_codec_views": 0,
     # Pure data, no aegis imports: the host table and the bootstrap text.
     "aegis_core.hosts": 0,
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
+    # STORE-API-1: the confined read/publish boundary storage.confined_file delegates to (stdlib only).
+    "aegis_core.storage_confined": 0,
+    "aegis_core.storage_shared": 0,
+    "aegis_core.gitops_checkpoint": 0,
+    "aegis_core.gitops_fds": 0,
+    "aegis_core.gitops_holder": 0,
+    "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_bound": 0,
+    "aegis_core.gitsafe_policy": 0,
+    "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_board": 1,
+    "aegis_core.team_claims": 2,
+    "aegis_core.team_custody": 1,
+    "aegis_core.team_custody_checks": 1,
+    "aegis_core.team_gate": 0,
+    "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
+    "aegis_core.git_path_codec": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # Operator command-string grammar shared by planners and process consumers.
+    "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
+    "aegis_core.pathlookup_fence": 0,
+    "aegis_core.pathlookup_gitcache": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
+    "aegis_core.proposals": 2,
     # The one secret-redaction table and its entry points (stdlib only).
     "aegis_core.redaction": 0,
     "aegis_core.config": 0,
@@ -66,19 +100,91 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.events": 0,
     "aegis_core.stats": 0,
     "aegis_core.workspace": 0,
+    "aegis_core.rule_lint": 2,
+    "aegis_core.rule_lint_capture": 2,
+    "aegis_core.rule_lint_grammar": 2,
+    "aegis_core.rule_lint_reasons": 0,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
     "aegis_core.match": 1,
+    "aegis_core.team_workspace_display": 0,
+    "aegis_core.team_workspace_events": 0,
+    "aegis_core.team_workspace_store": 0,
+    "aegis_core.team_writer_binding": 1,
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
     "aegis_core.ast": 1,
+    "aegis_core.scan_exposure": 1,
+    "aegis_core.scan_simulation": 2,
     "aegis_core.skills": 1,
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
     "aegis_core.team": 1,
+    "aegis_core.team_host_adapter": 0,
+    "aegis_core.team_host_agy": 1,
+    "aegis_core.team_isolation": 0,
+    "aegis_core.team_isolation_capability": 0,
+    "aegis_core.team_isolation_mounts": 0,
+    "aegis_core.team_isolation_refusal": 0,
+    "aegis_core.team_isolation_verify": 0,
+    "aegis_core.team_jobs_recipes": 0,
+    "aegis_core.team_jobs_source": 0,
+    "aegis_core.team_land_plan": 0,
+    "aegis_core.team_lease_custody": 0,
+    "aegis_core.team_lifecycle": 1,
+    "aegis_core.team_lifecycle_writers": 1,
+    "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_delivery": 1,
+    "aegis_core.team_mailbox_doctor": 1,
+    "aegis_core.team_mailbox_guidance": 1,
+    "aegis_core.team_mailbox_index": 1,
+    "aegis_core.team_mailbox_index_scan": 0,
+    "aegis_core.team_mailbox_pager": 0,
+    "aegis_core.team_mailbox_primitives": 0,
+    "aegis_core.team_mailbox_records": 1,
+    "aegis_core.team_mailbox_service": 1,
+    "aegis_core.team_mailbox_store": 0,
+    "aegis_core.team_meter": 0,
+    "aegis_core.team_metrics": 1,
+    "aegis_core.team_native_authority": 1,
+    "aegis_core.team_native_bridge": 1,
+    "aegis_core.team_native_codemode": 0,
+    "aegis_core.team_native_events": 0,
+    "aegis_core.team_native_keys": 0,
+    "aegis_core.team_native_rollout": 0,
+    "aegis_core.team_native_session": 1,
+    "aegis_core.team_native_wire": 0,
+    "aegis_core.team_paths": 1,
+    "aegis_core.team_profile": 1,
+    "aegis_core.team_profile_display": 0,
+    "aegis_core.team_supervisor": 1,
+    "aegis_core.team_supervisor_observe": 2,
+    "aegis_core.team_supervisor_start": 1,
+    "aegis_core.team_templates": 0,
+    "aegis_core.team_host_plan": 0,
+    "aegis_core.team_host_qualify": 0,
+    "aegis_core.team_host_qualify_evidence": 0,
+    "aegis_core.team_host_qualify_report": 0,
+    "aegis_core.team_host_registry": 0,
+    "aegis_core.team_hosts": 2,
+    "aegis_core.team_git_snapshot": 0,
+    "aegis_core.team_gitops": 0,
+    "aegis_core.model_select": 1,
+    # Manager-only policy and append-only audit domain; no repository credit imports.
+    "aegis_core.manager_policy": 1,
+    "aegis_core.manager_runtime": 2,
+    "aegis_core.manager_store": 1,
+    "aegis_core.manager_adjudication": 3,
+    # Startup-pinned configuration and owner approval over the audit domain.
+    "aegis_core.manager_config": 2,
+    # Shared manager decision/report service over the pinned activation service.
+    "aegis_core.manager": 3,
+    "aegis_core.guidance_grammar": 0,
+    "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
+    "aegis_core.kernel_identity": 0,
     # Pure AST inspection of lane declarations and pytest configuration.
     "aegis_core.lane_ast": 0,
     # The post-lane gate (aegis check --lane): team, matcher, gitsafe and events.
@@ -88,10 +194,15 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.governance": 1,
     "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
+    "aegis_core.approval_policy": 1,
+    "aegis_core.approval_shape": 0,
+    # Literal workflow parsing (text in, verdicts out; stdlib only).
+    "aegis_core.workflow_jobs": 0,
     # v4.3 verified checks: the tree identity (gitsafe, pathlookup), the credit state machine over the ledger
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
+    "aegis_core.credit_memo": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
     # Standalone stdlib unittest reporting, launched by the L1 test execution service.
@@ -105,6 +216,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop, a package (user-scope JSONL, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
+    "aegis_core.redaction_patterns": 0,
     # v4.3 T5: fail-to-pass regression check (gitsafe, testexec's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,
@@ -113,6 +225,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.lifecycle": 2,
     "aegis_core.migrate": 2,
     "aegis_core.metrics": 2,
+    "aegis_core.model_served": 1,
     "aegis_core.outcomes": 2,
     "aegis_core.verification": 2,
     "aegis_core.inference_provider": 2,
@@ -120,6 +233,22 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    "aegis_core.team_profile_schema": 0,
+    "aegis_core.team_publish": 2,
+    "aegis_core.team_qualify": 0,
+    "aegis_core.team_queue": 2,
+    "aegis_core.team_review": 0,
+    "aegis_core.team_review_copy": 0,
+    "aegis_core.team_review_files": 0,
+    "aegis_core.team_review_verify": 0,
+    "aegis_core.team_roles": 0,
+    "aegis_core.team_session_census": 1,
+    "aegis_core.team_session_custody": 1,
+    "aegis_core.team_session_stop": 1,
+    "aegis_core.team_session_wake": 1,
+    "aegis_core.team_source": 0,
+    # Read-only lane status report over lease declarations and the existing tip gate.
+    "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.
     "aegis_core.packs": 2,
     # The benchmark: scan, Layer 1 and events over a fixture corpus it ships as package data.
@@ -173,13 +302,19 @@ def _string_import(node: ast.Call) -> Optional[str]:
     return None
 
 
-def import_edges(root: Path = REPO) -> List[Edge]:
-    modules = _module_files(root)
+def module_inventory(root: Path = REPO) -> Dict[str, Tuple[Path, ast.Module]]:
+    """One scan-local inventory; consumers inspect the trees without modifying them."""
+    return {module: (path, ast.parse(path.read_text(encoding="utf-8"),
+                                    filename=path.relative_to(root).as_posix()))
+            for module, path in _module_files(root).items()}
+
+
+def import_edges(root: Path = REPO, *, inventory=None) -> List[Edge]:
+    modules = module_inventory(root) if inventory is None else inventory
     edges: List[Edge] = []
-    for module, path in modules.items():
+    for module, (path, tree) in modules.items():
         is_package = path.name == "__init__.py"
         rel = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         for node in import_nodes(tree):
             targets: List[str] = []
             if isinstance(node, ast.Import):

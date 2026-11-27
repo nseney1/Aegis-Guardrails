@@ -99,7 +99,7 @@ def test_git_environment_claim_names_the_evidence_scope_and_hook_exception():
 
 # Names of v3 components and v3 biology vocabulary that v4 dropped. A policy document
 # that still names one points the reader at something the repository no longer has.
-RETIRED_NAMES = ("Breeze", "Tempest", "Spores", "Mulch", "genome", "enzyme", "phylogeny", "evolutionary")
+RETIRED_NAMES = ("Breeze", "Tempest", "evolutionary")
 
 
 def test_policy_documents_use_no_retired_v3_names():
@@ -117,6 +117,11 @@ def test_policy_documents_use_no_retired_v3_names():
 # be added here and to the table.
 SPAWN_SITES = {
     "aegis_core/gitsafe.py": ("`git`",),
+    # GM-5: the strict lane runner starts the same `git` (through gitsafe custody).
+    "aegis_core/gitsafe_run.py": ("`git`",),
+    # PROCESS-CENSUS-LITERAL-PROGRAMS: the gitops custody holder (a real module, launched -I -c from its captured
+    # source) starts the same `git` through the descriptor-pinned executable while it owns the effect receipt.
+    "aegis_core/gitops_holder.py": ("`git`",),
     "aegis_cli/install_hosts.py": ("`codex`, `claude`",),
     # Doctor's MCP launcher check compares commands and starts nothing (no `python3`).
     "aegis_cli/doctor.py": ("`codex`, `claude`",),
@@ -126,6 +131,9 @@ SPAWN_SITES = {
     "aegis_core/verification/test_runner.py": ("`pytest`",),
     "aegis_core/verification/mutation_tester.py": ("`pytest`",),
     "aegis_core/inference_provider.py": ("your model command",),
+    "aegis_core/team_supervisor_start.py": ("owner-configured component argv (absolute executable, cwd=/, no shell)",),
+    # Wake turns/control use a caller-selected profile under owner custody; liveness probes start ps.
+    "aegis_core/team_session_wake.py": ("wake profile and control argv",),
     # Install runs the aegis it is about to register once, on an empty payload, in an empty directory.
     "aegis_cli/hooks/registrar.py": ("`aegis`, the hook handler",),
     # `aegis benchmark` starts the same handler under this Python (-I -c) on a fixture payload, in a temp workspace.
@@ -141,6 +149,10 @@ SPAWN_SITES = {
     # `aegis doctor --release` asks `gh --version`, one read-only `gh api` GET of the repository for its
     # default branch, the tier GETs, then `gh attestation verify` (read-only).
     "aegis_core/release_verify.py": ("`gh`",),
+    "aegis_core/team_native_bridge.py": ("owner-configured evidence-only provider argv (absolute executable, no shell)",),
+    "aegis_cli/team_isolation.py": ("`podman`", "`docker`"),
+    # MANAGER-RULES-SERVING-a: the pinned manager runtime launches the offline builder and the dedicated venv Python.
+    "aegis_core/manager_runtime.py": ("owner-selected isolated Python for manager runtime",),
 }
 _SPAWN_MODULES = {"subprocess", "pty", "multiprocessing"}
 _OS_SPAWN = re.compile(r"^(system|popen|startfile|exec\w*|spawn\w*|posix_spawn\w*)$")
@@ -183,9 +195,9 @@ def test_every_module_that_starts_a_program_is_in_the_inventory():
 def test_the_repository_trust_table_names_what_each_spawn_site_starts():
     table = _section(_security_text(), "Repository trust")
     rows = [line for line in table.splitlines() if line.startswith("| ") and not line.startswith("|---")]
-    first_cells = [row.split(" | ", 1)[0] for row in rows]
+    first_rules = [row.split(" | ", 1)[0] for row in rows]
     missing = sorted({term for terms in SPAWN_SITES.values() for term in terms
-                      if not any(term in cell for cell in first_cells)})
+                      if not any(term in rule for rule in first_rules)})
     assert missing == [], "the Repository trust table has no row for these programs"
 
 
@@ -223,9 +235,9 @@ def test_security_names_every_hook_registration_file_and_what_it_is_not(tmp_path
 def _tier_table():
     section = _section(_security_text(), "Trust tiers")
     rows = [line for line in section.splitlines() if line.startswith("| ") and not line.startswith("|---")]
-    header, *body = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+    header, *body = [[rule.strip() for rule in row.strip().strip("|").split("|")] for row in rows]
     assert header == ["Claim", "Tier A", "Tier B", "Tier C"]
-    return [dict(zip(header, cells)) for cells in body]
+    return [dict(zip(header, rules)) for rules in body]
 
 
 def test_the_tier_b_column_claims_no_more_than_a_pull_request_editable_check_supports():

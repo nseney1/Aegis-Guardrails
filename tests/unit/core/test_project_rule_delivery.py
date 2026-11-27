@@ -31,6 +31,7 @@ def project_catalog(tmp_path_factory):
     ("aegis_core/ast/policy.py", "contract-ast-semantic-fidelity"),
     ("aegis_core/redaction.py", "contract-redaction-before-output"),
     ("aegis_core/storage.py", "contract-atomic-storage-boundaries"),
+    ("aegis_core/storage_shared.py", "contract-atomic-storage-boundaries"),
     ("aegis_core/scan.py", "contract-jit-rule-delivery"),
     ("aegis_core/testexec.py", "boundary-repo-content-untrusted"),
     ("aegis_core/telemetry_engine/ledger.py", "persona-check-local-performance"),

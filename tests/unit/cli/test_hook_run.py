@@ -445,6 +445,7 @@ def test_a_failed_event_write_never_changes_the_decision(ws, capsys, monkeypatch
     assert _run(capsys, "claude-code", claude(ws, "Bash", {"command": "git merge x"})) == (0, "", "")
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="the deadline uses SIGALRM (POSIX)")
 def test_the_deadline_fails_open(ws, capsys, monkeypatch):
     monkeypatch.setattr(pretool, "DEADLINE_SECONDS", 0.2)
@@ -455,6 +456,7 @@ def test_the_deadline_fails_open(ws, capsys, monkeypatch):
     assert _events(ws) == []
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="the deadline uses SIGALRM (POSIX)")
 def test_the_deadline_leaves_the_callers_timer_and_handler_as_they_were(ws, capsys):
     def mine(signum, frame):
@@ -784,8 +786,13 @@ def test_a_scan_rows_time_is_read_as_strptime_reads_it(ws, capsys, stamp, counts
 # Measured on Linux, Python 3.12: 22 Aegis modules when this test was written, 28 after w14 split
 # aegis_core.atomicio out of storage and aegis_cli.commands_table out of cli (moved code, not new
 # code). The bounds leave room for another Python version and platform (Windows loads msvcrt,
-# _winapi and nt-only modules), not for a new subsystem on the hook path.
-_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 28
+# _winapi and nt-only modules), not for a new subsystem on the hook path. 29 after PATHLOOKUP-GIT-CACHE-SPLIT
+# moved the ordinary-Git cache policy out of aegis_core.pathlookup into aegis_core.pathlookup_gitcache (moved code).
+# Reviewed PROPOSAL-CLEAN-DELETED-VIEW round 3c: the pattern leaf adds one module;
+# coordinator importtime measured 3.6-6.4 ms of regex compilation moved from the secret-masking module.
+# Reviewed GITSAFE-LOSSLESS-PATHS: aegis_core.git_path_codec adds one module for
+# lossless Git path decoding during busy-log event layout.
+_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 31
 
 
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])

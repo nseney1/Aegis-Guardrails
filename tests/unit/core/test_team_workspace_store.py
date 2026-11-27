@@ -1,0 +1,2635 @@
+"""Public workspace contracts, with the legacy implementation as a test oracle."""
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+import ast
+import errno
+import hashlib
+import inspect
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from threading import Event, local
+from types import SimpleNamespace
+
+import pytest
+
+from conftest import symlink_or_skip
+from aegis_core import team_mailbox_store as storage
+from aegis_core import team_workspace_store as workspace
+from aegis_core import team_workspace_display as display
+from aegis_core.team_workspace_display import WorkspaceRefusal
+from aegis_core.team_workspace_events import validate_envelope
+from aegis_core.team_mailbox_primitives import validate_warnings
+from tools import hierarchy_workspace as legacy
+from tests.unit.core.test_team_workspace_display import credential_positions
+
+
+NOW = "2026-11-17T14:00:00.000000Z"
+LIMITS = {"writer_limit": 5, "heavy_limit": 3, "heavy_tests_limit": 1}
+INITIATIVE = {"id": "alpha", "project": "project", "repository": "repo", "priority": 1,
+              "target_branch": "main"}
+
+
+def stat_observation(info, mode, uid):
+    return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_mode=mode, st_uid=uid,
+                           st_size=info.st_size, st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                           st_nlink=info.st_nlink)
+
+
+@pytest.fixture(autouse=True)
+def trusted_test_ancestors(monkeypatch):
+    """Model a private test root without changing shared host directory modes.
+
+    The sandbox remaps root ownership and exposes a group-writable owner ancestor.
+    Model known fixture ancestry as UID-0/private at this module's OS boundary;
+    policy tests separately inject each trusted and untrusted mode/owner.
+    """
+    if os.name != "posix":
+        return
+    ancestors, root_owned = set(), set()
+    root_uid = Path(Path.cwd().anchor).stat().st_uid
+    for path in Path.cwd().parents:
+        info = path.stat()
+        if info.st_uid == os.geteuid() and info.st_mode & 0o020 and not info.st_mode & 0o002:
+            ancestors.add((info.st_dev, info.st_ino))
+        if info.st_uid == root_uid and info.st_uid != os.geteuid():
+            root_owned.add((info.st_dev, info.st_ino))
+    real_fstat = os.fstat
+    def fixture_info(fd):
+        info = real_fstat(fd)
+        identity = info.st_dev, info.st_ino
+        if identity in ancestors or identity in root_owned:
+            return stat_observation(info, info.st_mode & ~0o020 if identity in ancestors else info.st_mode,
+                                    0 if identity in root_owned else info.st_uid)
+        return info
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(os), "fstat": fixture_info}))
+
+
+def _public_entries():
+    """Discover definitions and class methods; no hand-kept API example list."""
+    cases = []
+    for module in (workspace, display):
+        for name, entry in inspect.getmembers(module):
+            if name.startswith("_") or not (inspect.isfunction(entry) or inspect.isclass(entry)):
+                continue
+            if entry.__module__ != module.__name__:
+                continue
+            cases.append(pytest.param(None, entry, id=module.__name__ + "." + name))
+            if inspect.isclass(entry):
+                for method_name, method in inspect.getmembers(entry, inspect.isfunction):
+                    if not method_name.startswith("_") and method.__module__ == module.__name__:
+                        cases.append(pytest.param(entry, method,
+                            id=module.__name__ + "." + name + "." + method_name))
+    return cases
+
+
+@pytest.mark.parametrize("owner,entry", _public_entries())
+def test_generated_wrong_type_over_every_public_entrypoint(tmp_path, owner, entry):
+    receiver = None
+    if owner is workspace.WorkspaceStore:
+        receiver = owner(make_store(tmp_path))
+    elif owner is workspace.Ledger:
+        receiver = owner()
+    elif owner is WorkspaceRefusal:
+        receiver = owner("invalid_record")
+    else:
+        assert owner is None, "add fixture construction for the discovered public class"
+    bad, arguments, keywords = object(), [], {}
+    for parameter in inspect.signature(entry).parameters.values():
+        if receiver is not None and parameter.name == "self":
+            arguments.append(receiver)
+        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            keywords[parameter.name] = bad
+        elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            keywords["unexpected"] = bad
+        else:
+            arguments.append(bad)
+    if not arguments or arguments == [receiver]:
+        arguments.append(bad)
+    try:
+        try:
+            result = entry(*arguments, **keywords)
+            if hasattr(result, "__enter__"):
+                with result:
+                    result = None
+            elif inspect.isfunction(result):
+                result = result()
+        except WorkspaceRefusal as error:
+            result = error
+        assert isinstance(result, WorkspaceRefusal)
+        assert result.code == 1 and result.next_action
+        assert str(result) == "workspace refused: " + result.reason
+    finally:
+        if owner is workspace.WorkspaceStore:
+            receiver.close()
+
+
+def test_exports_are_exactly_the_owned_public_definitions():
+    for module in (workspace, display):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        names = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+        expected = {name for name in names if not name.startswith("_")}
+        assert hasattr(module, "__all__")
+        assert set(module.__all__) == expected
+        assert len(module.__all__) == len(expected)
+
+
+def _workspace_transition_sources():
+    store = Path(workspace.__file__)
+    source = store.with_name("team_workspace_events.py")
+    assert source.is_file(), "workspace transitions need a module independent of descriptor storage"
+    return ast.parse(store.read_text(encoding="utf-8")), ast.parse(source.read_text(encoding="utf-8"))
+
+
+def _assert_workspace_transition_wrappers(store, events):
+    wrappers = {node.name: node for node in store.body if isinstance(node, ast.FunctionDef)}
+    implementations = {node.name: node for node in events.body if isinstance(node, ast.FunctionDef)}
+    imports = [alias.asname or alias.name
+               for node in store.body if isinstance(node, ast.ImportFrom) and node.level == 0
+               and node.module == "aegis_core"
+               for alias in node.names if alias.name == "team_workspace_events"]
+    assert len(imports) == 1, "the store must import the workspace events module"
+    events_alias = imports[0]
+    names = {transition.__name__ for transition in workspace.APPLY.values()}
+    names.update(name for name in workspace.__all__ if name.startswith("apply_"))
+    names.add("require_unclaimed_lanes")
+    for name in sorted(names):
+        assert name in wrappers and name in implementations, f"{name} needs a store wrapper and an events implementation"
+        wrapper = wrappers[name]
+        parameters = implementations[name].args
+        assert ast.dump(wrapper.args) == ast.dump(parameters), f"{name} must match its events signature"
+        assert not (parameters.vararg or parameters.kwonlyargs or parameters.kwarg), f"{name} must use positional forwarding"
+        arguments = ", ".join(parameter.arg for parameter in parameters.posonlyargs + parameters.args)
+        expected = ast.parse(f"return {events_alias}.{name}({arguments})").body[0]
+        assert [ast.dump(stmt) for stmt in wrapper.body] == [ast.dump(expected)], (
+            f"{name} must forward its original arguments directly to team_workspace_events.{name}"
+        )
+
+
+def test_workspace_transition_definitions_live_in_events_module():
+    _assert_workspace_transition_wrappers(*_workspace_transition_sources())
+
+
+def test_workspace_transition_guard_rejects_replacement_of_retained_row():
+    store, events = _workspace_transition_sources()
+    release = next(node for node in store.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "apply_release")
+    replacement = ast.parse(
+        'ledger.requests[data["request_id"]] = dict(ledger.request(data["request_id"]))'
+    ).body[0]
+    release.body.insert(0, replacement)
+    with pytest.raises(AssertionError, match=r"^apply_release must forward its original arguments directly"):
+        _assert_workspace_transition_wrappers(store, events)
+
+
+def event(seq, kind, data):
+    return {"schema": workspace.EVENT_SCHEMA, "seq": seq, "at": NOW, "kind": kind, "data": data}
+
+
+def make_store(tmp_path, events=None, name="workspace"):
+    if not storage.descriptor_supported():
+        pytest.skip("descriptor-relative no-follow storage required")
+    root = tmp_path / name
+    root.mkdir(mode=0o700)
+    (root / "events").mkdir(mode=0o700)
+    if events is None:
+        events = [event(1, "init", LIMITS)]
+    for row in events:
+        (root / "events" / ("%08d.json" % row["seq"])).write_bytes(workspace.encoded(row) + b"\n")
+    return root
+
+
+def manual_recovery_if_identity_unavailable(root):
+    """Owner inspection/removal is explicit test action, as in the legacy CLI."""
+    path = root / ".write.lock"
+    if path.exists() and json.loads(path.read_bytes())["identity"] == "unavailable":
+        with workspace.WorkspaceStore(root) as store:
+            with pytest.raises(WorkspaceRefusal) as error:
+                with store.lock():
+                    pytest.fail("unknown identity was automatically recovered")
+            assert_refusal(error, "busy")
+        path.unlink()
+
+
+def assert_refusal(error, reason):
+    value = error.value.as_dict()
+    assert value == {"status": "refused", "code": 1, "reason": reason,
+                     "next_action": error.value.next_action}
+    assert value["next_action"]
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("path", ["relative", "/a/../secret", "", None, "x" * 5000],
+                         ids=["relative", "traversal", "empty", "none", "oversized"])
+def test_absolute_refuses_without_echo(path):
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.absolute(path, "checkout")
+    assert_refusal(error, "unsafe_path")
+    valid = Path.cwd().as_posix()
+    assert workspace.absolute(valid, "checkout") == valid
+
+
+@pytest.mark.parametrize("data", [{}, {**INITIATIVE, "priority": True},
+                                 {**INITIATIVE, "checkouts": ["relative"]},
+                                 {**INITIATIVE, "target_branch": "x" * 257}])
+def test_validation_refusal_set_matches_legacy(data):
+    with pytest.raises(ValueError):
+        legacy.validate_initiative(data)
+    with pytest.raises(WorkspaceRefusal):
+        workspace.validate_initiative(data)
+    assert workspace.validate_initiative(INITIATIVE) is None
+
+
+def test_unsupported_platform_has_typed_refusal(tmp_path, monkeypatch):
+    """Accepted delta: legacy has a portable reader; core refuses without descriptors."""
+    root = tmp_path / "portable"
+    root.mkdir()
+    (root / "events").mkdir()
+    (root / "events" / "00000001.json").write_bytes(legacy.encoded(event(1, "init", LIMITS)))
+    monkeypatch.setattr(legacy, "_memo_supported", lambda: False)
+    monkeypatch.setattr(workspace, "descriptor_supported", lambda: False)
+    assert legacy.Store(root).load().seq == 1
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(root)
+    assert_refusal(error, "unsupported_platform")
+    assert legacy.Store(root).load().seq == 1
+
+
+def test_compatibility_delta_eager_root_binding(tmp_path):
+    root = make_store(tmp_path)
+    missing = root / "later"
+    assert legacy.Store(missing).path == missing
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(missing)
+    assert_refusal(error, "missing")
+    assert not missing.exists()
+    created = make_store(root, name="later")
+    with workspace.WorkspaceStore(created) as store:
+        assert store.load().seq == legacy.Store(created).load().seq == 1
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("repository", "\ud800", "invalid_record"),
+    ("checkouts", "x" * 256, "unsafe_path"),
+    ("checkouts", "\u00e9" * 128, "unsafe_path"),
+], ids=["surrogate", "component_characters", "component_utf8_bytes"])
+def test_compatibility_delta_shared_input_bounds(field, value, reason):
+    value = [(Path.cwd() / value).as_posix()] if field == "checkouts" else value
+    data = {**INITIATIVE, field: value}
+    before = deepcopy(data)
+    assert legacy.validate_initiative(data) is None
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.validate_initiative(data)
+    assert_refusal(error, reason)
+    assert data == before
+    assert legacy.validate_initiative(INITIATIVE) is workspace.validate_initiative(INITIATIVE) is None
+
+
+def test_compatibility_delta_pending_entry_census(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    pending = root / "events" / ".pending-probe"
+    pending.write_bytes(b"pending")
+    # Exercise the same configured ceiling at both public read boundaries.
+    monkeypatch.setattr(legacy, "MAX_RECORDS", 1)
+    monkeypatch.setattr(storage, "MAX_RECORDS", 1)
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 1)
+    assert legacy.Store(root).load().seq == 1
+    before = {path.name: path.read_bytes() for path in (root / "events").iterdir()}
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "too_large")
+        assert {path.name: path.read_bytes() for path in (root / "events").iterdir()} == before
+        pending.unlink()
+        assert store.load().seq == legacy.Store(root).load().seq == 1
+
+
+def test_views_and_report_match_same_legacy_bytes(tmp_path, monkeypatch):
+    rows = [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+            event(3, "request", {"initiative": "alpha", "kind": "writer", "holder": "writer",
+                                 "request_id": "req-00000003"}),
+            event(4, "grant", {"request_id": "req-00000003"})]
+    root = make_store(tmp_path, rows)
+    monkeypatch.setattr(workspace, "timestamp", lambda: NOW)
+    monkeypatch.setattr(legacy, "timestamp", lambda: NOW)
+    with workspace.WorkspaceStore(root) as store:
+        actual, expected = store.load(), legacy.Store(root).load()
+        assert ledger_state(actual) == ledger_state(expected)
+        assert workspace.capacity_view(actual) == legacy.capacity_view(expected)
+        assert workspace.initiative_view(actual, "alpha") == legacy.initiative_view(expected, "alpha")
+        assert workspace.check_delivery(actual, "alpha") == legacy.check_delivery(expected, "alpha")
+        assert workspace.report(actual) == legacy.report(expected)
+        assert workspace.report_text(workspace.report(actual)) == legacy.report_text(legacy.report(expected))
+        assert ledger_state(store.load()) == ledger_state(actual)
+
+
+def test_busy_refuses_once_and_retry_succeeds(tmp_path):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as first, workspace.WorkspaceStore(root) as second:
+        with first.lock():
+            with pytest.raises(WorkspaceRefusal) as error:
+                with second.lock():
+                    pytest.fail("contending writer entered")
+            assert_refusal(error, "busy")
+            assert "abandoned lock" in error.value.next_action
+        with second.lock():
+            assert second.load().seq == 1
+    assert not (root / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("kind,limit", [("heavy", 3), ("heavy-tests", 1)])
+def test_over_capacity_refuses_without_state_change_then_retries(tmp_path, kind, limit):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        ledger = store.load()
+        store.append(ledger, "register", INITIATIVE)
+        for index in range(limit + 1):
+            identifier = "req-%08d" % (ledger.seq + 1)
+            store.append(ledger, "request", {"initiative": "alpha", "kind": kind,
+                                             "holder": "writer-%d" % index, "request_id": identifier})
+            if index < limit:
+                store.append(ledger, "grant", {"request_id": identifier})
+        before, names = ledger_state(ledger), sorted((root / "events").iterdir())
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "grant", {"request_id": identifier})
+        assert_refusal(error, "capacity_full")
+        assert ledger_state(ledger) == before
+        assert sorted((root / "events").iterdir()) == names
+        held = ledger.held(kind)[0]["request_id"]
+        store.append(ledger, "release", {"request_id": held,
+                     "evidence": {"path": str(root / "evidence"), "sha256": "0" * 64}})
+        store.append(ledger, "grant", {"request_id": identifier})
+        assert ledger_state(store.load()) == ledger_state(ledger)
+
+
+def test_two_concurrent_grants_use_one_slot(tmp_path):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+        event(3, "request", {"initiative": "alpha", "kind": "heavy-tests", "holder": "one",
+                             "request_id": "req-00000003"}),
+        event(4, "request", {"initiative": "alpha", "kind": "heavy-tests", "holder": "two",
+                             "request_id": "req-00000004"})])
+
+    def grant():
+        try:
+            with workspace.WorkspaceStore(root) as store:
+                return workspace.grant_next(store, "heavy-tests")[0]
+        except WorkspaceRefusal as error:
+            assert error.reason == "busy"
+            return error.reason
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result(timeout=5) for future in [pool.submit(grant), pool.submit(grant)]]
+    assert results.count(0) == 1
+    with workspace.WorkspaceStore(root) as store:
+        assert len(store.load().held("heavy-tests")) == 1
+        assert workspace.grant_next(store, "heavy-tests")[1]["reason"] == "capacity_full"
+
+
+def test_publication_failure_preserves_ledger_and_retry(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        ledger = store.load()
+        before = ledger_state(ledger)
+        publish = workspace.WorkspaceStore.publish
+        def unavailable(*args, **kwargs):
+            raise OSError("secret")
+        monkeypatch.setattr(workspace.WorkspaceStore, "publish", unavailable)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", INITIATIVE)
+        assert_refusal(error, "io")
+        assert ledger_state(ledger) == before
+        monkeypatch.setattr(workspace.WorkspaceStore, "publish", publish)
+        store.append(ledger, "register", INITIATIVE)
+        assert store.load().seq == 2
+
+
+def test_root_rename_does_not_redirect_reads_or_writes(tmp_path):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as store:
+        held = root.with_name("held")
+        root.rename(held)
+        root.mkdir(mode=0o700)
+        (root / "events").mkdir(mode=0o700)
+        with store.lock():
+            ledger = store.load()
+            store.append(ledger, "register", INITIATIVE)
+        assert list((root / "events").iterdir()) == []
+        assert (held / "events" / "00000002.json").is_file()
+
+
+def test_symlink_component_and_event_refuse_then_retry(tmp_path):
+    root = make_store(tmp_path)
+    alias = tmp_path / "alias"
+    symlink_or_skip(root, alias, target_is_directory=True)
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(alias)
+    assert_refusal(error, "unsafe_path")
+    record = root / "events" / "00000001.json"
+    raw = record.read_bytes()
+    record.unlink()
+    source = tmp_path / "secret"
+    source.write_bytes(raw)
+    symlink_or_skip(source, record)
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "unsafe_path")
+        record.unlink()
+        record.write_bytes(raw)
+        assert store.load().seq == 1
+
+
+@pytest.mark.parametrize("raw", [b"{", b'{}', b'\xff', b'{"x":1,"x":2}', b'[' * 1000,
+                                 b' ' * (workspace.MAX_BYTES + 1)],
+                         ids=["syntax", "schema", "encoding", "duplicate", "depth", "oversized"])
+def test_malformed_or_oversized_event_is_typed_and_recoverable(tmp_path, raw):
+    root = make_store(tmp_path)
+    path = root / "events" / "00000001.json"
+    good = path.read_bytes()
+    path.write_bytes(raw)
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert error.value.reason in {"invalid_record", "too_large"}
+        path.write_bytes(good)
+        assert store.load().seq == 1
+
+
+def test_evidence_is_bounded_and_descriptor_read(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    path = root / "proof"
+    path.write_bytes(b"proof")
+    reference = {"path": str(path), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    assert workspace.verify_evidence(reference) is None
+    limit = workspace.MAX_EVIDENCE_BYTES
+    monkeypatch.setattr(workspace, "MAX_EVIDENCE_BYTES", 4)
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.verify_evidence(reference)
+    assert_refusal(error, "too_large")
+    monkeypatch.setattr(workspace, "MAX_EVIDENCE_BYTES", limit)
+    assert workspace.verify_evidence(reference) is None
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.verify_evidence({**reference, "sha256": "0" * 64})
+    assert_refusal(error, "evidence_mismatch")
+
+
+def test_lease_and_mailbox_readers_are_injected():
+    ledger = workspace.Ledger()
+    ledger.apply(event(1, "init", LIMITS))
+    ledger.apply(event(2, "register", INITIATIVE))
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.check_paths(ledger, "alpha", ["a.py"])
+    assert_refusal(error, "port_required")
+    ports = legacy.lease_tools()
+    assert workspace.check_paths(ledger, "alpha", ["a.py"], lease_ports=ports) == legacy.check_paths(
+        ledger, "alpha", ["a.py"])
+    assert workspace.mailbox_facts(INITIATIVE) is None
+    fake = SimpleNamespace(status=lambda: {"messages": 2, "open_job_requests": [], "accepted_writers": []})
+    assert workspace.mailbox_facts({**INITIATIVE, "mailbox_root": "/mail"},
+                                    mailbox_factory=lambda path: fake)["messages"] == 2
+
+
+def ledger_state(ledger):
+    return {"seq": ledger.seq, "limits": deepcopy(ledger.limits),
+            "initiatives": deepcopy(ledger.initiatives), "requests": deepcopy(ledger.requests),
+            "capacity": workspace.capacity_view(ledger)}
+
+
+@pytest.mark.parametrize("operation", ["write", "link", "directory_sync", "pending_cleanup"])
+def test_publication_io_failures_close_descriptors_and_retry(tmp_path, monkeypatch, operation):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        ledger = store.load()
+        before = ledger_state(ledger)
+        opened, failed = [], []
+        real_open, real_write, real_link = os.open, os.write, os.link
+        real_sync, real_unlink = os.fsync, os.unlink
+        def track_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+        def fail_write(*args, **kwargs):
+            if operation == "write":
+                raise OSError("secret")
+            return real_write(*args, **kwargs)
+        def fail_link(*args, **kwargs):
+            if operation == "link":
+                raise OSError("secret")
+            return real_link(*args, **kwargs)
+        def fail_sync(descriptor):
+            if operation == "directory_sync" and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("secret")
+            return real_sync(descriptor)
+        def fail_cleanup(name, **kwargs):
+            if operation == "pending_cleanup" and name.startswith(".pending-") and not failed:
+                failed.append(True)
+                raise OSError("secret")
+            return real_unlink(name, **kwargs)
+        owned_os = SimpleNamespace(**{**vars(workspace.os), "open": track_open, "write": fail_write,
+                                      "link": fail_link, "fsync": fail_sync, "unlink": fail_cleanup})
+        monkeypatch.setattr(workspace, "os", owned_os)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", INITIATIVE)
+        assert_refusal(error, "io")
+        monkeypatch.setattr(workspace, "os", os)
+        assert ledger_state(ledger) == before
+        assert [path.name for path in (root / "events").iterdir()] == ["00000001.json"]
+        for descriptor in opened:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+        store.append(ledger, "register", INITIATIVE)
+        assert store.load().seq == 2
+
+
+def test_event_directory_swap_during_read_stays_on_held_descriptor(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    outside = make_store(tmp_path, name="outside")
+    with workspace.WorkspaceStore(root) as store:
+        read = workspace._Files.read
+        changed = []
+        def swap_then_read(self, path, **kwargs):
+            if not changed:
+                (root / "events").rename(root / "held-events")
+                symlink_or_skip(outside / "events", root / "events", target_is_directory=True)
+                changed.append(True)
+            return read(self, path, **kwargs)
+        monkeypatch.setattr(workspace._Files, "read", swap_then_read)
+        assert store.load().seq == 1
+        assert (outside / "events" / "00000001.json").read_bytes() == (
+            root / "held-events" / "00000001.json").read_bytes()
+
+
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_grant_next_nonerror_full_matches_legacy(tmp_path, kind):
+    limits = {"writer_limit": 5, "heavy_limit": 1, "heavy_tests_limit": 1}
+    root = make_store(tmp_path, [event(1, "init", limits), event(2, "register", INITIATIVE),
+        event(3, "request", {"initiative": "alpha", "kind": kind, "holder": "one",
+                             "request_id": "req-00000003"}),
+        event(4, "grant", {"request_id": "req-00000003"})])
+    with workspace.WorkspaceStore(root) as store:
+        assert workspace.grant_next(store, kind) == legacy.grant_next(legacy.Store(root), kind)
+
+
+def test_supersede_replay_and_timing_unknown_match_legacy(tmp_path):
+    rows = [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+        event(3, "request", {"initiative": "alpha", "kind": "writer", "holder": "one",
+                             "request_id": "req-00000003"}),
+        {**event(4, "request", {"initiative": "alpha", "kind": "writer", "holder": "one",
+                               "request_id": "req-00000004", "supersedes": "req-00000003"}),
+         "schema": workspace.SUPERSEDE_EVENT_SCHEMA, "at": "invalid"}]
+    root = make_store(tmp_path, rows)
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal):
+            store.load()
+        actual, expected = store.load(for_report=True), legacy.Store(root).load(for_report=True)
+        assert ledger_state(actual) == ledger_state(expected)
+        assert workspace.queue_facts(actual, NOW) == legacy.queue_facts(expected, NOW)
+
+
+def test_legacy_sources_stay_at_claim_bytes_without_git_history():
+    root = Path(__file__).resolve().parents[3]
+    expected = {"hierarchy_workspace.py": "89716178d61b79fcc7d1f67d473f71d2847aa3e251237908325cf838fe8a6e5f",
+                "hierarchy_workspace_display.py": "d57ed96be1f41362716e5570d67b9f193d3e8f828cf804ded013bd7ff9abb0ec"}
+    for name, digest in expected.items():
+        text = (root / "tools" / name).read_text(encoding="utf-8")
+        assert hashlib.sha256(text.encode("utf-8")).hexdigest() == digest
+
+
+def test_observer_failure_is_typed_and_releases_lock_for_retry(tmp_path):
+    root = make_store(tmp_path)
+    def unavailable(ledger):
+        raise RuntimeError("secret")
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            workspace.grant_next(store, "heavy", outside=unavailable)
+        assert_refusal(error, "port_unavailable")
+        assert workspace.grant_next(store, "heavy")[1]["reason"] == "queue_empty"
+
+
+def test_report_text_screens_untrusted_fields(monkeypatch):
+    """Accepted delta: text is screened while successful structured values match."""
+    monkeypatch.setattr(workspace, "timestamp", lambda: NOW)
+    monkeypatch.setattr(legacy, "timestamp", lambda: NOW)
+    ledger, old_ledger = workspace.Ledger(), legacy.Ledger()
+    for row in (event(1, "init", LIMITS),
+                event(2, "register", {**INITIATIVE, "blocked_by": ["password=hunter2\n"]})):
+        ledger.apply(row)
+        old_ledger.apply(row)
+    report, old_report = workspace.report(ledger), legacy.report(old_ledger)
+    before = deepcopy(report)
+    assert report == old_report
+    assert "password=hunter2\n" in legacy.report_text(old_report)
+    result = workspace.report_text(report)
+    assert "hunter2" not in result
+    assert "blocked by <redacted" in result
+    assert report == before
+
+
+def test_successful_append_preserves_request_references_like_legacy(tmp_path):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+        event(3, "request", {"initiative": "alpha", "kind": "writer", "holder": "one",
+                             "request_id": "req-00000003"})])
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        ledger = store.load()
+        request = ledger.request("req-00000003")
+        store.append(ledger, "grant", {"request_id": request["request_id"]})
+        assert request["state"] == "granted"
+        assert workspace.request_view(request) == workspace.request_view(ledger.request(request["request_id"]))
+
+
+def test_release_append_updates_retained_request(tmp_path):
+    data = _request_data()
+    request_id = data["request_id"]
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                                 event(3, "request", data), event(4, "grant", {"request_id": request_id})])
+    evidence = {"path": str(root / "evidence"), "sha256": "0" * 64}
+
+    with workspace.WorkspaceStore(root) as store:
+        ledger = store.load()
+        request = ledger.request(request_id)
+        before = ledger_state(ledger)
+        names = sorted((root / "events").iterdir())
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "release", {"request_id": request_id, "evidence": {**evidence, "sha256": "bad"}})
+        assert_refusal(error, "invalid_record")
+        assert ledger_state(ledger) == before
+        assert ledger.request(request_id) is request
+        assert sorted((root / "events").iterdir()) == names
+
+        appended = store.append(ledger, "release", {"request_id": request_id, "evidence": evidence})
+        assert request["state"] == "released"
+        assert ledger.request(request_id) is request
+        assert request["closed_at"] == appended["at"]
+        assert request["evidence"] == evidence
+
+    with workspace.WorkspaceStore(root) as reader:
+        assert ledger_state(reader.load()) == ledger_state(ledger)
+
+
+def test_evidence_parent_swap_is_confined_and_missing_evidence_can_retry(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    outside = make_store(tmp_path, name="outside")
+    proof = root / "proof"
+    proof.write_bytes(b"proof")
+    (outside / "proof").write_bytes(b"decoy")
+    reference = {"path": str(proof), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    read, changed = workspace._Files.read, []
+    def swap_then_read(self, path, **kwargs):
+        if path == proof and not changed:
+            root.rename(tmp_path / "held")
+            symlink_or_skip(outside, root, target_is_directory=True)
+            changed.append(True)
+        return read(self, path, **kwargs)
+    monkeypatch.setattr(workspace._Files, "read", swap_then_read)
+    assert workspace.verify_evidence(reference) is None
+    assert (outside / "proof").read_bytes() == b"decoy"
+    missing = outside / "missing"
+    reference = {"path": str(missing), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.verify_evidence(reference)
+    assert_refusal(error, "missing")
+    missing.write_bytes(b"proof")
+    assert workspace.verify_evidence(reference) is None
+
+
+def _request_data():
+    return {"initiative": "alpha", "request_id": "req-00000003", "kind": "writer", "holder": "one"}
+
+
+def _append_transition_case(kind, tmp_path):
+    queued = {**_request_data(), "request_id": "req-00000005"}
+    granted = {**queued, "request_id": "req-00000006", "holder": "two"}
+    grant_id = {"request_id": granted["request_id"]}
+    queued_id = {"request_id": queued["request_id"]}
+    merge = {"repository": "repo", "branch": "main", "commit": "a" * 40, "source": "owner"}
+    evidence = {"path": str(tmp_path / "evidence"), "sha256": "0" * 64}
+    events = [
+        event(1, "init", LIMITS),
+        event(2, "register", INITIATIVE),
+        event(3, "register", {**INITIATIVE, "id": "beta"}),
+        event(4, "register", {**INITIATIVE, "id": "gamma"}),
+        event(5, "request", queued),
+        event(6, "request", granted),
+        event(7, "grant", grant_id),
+        event(8, "merge", merge),
+    ]
+    data = {
+        "init": LIMITS,
+        "register": {**INITIATIVE, "id": "delta"},
+        "update": {"initiative": "alpha", "source": "owner", "priority": 2},
+        "request": {**queued, "request_id": "req-00000009", "supersedes": queued["request_id"]},
+        "withdraw": {**queued_id, "source": "owner"},
+        "grant": queued_id,
+        "release": {**grant_id, "evidence": evidence},
+        "merge": {**merge, "commit": "b" * 40, "initiative": "alpha"},
+        "clear_base_moved": {"initiative": "alpha", "base_commit": merge["commit"],
+                             "evidence": evidence, "source": "owner"},
+        "set_limits": {"source": "owner", "writer_limit": 4},
+    }
+    assert kind in data, f"add a public append case for {kind}"
+    return make_store(tmp_path, [] if kind == "init" else events), data[kind]
+
+
+def _workspace_rows(ledger):
+    rows = {
+        **{("initiative", identifier): row for identifier, row in ledger.initiatives.items()},
+        **{("request", identifier): row for identifier, row in ledger.requests.items()},
+        ("ledger", "granted_counts"): ledger.granted_counts,
+        ("ledger", "open_holders"): ledger.open_holders,
+    }
+    if ledger.limits is not None:
+        rows["ledger", "limits"] = ledger.limits
+    return rows
+
+
+@pytest.mark.parametrize("kind", sorted(workspace.APPLY))
+def test_append_updates_retained_workspace_rows(tmp_path, kind):
+    root, data = _append_transition_case(kind, tmp_path)
+    events = root / "events"
+    with workspace.WorkspaceStore(root) as store, workspace.WorkspaceStore(root) as other:
+        ledger = workspace.Ledger() if kind == "init" else store.load()
+        seq = ledger.seq
+        retained = _workspace_rows(ledger)
+        before = deepcopy(retained)
+        history = {path.name: path.read_bytes() for path in events.iterdir()}
+
+        with ThreadPoolExecutor(max_workers=1) as pool, other.lock():
+            attempt = pool.submit(store.append, ledger, kind, data)
+            with pytest.raises(WorkspaceRefusal) as error:
+                attempt.result(timeout=5)
+            assert_refusal(error, "busy")
+
+        live = _workspace_rows(ledger)
+        assert ledger.seq == seq
+        assert live == before
+        assert all(live[key] is row for key, row in retained.items())
+        assert {path.name: path.read_bytes() for path in events.iterdir()} == history
+
+        appended = store.append(ledger, kind, data)
+        replayed = other.load()
+        published = _workspace_rows(replayed)
+        live = _workspace_rows(ledger)
+        assert replayed.seq == ledger.seq == appended["seq"] == seq + 1
+        assert live == published
+        for key, row in retained.items():
+            assert row == published[key], f"retained {key} did not reflect the published {kind}"
+            assert row is live[key], f"{kind} replaced retained {key}"
+
+
+def _initialized_ledger():
+    ledger = workspace.Ledger()
+    ledger.apply(event(1, "init", LIMITS))
+    ledger.apply(event(2, "register", INITIATIVE))
+    return ledger
+
+
+def test_supersede_refusal_preserves_history_and_retry_matches_fresh_replay(tmp_path):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                                 event(3, "request", _request_data())])
+    events = root / "events"
+    with workspace.WorkspaceStore(root) as store:
+        ledger = store.load()
+        original = ledger.request("req-00000003")
+        before = ledger_state(ledger)
+        history = {path.name: path.read_bytes() for path in events.iterdir()}
+        replacement = {**_request_data(), "request_id": "req-00000004", "supersedes": original["request_id"]}
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "request", {**replacement, "holder": "different"})
+        assert_refusal(error, "invalid_record")
+        assert ledger_state(ledger) == before
+        assert ledger.request("req-00000003") is original
+        assert {path.name: path.read_bytes() for path in events.iterdir()} == history
+
+        appended = store.append(ledger, "request", replacement)
+        assert appended["schema"] == workspace.SUPERSEDE_EVENT_SCHEMA
+        assert ledger.request("req-00000003") is original
+        assert original["state"] == "withdrawn"
+        assert original["superseded_by"] == "req-00000004"
+        assert ledger.request("req-00000004")["seq"] == original["seq"]
+
+    with workspace.WorkspaceStore(root) as reader:
+        assert ledger_state(reader.load()) == ledger_state(ledger)
+
+
+@pytest.mark.parametrize("field", sorted(_request_data()))
+@pytest.mark.parametrize("bad", [[], {}], ids=["array", "object"])
+def test_request_field_shapes_refuse_without_mutation_then_retry(field, bad):
+    ledger = _initialized_ledger()
+    before = ledger_state(ledger)
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(3, "request", {**_request_data(), field: bad}))
+    assert_refusal(error, "invalid_record")
+    assert ledger_state(ledger) == before
+    ledger.apply(event(3, "request", _request_data()))
+    assert ledger.request("req-00000003")["state"] == "queued"
+
+
+@pytest.mark.parametrize("bad", [[], {}], ids=["array", "object"])
+def test_unhashable_event_kind_is_fixed_refusal_and_retries(bad):
+    ledger = _initialized_ledger()
+    before = ledger_state(ledger)
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(3, bad, _request_data()))
+    assert_refusal(error, "invalid_record")
+    assert ledger_state(ledger) == before
+    ledger.apply(event(3, "request", _request_data()))
+    assert ledger.seq == 3
+
+
+@pytest.mark.parametrize("bad", [[], {}], ids=["array", "object"])
+def test_unhashable_replay_schema_is_fixed_refusal_and_retries(tmp_path, bad):
+    root = make_store(tmp_path)
+    record = root / "events" / "00000001.json"
+    good = record.read_bytes()
+    raw = workspace.encoded({**event(1, "init", LIMITS), "schema": bad})
+    record.write_bytes(raw)
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "invalid_record")
+        assert record.read_bytes() == raw
+        record.write_bytes(good)
+        assert store.load().seq == 1
+
+
+def _damaged_envelope(seq, kind, data, defect):
+    """One hostile envelope. A multi-line time is refused whole, never joined."""
+    row = event(seq, kind, data)
+    if defect == "schema":
+        return {**row, "schema": "aegis.hierarchy-workspace-event/v9"}
+    if defect == "sequence":
+        return {**row, "seq": seq + 2}
+    if defect == "time":
+        return {**row, "at": "bad-time\nbad"}
+    raise AssertionError("unknown envelope defect")
+
+
+def _event_bytes(root):
+    folder = root / "events"
+    return {path.name: path.read_bytes() for path in folder.iterdir()}
+
+
+def _mapping_ids(ledger):
+    return (ledger.initiatives, ledger.requests, ledger.open_holders, ledger.granted_counts, ledger.limits)
+
+
+def _same_mappings(ledger, indexes):
+    assert all(left is right for left, right in zip(_mapping_ids(ledger), indexes))
+
+
+@pytest.mark.parametrize("defect", ["schema", "sequence", "time"])
+def test_direct_apply_refuses_envelopes_replay_rejects(defect):
+    """Memory apply refuses the schema, sequence and time defects replay refuses."""
+    ledger = _initialized_ledger()
+    retained = ledger.initiative("alpha")
+    indexes = _mapping_ids(ledger)
+    before = ledger_state(ledger)
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(_damaged_envelope(3, "request", _request_data(), defect))
+    assert_refusal(error, "invalid_record")
+    assert "bad-time" not in str(error.value)
+    assert "v9" not in str(error.value)
+    assert ledger_state(ledger) == before
+    assert ledger.seq == 2
+    assert ledger.initiative("alpha") is retained
+    _same_mappings(ledger, indexes)
+    ledger.apply(event(3, "request", _request_data()))
+    assert ledger.seq == 3
+    assert ledger.request("req-00000003")["state"] == "queued"
+    assert ledger.initiative("alpha") is retained
+    assert ledger.initiatives is indexes[0]
+
+
+@pytest.mark.parametrize("defect", ["schema", "sequence", "time"])
+def test_replay_refuses_same_envelope_defects_then_retries(tmp_path, defect):
+    """Replay refuses the same defects, leaves the bytes in place, and accepts a repair."""
+    root = make_store(tmp_path, [event(1, "init", LIMITS)])
+    bad = _damaged_envelope(2, "register", INITIATIVE, defect)
+    path = root / "events" / "00000002.json"
+    path.write_bytes(workspace.encoded(bad) + b"\n")
+    raw = path.read_bytes()
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "invalid_record")
+        assert "bad-time" not in str(error.value)
+        assert "v9" not in str(error.value)
+        assert path.read_bytes() == raw
+        if defect == "time":
+            with pytest.raises(WorkspaceRefusal) as report_error:
+                store.load(for_report=True)
+            assert_refusal(report_error, "invalid_record")
+            assert path.read_bytes() == raw
+        path.write_bytes(workspace.encoded(event(2, "register", INITIATIVE)) + b"\n")
+        loaded = store.load()
+        assert loaded.seq == 2
+        assert loaded.initiative("alpha")["id"] == "alpha"
+
+
+def _queue_time_history(tmp_path, kind):
+    request = _request_data()
+    evidence = {"path": str(tmp_path / "evidence"), "sha256": "0" * 64}
+    rows = [event(1, "init", LIMITS), event(2, "register", INITIATIVE), event(3, "request", request)]
+    if kind == "request":
+        damaged = event(4, "request", {**request, "request_id": "req-00000004", "holder": "two"})
+    elif kind == "grant":
+        damaged = event(4, "grant", {"request_id": request["request_id"]})
+    elif kind == "withdraw":
+        damaged = event(4, "withdraw", {"request_id": request["request_id"], "source": "owner"})
+    elif kind == "release":
+        rows.append(event(4, "grant", {"request_id": request["request_id"]}))
+        damaged = event(5, "release", {"request_id": request["request_id"], "evidence": evidence})
+    else:
+        raise AssertionError(kind)
+    return rows + [{**damaged, "at": "bad-time\nbad"}]
+
+
+@pytest.mark.parametrize("kind", ["request", "grant", "release", "withdraw"])
+def test_report_replay_recovers_only_damaged_queue_event_times(tmp_path, kind):
+    """Report replay stores a damaged queue time as unknown and does not rewrite history."""
+    rows = _queue_time_history(tmp_path, kind)
+    root = make_store(tmp_path, rows)
+    history = _event_bytes(root)
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "invalid_record")
+        assert "bad-time" not in str(error.value)
+        assert _event_bytes(root) == history
+        actual = store.load(for_report=True)
+        assert actual.seq == rows[-1]["seq"]
+        assert _event_bytes(root) == history
+        assert ledger_state(actual) == ledger_state(legacy.Store(root).load(for_report=True))
+        request_id = "req-00000004" if kind == "request" else "req-00000003"
+        stamp = "requested_at" if kind == "request" else "granted_at" if kind == "grant" else "closed_at"
+        assert actual.request(request_id)[stamp] is None
+
+
+def test_direct_apply_absent_grant_keeps_queued_request_then_retries():
+    """Refusing a grant of an absent request keeps the queued row, then the retry grants it."""
+    ledger = _initialized_ledger()
+    ledger.apply(event(3, "request", _request_data()))
+    request = ledger.request("req-00000003")
+    indexes = _mapping_ids(ledger)
+    before = ledger_state(ledger)
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(4, "grant", {"request_id": "req-00000099"}))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq == 3
+    assert request["state"] == "queued"
+    assert request["seq"] == 3
+    assert ledger.granted_counts["writer"] == 0
+    assert ledger_state(ledger) == before
+    assert ledger.request("req-00000003") is request
+    _same_mappings(ledger, indexes)
+    ledger.apply(event(4, "grant", {"request_id": request["request_id"]}))
+    assert ledger.request("req-00000003") is request
+    assert request["state"] == "granted"
+    assert request["seq"] == 3
+    assert ledger.seq == 4
+    assert ledger.granted_counts["writer"] == 1
+    assert ledger.requests is indexes[1]
+    assert ledger.granted_counts is indexes[3]
+    assert ledger.open_holders is indexes[2]
+    assert ledger.limits is indexes[4]
+
+
+def _evidence():
+    return {"path": Path.cwd().as_posix(), "sha256": "0" * 64}
+
+
+def _direct_apply_case(kind):
+    """One retained row, one transition refusal, and one later valid apply."""
+    evidence = _evidence()
+    commit = "a" * 40
+    if kind == "init":
+        ledger = workspace.Ledger()
+        return ledger, {"writer_limit": 0, "heavy_limit": 1}, LIMITS, ledger.initiatives
+    ledger = _initialized_ledger()
+    if kind == "register":
+        return ledger, dict(INITIATIVE), {**INITIATIVE, "id": "beta"}, ledger.initiative("alpha")
+    if kind == "update":
+        missing = {"initiative": "missing", "source": "owner", "priority": 2}
+        return ledger, missing, {"initiative": "alpha", "source": "owner", "priority": 2}, ledger.initiative("alpha")
+    if kind == "set_limits":
+        return ledger, {"source": "owner"}, {"source": "owner", "writer_limit": 4}, ledger.limits
+    if kind == "merge":
+        bad = {"repository": "repo", "branch": "main", "commit": "not-a-commit", "source": "owner"}
+        good = {"repository": "repo", "branch": "main", "commit": commit, "source": "owner"}
+        return ledger, bad, good, ledger.initiative("alpha")
+    ledger.apply(event(3, "request", _request_data()))
+    request = ledger.request("req-00000003")
+    if kind == "request":
+        return ledger, dict(_request_data()), {**_request_data(), "request_id": "req-00000004", "holder": "two"}, request
+    if kind == "withdraw":
+        return ledger, {"request_id": "req-00000099", "source": "owner"}, {"request_id": request["request_id"], "source": "owner"}, request
+    if kind == "grant":
+        return ledger, {"request_id": "req-00000099"}, {"request_id": request["request_id"]}, request
+    if kind == "release":
+        ledger.apply(event(ledger.seq + 1, "grant", {"request_id": request["request_id"]}))
+        bad = {"request_id": request["request_id"]}
+        return ledger, bad, {"request_id": request["request_id"], "evidence": evidence}, request
+    ledger.apply(event(ledger.seq + 1, "merge", {
+        "repository": "repo", "branch": "main", "commit": commit, "source": "owner"}))
+    bad = {"initiative": "alpha", "base_commit": "b" * 40, "evidence": evidence, "source": "owner"}
+    good = {"initiative": "alpha", "base_commit": commit, "evidence": evidence, "source": "owner"}
+    return ledger, bad, good, ledger.initiative("alpha")
+
+
+def _retained_same(ledger, kind, retained):
+    if kind == "init":
+        assert ledger.initiatives is retained
+    elif kind == "set_limits":
+        assert ledger.limits is retained
+    elif kind in ("request", "withdraw", "grant", "release"):
+        assert ledger.request("req-00000003") is retained
+    else:
+        assert ledger.initiative("alpha") is retained
+
+
+@pytest.mark.parametrize("kind", sorted(workspace.APPLY))
+def test_direct_apply_keeps_retained_rows_for_every_kind(kind):
+    """Envelope and transition refusals keep the row, then a valid apply updates it."""
+    ledger, bad, good, retained = _direct_apply_case(kind)
+    indexes = _mapping_ids(ledger)
+    seq = ledger.seq
+    for row in (_damaged_envelope(seq + 1, kind, good, "schema"), event(seq + 1, kind, bad)):
+        with pytest.raises(WorkspaceRefusal) as error:
+            ledger.apply(row)
+        assert_refusal(error, "invalid_record")
+        assert "v9" not in str(error.value)
+        assert ledger.seq == seq
+        _same_mappings(ledger, indexes)
+        _retained_same(ledger, kind, retained)
+    ledger.apply(event(seq + 1, kind, good))
+    assert ledger.seq == seq + 1
+    _retained_same(ledger, kind, retained)
+    assert ledger.initiatives is indexes[0]
+    assert ledger.requests is indexes[1]
+    assert ledger.open_holders is indexes[2]
+    assert ledger.granted_counts is indexes[3]
+    if kind != "init":
+        assert ledger.limits is indexes[4]
+    if kind == "init":
+        assert ledger.limits["writer"] == LIMITS["writer_limit"]
+    elif kind == "register":
+        assert ledger.initiative("beta")["id"] == "beta"
+    elif kind == "update":
+        assert retained["priority"] == 2
+    elif kind == "set_limits":
+        assert retained["writer"] == 4
+    elif kind == "request":
+        assert ledger.request("req-00000004")["state"] == "queued"
+    elif kind == "withdraw":
+        assert retained["state"] == "withdrawn"
+    elif kind == "grant":
+        assert retained["state"] == "granted"
+    elif kind == "release":
+        assert retained["state"] == "released"
+    elif kind == "merge":
+        assert retained["base_moved"]["commit"] == "a" * 40
+    else:
+        assert retained["base_moved"] is None
+
+
+def _non_queue_history(kind):
+    evidence = _evidence()
+    commit = "a" * 40
+    if kind == "init":
+        return [{**event(1, "init", LIMITS), "at": "bad-time\nbad"}]
+    rows = [event(1, "init", LIMITS), event(2, "register", INITIATIVE)]
+    if kind == "register":
+        return [rows[0], {**event(2, "register", INITIATIVE), "at": "bad-time\nbad"}]
+    if kind == "clear_base_moved":
+        rows.append(event(3, "merge", {"repository": "repo", "branch": "main", "commit": commit, "source": "owner"}))
+        damaged = event(4, "clear_base_moved", {
+            "initiative": "alpha", "base_commit": commit, "evidence": evidence, "source": "owner"})
+    else:
+        payloads = {
+            "update": {"initiative": "alpha", "source": "owner", "priority": 2},
+            "set_limits": {"source": "owner", "writer_limit": 4},
+            "merge": {"repository": "repo", "branch": "main", "commit": commit, "source": "owner"},
+        }
+        damaged = event(3, kind, payloads[kind])
+    return rows + [{**damaged, "at": "bad-time\nbad"}]
+
+
+@pytest.mark.parametrize("kind", sorted(set(workspace.APPLY) - {"request", "grant", "release", "withdraw"}))
+def test_report_replay_refuses_damaged_time_for_every_non_queue_kind(tmp_path, kind):
+    """A damaged time on a non-queue event is a refusal for readers and report readers."""
+    rows = _non_queue_history(kind)
+    root = make_store(tmp_path, rows)
+    history = _event_bytes(root)
+    damaged = root / "events" / ("%08d.json" % rows[-1]["seq"])
+    with workspace.WorkspaceStore(root) as store:
+        for report in (False, True):
+            with pytest.raises(WorkspaceRefusal) as error:
+                store.load(for_report=report)
+            assert_refusal(error, "invalid_record")
+            assert "bad-time" not in str(error.value)
+            assert _event_bytes(root) == history
+        repaired = {**rows[-1], "at": NOW}
+        damaged.write_bytes(workspace.encoded(repaired) + b"\n")
+        assert store.load().seq == repaired["seq"]
+        assert store.load(for_report=True).seq == repaired["seq"]
+
+
+@pytest.mark.parametrize("bad", [True, 1.0])
+def test_validate_envelope_rejects_bool_and_float_sequence(bad):
+    """A boolean or float sequence is not the integer the caller expected."""
+    row = {**event(1, "init", LIMITS), "seq": bad}
+    with pytest.raises(WorkspaceRefusal) as error:
+        validate_envelope(row, 1, recover_queue_time=False)
+    assert_refusal(error, "invalid_record")
+    assert row["seq"] is bad
+
+
+def test_validate_envelope_recovery_does_not_edit_the_input():
+    """Report recovery returns a copy and leaves the caller's mapping unchanged."""
+    original = event(1, "request", _request_data())
+    original["at"] = "bad-time\nbad"
+    snapshot = {**original, "data": dict(original["data"])}
+    recovered = validate_envelope(original, 1, recover_queue_time=True)
+    assert original == snapshot
+    assert original["at"] == "bad-time\nbad"
+    assert recovered is not original
+    assert recovered["at"] is None
+    again = validate_envelope(original, 1, recover_queue_time=True)
+    assert again is not original and again["at"] is None and original["at"] == "bad-time\nbad"
+
+
+def test_validate_envelope_checks_the_caller_limit_before_sequence_equality():
+    """Types are refused first. The caller's ceiling is too_large, then the sequence is compared."""
+    row = event(3, "init", LIMITS)
+    with pytest.raises(WorkspaceRefusal) as error:
+        validate_envelope(row, True, recover_queue_time=False, max_records=2)
+    assert_refusal(error, "invalid_record")
+    with pytest.raises(WorkspaceRefusal) as error:
+        validate_envelope(row, 3, recover_queue_time=False, max_records=True)
+    assert_refusal(error, "invalid_record")
+    with pytest.raises(WorkspaceRefusal) as error:
+        validate_envelope(row, 3, recover_queue_time=False, max_records=2)
+    assert_refusal(error, "too_large")
+    assert row["seq"] == 3
+    accepted = validate_envelope(event(2, "init", LIMITS), 2, recover_queue_time=False, max_records=2)
+    assert accepted["seq"] == 2
+
+
+def _validate_envelope_calls():
+    tree = ast.parse(Path(workspace.__file__).read_text(encoding="utf-8"))
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "validate_envelope":
+            calls.append(node)
+    return calls
+
+
+def test_store_callers_pass_one_record_limit():
+    """Apply, replay, and append pass the store ceiling into the shared validator."""
+    calls = _validate_envelope_calls()
+    assert len(calls) == 3
+    for call in calls:
+        limits = [keyword for keyword in call.keywords if keyword.arg == "max_records"]
+        assert len(limits) == 1
+        assert isinstance(limits[0].value, ast.Name) and limits[0].value.id == "MAX_RECORDS"
+
+
+@pytest.mark.parametrize("seq", [None, "1", [], True, -1])
+def test_apply_refuses_a_corrupted_sequence_before_arithmetic(seq):
+    """A corrupt cursor refuses before seq + 1, then a zero cursor still initializes."""
+    ledger = workspace.Ledger()
+    ledger.seq = seq
+    proposed = 2 if seq is True else 1
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(proposed, "init", LIMITS))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq is seq
+    assert ledger.limits is None
+    ledger.seq = 0
+    ledger.apply(event(1, "init", LIMITS))
+    assert ledger.seq == 1
+    assert ledger.limits["writer"] == LIMITS["writer_limit"]
+
+
+def test_apply_on_a_non_ledger_is_invalid_record():
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.Ledger.apply(SimpleNamespace(seq=None), event(1, "init", LIMITS))
+    assert_refusal(error, "invalid_record")
+
+
+def test_init_refuses_unless_the_sequence_is_zero_then_retries():
+    ledger = workspace.Ledger()
+    ledger.seq = 5
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(6, "init", LIMITS))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq == 5
+    assert ledger.limits is None
+    ledger.seq = 0
+    ledger.apply(event(1, "init", LIMITS))
+    assert ledger.seq == 1
+
+
+def test_non_init_refuses_a_zero_sequence_and_retries_after_init():
+    ledger = workspace.Ledger()
+    ledger.limits = {"writer": 5, "heavy": 3, "heavy-tests": 1}
+    limits = ledger.limits
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(1, "register", INITIATIVE))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq == 0
+    assert "alpha" not in ledger.initiatives
+    assert ledger.limits is limits
+    ledger.limits = None
+    ledger.apply(event(1, "init", LIMITS))
+    ledger.apply(event(2, "register", INITIATIVE))
+    assert ledger.initiative("alpha")["id"] == "alpha"
+    assert ledger.seq == 2
+
+
+def test_apply_at_the_record_ceiling_is_too_large_and_retries():
+    ledger = _initialized_ledger()
+    retained = ledger.initiative("alpha")
+    indexes = _mapping_ids(ledger)
+    before = ledger_state(ledger)
+    ledger.seq = workspace.MAX_RECORDS
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(workspace.MAX_RECORDS + 1, "set_limits", {"source": "owner", "writer_limit": 4}))
+    assert_refusal(error, "too_large")
+    assert ledger.seq == workspace.MAX_RECORDS
+    assert ledger.initiative("alpha") is retained
+    _same_mappings(ledger, indexes)
+    ledger.seq = before["seq"]
+    assert ledger_state(ledger) == before
+    ledger.apply(event(3, "set_limits", {"source": "owner", "writer_limit": 4}))
+    assert ledger.seq == 3
+    assert ledger.limits is indexes[4]
+    assert retained["id"] == "alpha"
+
+
+def test_store_record_limit_override_binds_apply(monkeypatch):
+    """A lowered store ceiling refuses apply, and a raised ceiling admits the same validator."""
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 2)
+    ledger = _initialized_ledger()
+    retained = ledger.initiative("alpha")
+    indexes = _mapping_ids(ledger)
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(3, "request", _request_data()))
+    assert_refusal(error, "too_large")
+    assert ledger.seq == 2
+    assert "req-00000003" not in ledger.requests
+    assert ledger.initiative("alpha") is retained
+    _same_mappings(ledger, indexes)
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 10005)
+    ledger.seq = 10004
+    ledger.apply(event(10005, "set_limits", {"source": "owner", "writer_limit": 4}))
+    assert ledger.seq == 10005
+    assert ledger.limits is indexes[4]
+    assert ledger.limits["writer"] == 4
+
+
+def test_store_record_limit_override_binds_append(tmp_path, monkeypatch):
+    """Raising the store ceiling lets append publish the sequence the events default would refuse."""
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 10005)
+    root = make_store(tmp_path, [])
+    ledger = _initialized_ledger()
+    limits = ledger.limits
+    ledger.seq = 10000
+    with workspace.WorkspaceStore(root) as store:
+        published = store.append(ledger, "set_limits", {"source": "owner", "writer_limit": 4})
+    assert published["seq"] == 10001
+    assert ledger.seq == 10001
+    assert ledger.limits is limits
+    assert limits["writer"] == 4
+    names = sorted(path.name for path in (root / "events").iterdir())
+    assert names == ["00010001.json"]
+
+
+@pytest.mark.parametrize("seq", [True, 1])
+def test_append_init_cannot_publish_past_a_missing_first_record(tmp_path, seq):
+    """Init at a boolean or nonzero cursor writes nothing, then a zero cursor publishes 00000001."""
+    root = make_store(tmp_path, [])
+    ledger = workspace.Ledger()
+    ledger.seq = seq
+    with workspace.WorkspaceStore(root) as store:
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "init", LIMITS)
+        assert_refusal(error, "invalid_record")
+        assert ledger.limits is None
+        assert ledger.seq == seq
+        assert list((root / "events").iterdir()) == []
+        fresh = workspace.Ledger()
+        published = store.append(fresh, "init", LIMITS)
+        assert published["seq"] == 1
+        assert fresh.seq == 1
+        assert fresh.limits["writer"] == LIMITS["writer_limit"]
+        assert sorted(path.name for path in (root / "events").iterdir()) == ["00000001.json"]
+        assert store.load().seq == 1
+
+
+def test_corrupt_sequence_append_does_not_publish_beside_a_valid_init(tmp_path):
+    """A concurrent corrupt init loses; the valid init publishes only the first record."""
+    root = make_store(tmp_path, [])
+    bad = workspace.Ledger()
+    bad.seq = True
+    good = workspace.Ledger()
+
+    def attempt(ledger):
+        with workspace.WorkspaceStore(root) as store:
+            try:
+                return store.append(ledger, "init", LIMITS)
+            except WorkspaceRefusal as error:
+                return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result(timeout=5) for future in (
+            pool.submit(attempt, bad), pool.submit(attempt, good))]
+    assert bad.limits is None and bad.seq is True
+    names = sorted(path.name for path in (root / "events").iterdir())
+    assert "00000002.json" not in names
+    published = [item for item in results if not isinstance(item, WorkspaceRefusal)]
+    refusals = [item for item in results if isinstance(item, WorkspaceRefusal)]
+    assert refusals
+    assert all(item.reason in ("invalid_record", "busy") for item in refusals)
+    with workspace.WorkspaceStore(root) as store:
+        if not published:
+            published_event = store.append(good, "init", LIMITS)
+            assert published_event["seq"] == 1
+        else:
+            assert len(published) == 1 and published[0]["seq"] == 1
+            assert good.seq == 1
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(bad, "init", LIMITS)
+        assert_refusal(error, "invalid_record")
+        assert bad.limits is None and bad.seq is True
+        assert sorted(path.name for path in (root / "events").iterdir()) == ["00000001.json"]
+        assert store.load().seq == 1
+
+
+@pytest.mark.parametrize("transition", ["release", "supersede"])
+def test_link_failure_after_preview_keeps_row_and_retries(tmp_path, monkeypatch, transition):
+    """A link failure after preview keeps history, the row and the indexes; retry updates that row."""
+    request = _request_data()
+    evidence = {"path": str(tmp_path / "evidence"), "sha256": "0" * 64}
+    rows = [event(1, "init", LIMITS), event(2, "register", INITIATIVE), event(3, "request", request)]
+    if transition == "release":
+        rows.append(event(4, "grant", {"request_id": request["request_id"]}))
+        kind, data = "release", {"request_id": request["request_id"], "evidence": evidence}
+    else:
+        kind = "request"
+        data = {**request, "request_id": "req-00000004", "supersedes": request["request_id"]}
+    root = make_store(tmp_path, rows)
+    with workspace.WorkspaceStore(root) as store, workspace.WorkspaceStore(root) as reader:
+        ledger = store.load()
+        retained = ledger.request(request["request_id"])
+        indexes = _mapping_ids(ledger)
+        before = ledger_state(ledger)
+        history = _event_bytes(root)
+        owned = workspace.os
+
+        def fail_link(*args, **kwargs):
+            raise OSError("secret")
+
+        monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned), "link": fail_link}))
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, kind, data)
+        assert_refusal(error, "io")
+        assert ledger.seq == before["seq"]
+        assert ledger_state(ledger) == before
+        assert ledger.request(request["request_id"]) is retained
+        assert _event_bytes(root) == history
+        _same_mappings(ledger, indexes)
+        assert reader.load().seq == ledger.seq
+        monkeypatch.setattr(workspace, "os", owned)
+        appended = store.append(ledger, kind, data)
+        assert ledger.request(request["request_id"]) is retained
+        fresh = reader.load()
+        assert fresh.seq == ledger.seq == appended["seq"]
+        assert ledger_state(fresh) == ledger_state(ledger)
+        if transition == "release":
+            assert retained["state"] == "released"
+            assert retained["evidence"] == evidence
+        else:
+            assert retained["state"] == "withdrawn"
+            assert retained["superseded_by"] == "req-00000004"
+            assert ledger.request("req-00000004")["seq"] == retained["seq"]
+
+
+@pytest.mark.parametrize("bad", [None, object(), [[]]], ids=["none", "opaque", "nested_array"])
+def test_field_declaration_shape_refuses_before_set_conversion(bad):
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.fields({"x": 1}, bad)
+    assert_refusal(error, "invalid_record")
+    assert workspace.fields({"x": 1}, {"x"}) is None
+
+
+@pytest.mark.parametrize("field", ["used", "limit"])
+@pytest.mark.parametrize("bad", [[], {}], ids=["array", "object"])
+def test_report_numeric_shapes_refuse_before_formatting_then_retry(field, bad):
+    report = workspace.report(_initialized_ledger())
+    valid = deepcopy(report)
+    report["capacity"]["writer"][field] = bad
+    before = deepcopy(report)
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.report_text(report)
+    assert_refusal(error, "invalid_record")
+    assert report == before
+    assert isinstance(workspace.report_text(valid), str)
+
+
+@pytest.mark.parametrize("bad", [None, [], {}, False], ids=["null", "array", "object", "boolean"])
+def test_wrong_timing_types_keep_legacy_unknown_outcome(bad):
+    ledger = _initialized_ledger()
+    ledger.apply(event(3, "request", _request_data()))
+    request = ledger.request("req-00000003")
+    request["requested_at"] = bad
+    before = ledger_state(ledger)
+    result = workspace.queue_facts(ledger, NOW)
+    assert result == legacy.queue_facts(ledger, NOW)
+    assert result["writer"]["timing_unknown"] == 1
+    assert ledger_state(ledger) == before
+    request["requested_at"] = NOW
+    assert workspace.queue_facts(ledger, NOW)["writer"]["timing_unknown"] == 0
+
+
+@pytest.mark.parametrize("bad", [None, {"messages": 0, "open_job_requests": None, "accepted_writers": []}],
+                         ids=["status_object", "request_collection"])
+def test_mailbox_status_shape_keeps_operational_refusal_and_closes_port(bad):
+    closed = []
+    mailbox = SimpleNamespace(status=lambda: bad, close=lambda: closed.append(True))
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.mailbox_facts({"mailbox_root": Path.cwd().as_posix()}, mailbox_factory=lambda root: mailbox)
+    assert_refusal(error, "invalid_record")
+    assert closed == [True]
+
+
+def test_mailbox_delivery_shape_refuses_before_numeric_sum_and_closes_port():
+    closed = []
+    mailbox = SimpleNamespace(
+        status=lambda: {"messages": 0, "open_job_requests": [], "accepted_writers": []},
+        delivery=lambda root: {"endpoints": {"lane": {"unread_count": None}}},
+        close=lambda: closed.append(True))
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.mailbox_facts({"mailbox_root": Path.cwd().as_posix(), "delivery_dir": Path.cwd().as_posix()},
+                                mailbox_factory=lambda root: mailbox)
+    assert_refusal(error, "invalid_record")
+    assert closed == [True]
+
+
+def test_mailbox_shape_refusal_allows_valid_retry_with_legacy_facts():
+    response, closed = [None], []
+    def factory(root):
+        return SimpleNamespace(status=lambda: response[0], close=lambda: closed.append(True),
+            delivery=lambda destination: {"endpoints": {"one": {"unread_count": 1}, "two": {"unread_count": 2}}})
+    initiative = {"mailbox_root": Path.cwd().as_posix(), "delivery_dir": Path.cwd().as_posix()}
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.mailbox_facts(initiative, mailbox_factory=factory)
+    assert_refusal(error, "invalid_record")
+    response[0] = {"messages": 2, "open_job_requests": ["one"], "accepted_writers": ["one"]}
+    assert workspace.mailbox_facts(initiative, mailbox_factory=factory) == {
+        "messages": 2, "open_job_requests": 1, "accepted_writers": 1, "unread": 3}
+    assert closed == [True, True]
+
+
+@pytest.mark.parametrize("payload", list(credential_positions(2)))
+def test_generated_observer_credential_positions_are_screened(tmp_path, payload):
+    root = make_store(tmp_path)
+    with workspace.WorkspaceStore(root) as store:
+        code, result = workspace.grant_next(store, "heavy-tests", lambda ledger: [payload])
+        assert code == 3 and result["reason"] == "capacity_full"
+        assert "hunter2" not in repr(result)
+        assert store.load().seq == 1
+
+
+def test_resulting_capacity_counts_stale_pending_before_publication(tmp_path, monkeypatch):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE)])
+    pending = root / "events" / ".pending-stale"
+    pending.write_bytes(b"stale")
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 3)
+    monkeypatch.setattr(storage, "MAX_RECORDS", 3)
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        ledger = store.load()
+        before = {p.name: p.read_bytes() for p in (root / "events").iterdir()}
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "request", _request_data())
+        assert_refusal(error, "too_large")
+        assert ledger.seq == 2
+        assert {p.name: p.read_bytes() for p in (root / "events").iterdir()} == before
+        pending.unlink()
+        store.append(ledger, "request", _request_data())
+        assert store.load().seq == 3
+
+
+def test_concurrent_reader_accepts_only_own_publication_pair(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    monkeypatch.setattr(workspace, "MAX_RECORDS", 2)
+    linked, resume = Event(), Event()
+    real_link = os.link
+    def pause_after_link(*args, **kwargs):
+        real_link(*args, **kwargs)
+        linked.set()
+        assert resume.wait(5)
+    owned_os = SimpleNamespace(**{**vars(workspace.os), "link": pause_after_link})
+    monkeypatch.setattr(workspace, "os", owned_os)
+    with workspace.WorkspaceStore(root) as writer, workspace.WorkspaceStore(root) as reader:
+        def publish():
+            with writer.lock():
+                writer.append(writer.load(), "register", INITIATIVE)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(publish)
+            try:
+                assert linked.wait(5)
+                assert reader.load().seq == legacy.Store(root).load().seq == 2
+            finally:
+                resume.set()
+            future.result(timeout=5)
+        assert reader.load().seq == 2
+        real_link(root / "events" / "00000002.json", root / "unrelated-link")
+        with pytest.raises(WorkspaceRefusal) as error:
+            reader.load()
+        assert_refusal(error, "unsafe_path")
+        (root / "unrelated-link").unlink()
+        assert reader.load().seq == 2
+
+
+def test_committed_grant_survives_cleanup_and_next_writer_recovers(tmp_path, monkeypatch):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    real_unlink = os.unlink
+    failed = []
+    def fail_release(name, **kwargs):
+        if name == ".write.lock" and not failed:
+            failed.append(True)
+            raise OSError("password=hunter2")
+        return real_unlink(name, **kwargs)
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(workspace.os), "unlink": fail_release}))
+    with workspace.WorkspaceStore(root) as store:
+        code, result = workspace.grant_next(store, "writer")
+        assert code == 0 and result["granted"]["state"] == "granted"
+        assert result["warnings"][0]["reason"] == "lock_release"
+        assert result["warnings"][0]["next_action"]
+        validate_warnings(result["warnings"])
+        assert "hunter2" not in repr(result)
+        assert store.load().requests[result["granted"]["request_id"]]["state"] == "granted"
+    manual_recovery_if_identity_unavailable(root)
+    with workspace.WorkspaceStore(root) as retry:
+        assert workspace.grant_next(retry, "writer")[1]["reason"] == "queue_empty"
+    assert not (root / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("sticky", [False, True])
+def test_trusted_root_owned_parent_keeps_legacy_success(tmp_path, monkeypatch, sticky):
+    root = make_store(tmp_path)
+    proof = root / "proof"
+    proof.write_bytes(b"proof")
+    reference = {"path": str(proof), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    parent = os.stat(tmp_path)
+    root_uid = 0
+    real_fstat = workspace.os.fstat
+    def parent_policy(fd):
+        info = real_fstat(fd)
+        if (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
+            return stat_observation(info, stat.S_IFDIR | (0o1777 if sticky else 0o755), root_uid)
+        return info
+    proxy = SimpleNamespace(**{**vars(workspace.os), "fstat": parent_policy})
+    monkeypatch.setattr(workspace, "os", proxy)
+    # The actual filesystem still supplies all descriptors and bytes; only
+    # parent ownership/mode observation models /home and /tmp cross-platform.
+    assert legacy.Store(root).load().seq == 1
+    assert legacy.verify_evidence(reference) is None
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+    assert workspace.verify_evidence(reference) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX backslash declaration semantics")
+def test_posix_backslash_declaration_keeps_legacy_acceptance():
+    value = "/tmp/a\\b"
+    assert workspace.absolute(value, "path") == legacy.absolute(value, "path") == value
+    assert workspace.validate_initiative({**INITIATIVE, "checkouts": [value]}) is None
+
+
+def test_replay_reuses_unchanged_appends_incrementally_and_rewrites_fully(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    real_json, reads = workspace.strict_json, []
+    def count_parse(raw):
+        reads.append(raw)
+        return real_json(raw)
+    monkeypatch.setattr(workspace, "strict_json", count_parse)
+    with workspace.WorkspaceStore(root) as store:
+        first = store.load()
+        assert len(reads) == 1
+        first.limits["writer"] = 999
+        assert store.load().limits["writer"] == 5
+        assert len(reads) == 1
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+        assert store.load().seq == 2
+        assert len(reads) == 2
+        path = root / "events" / "00000002.json"
+        path.write_bytes(workspace.encoded(event(2, "register", {**INITIATIVE, "project": "revised"})))
+        assert store.load().initiatives["alpha"]["project"] == "revised"
+        assert len(reads) == 4
+        assert store.load(for_report=True).seq == 2
+        assert len(reads) == 6
+
+
+@pytest.mark.parametrize("owner,mode", [("owner", 0o777), ("owner", 0o770), ("foreign", 0o755),
+                                       ("foreign", 0o1777)])
+def test_untrusted_ancestor_refuses_before_read_then_retries(tmp_path, monkeypatch, owner, mode):
+    root = make_store(tmp_path)
+    target = os.stat(tmp_path)
+    real_fstat, owned_os = workspace.os.fstat, workspace.os
+    def untrusted(fd):
+        info = real_fstat(fd)
+        if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+            return stat_observation(info, stat.S_IFDIR | mode, os.geteuid() if owner == "owner" else 123456)
+        return info
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "fstat": untrusted}))
+    before = (root / "events" / "00000001.json").read_bytes()
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(root)
+    assert_refusal(error, "unsafe_path")
+    assert (root / "events" / "00000001.json").read_bytes() == before
+    monkeypatch.setattr(workspace, "os", owned_os)
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+
+
+def test_failed_constructor_closes_every_opened_descriptor(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    owned_os, opened = workspace.os, []
+    def track_open(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    def fail_stat(fd):
+        raise OSError("password=hunter2")
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "open": track_open,
+                                                           "fstat": fail_stat}))
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(root)
+    assert_refusal(error, "io")
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    monkeypatch.setattr(workspace, "os", owned_os)
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+
+
+def test_cleanup_failure_without_commit_refuses_then_recovers_own_stale_lock(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    def fail_release(name, **kwargs):
+        if name == ".write.lock":
+            raise OSError("password=hunter2")
+        return os.unlink(name, **kwargs)
+    with workspace.WorkspaceStore(root) as store:
+        monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_release}))
+        with pytest.raises(WorkspaceRefusal) as error:
+            with store.lock():
+                store.append(store.load(), "register", {})
+        assert error.value.code == 1 and error.value.next_action
+        assert store.load().seq == 1
+        monkeypatch.setattr(workspace, "os", owned_os)
+        manual_recovery_if_identity_unavailable(root)
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+        assert store.load().seq == 2
+
+
+def test_stale_lock_recovery_never_removes_replaced_lock(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    def fail_release(name, **kwargs):
+        if name == ".write.lock":
+            raise OSError("release failed")
+        return os.unlink(name, **kwargs)
+    with workspace.WorkspaceStore(root) as store:
+        monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_release}))
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+        monkeypatch.setattr(workspace, "os", owned_os)
+    lock = root / ".write.lock"
+    lock.unlink()
+    lock.write_bytes(b"another writer")
+    lock.chmod(0o600)
+    with workspace.WorkspaceStore(root) as retry:
+        with pytest.raises(WorkspaceRefusal) as error:
+            with retry.lock():
+                pytest.fail("replaced lock was removed")
+        assert_refusal(error, "busy")
+        assert lock.read_bytes() == b"another writer"
+        lock.unlink()
+        with retry.lock():
+            assert retry.load().seq == 2
+
+
+def test_cache_failed_rewrite_refuses_and_restored_history_retries(tmp_path):
+    root = make_store(tmp_path)
+    path = root / "events" / "00000001.json"
+    good = path.read_bytes()
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+        path.write_bytes(b"{")
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "invalid_record")
+        path.write_bytes(good)
+        assert store.load().seq == 1
+
+
+def test_filesystem_metadata_never_teaches_an_additional_trusted_uid(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    root_info, target = os.stat(Path(root.anchor)), os.stat(tmp_path)
+    identities = {(info.st_dev, info.st_ino) for info in (root_info, target)}
+    def foreign_root(fd):
+        info = owned_os.fstat(fd)
+        if info.st_uid == 0 or (info.st_dev, info.st_ino) in identities:
+            return stat_observation(info, stat.S_IFDIR | 0o755, 123456)
+        return info
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "fstat": foreign_root}))
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.WorkspaceStore(root)
+    assert_refusal(error, "unsafe_path")
+    monkeypatch.setattr(workspace, "os", owned_os)
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+
+
+def test_reader_retries_when_link_appears_after_directory_name_snapshot(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    pending = root / "events" / (".pending-" + "a" * 32)
+    pending.write_bytes(workspace.encoded(event(2, "register", INITIATIVE)))
+    linked = []
+    real_stat = os.stat
+    def link_before_stat(name, **kwargs):
+        if name == pending.name and not linked:
+            os.link(pending.name, "00000002.json", src_dir_fd=kwargs["dir_fd"],
+                    dst_dir_fd=kwargs["dir_fd"], follow_symlinks=False)
+            linked.append(True)
+        return real_stat(name, **kwargs)
+    with workspace.WorkspaceStore(root) as store:
+        monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(workspace.os), "stat": link_before_stat}))
+        assert store.load().seq == legacy.Store(root).load().seq == 2
+        pending.unlink()
+        assert store.load().seq == 2
+
+
+def real_owner(path, uid):
+    """Real ownership tests run only where this UID can set the requested owner."""
+    if path.stat().st_uid != uid:
+        try:
+            os.chown(path, uid, -1)
+        except OSError as error:
+            if error.errno not in (errno.EPERM, errno.EACCES, errno.EINVAL, errno.ENOTSUP):
+                raise
+            pytest.skip("changing directory/file ownership requires an OS capability")
+
+
+@pytest.mark.parametrize("ancestor", ["owner", "root0755", "root0711", "sticky1777"])
+@pytest.mark.parametrize("coordination", ["owner0700", "owner0775", "root1777", "foreign"])
+@pytest.mark.parametrize("target", ["workspace", "events", "evidence"])
+def test_generated_real_ancestor_coordination_matrix(tmp_path, ancestor, coordination, target):
+    if os.name != "posix":
+        pytest.skip("POSIX directory ownership and modes")
+    parent = tmp_path / "ancestor"
+    parent.mkdir(mode=0o700)
+    root = make_store(parent)
+    proof = root / "proof"
+    proof.write_bytes(b"proof")
+    reference = {"path": str(proof), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    folder = root / "events" if target == "events" else root
+    try:
+        if ancestor != "owner":
+            real_owner(parent, 0)
+            parent.chmod({"root0755": 0o755, "root0711": 0o711, "sticky1777": 0o1777}[ancestor])
+        if coordination == "root1777":
+            real_owner(folder, 0)
+        elif coordination == "foreign":
+            real_owner(folder, 65533 if os.geteuid() != 65533 else 65532)
+        folder.chmod({"owner0700": 0o700, "owner0775": 0o775, "root1777": 0o1777,
+                      "foreign": 0o755}[coordination])
+        def check():
+            if target == "evidence":
+                return workspace.verify_evidence(reference)
+            with workspace.WorkspaceStore(root) as store:
+                return store.load().seq
+        if coordination == "owner0700" or (target == "evidence" and coordination == "root1777"):
+            assert check() == (None if target == "evidence" else 1)
+        else:
+            with pytest.raises(WorkspaceRefusal) as error:
+                check()
+            assert_refusal(error, "unsafe_path")
+    finally:
+        # Restore real permissions/ownership for pytest's cross-platform cleanup.
+        if folder.stat().st_uid == os.geteuid():
+            folder.chmod(0o700)
+        else:
+            os.chown(folder, os.geteuid(), -1)
+            folder.chmod(0o700)
+        if parent.stat().st_uid != os.geteuid():
+            os.chown(parent, os.geteuid(), -1)
+        parent.chmod(0o700)
+
+
+@pytest.mark.parametrize("api", ["store", "evidence"])
+@pytest.mark.parametrize("component", ["ancestor", "coordination"])
+def test_search_only_real_ancestor_keeps_legacy_success(tmp_path, api, component):
+    if os.name != "posix" or not hasattr(os, "O_PATH"):
+        pytest.skip("search-only directory descriptors required")
+    parent = tmp_path / "search-only"
+    parent.mkdir(mode=0o700)
+    root = make_store(parent)
+    proof = root / "proof"
+    proof.write_bytes(b"proof")
+    reference = {"path": str(proof), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    search_only = parent if component == "ancestor" else root
+    search_only.chmod(0o111)
+    try:
+        if api == "store":
+            assert legacy.Store(root).load().seq == 1
+            with workspace.WorkspaceStore(root) as store:
+                assert store.load().seq == 1
+        else:
+            assert legacy.verify_evidence(reference) is None
+            assert workspace.verify_evidence(reference) is None
+    finally:
+        search_only.chmod(0o700)
+
+
+def test_foreign_owned_event_refuses_before_read_and_retries(tmp_path):
+    if os.name != "posix":
+        pytest.skip("POSIX file ownership")
+    root = make_store(tmp_path)
+    record = root / "events" / "00000001.json"
+    original = record.read_bytes()
+    try:
+        real_owner(record, 65533 if os.geteuid() != 65533 else 65532)
+        with workspace.WorkspaceStore(root) as store:
+            with pytest.raises(WorkspaceRefusal) as error:
+                store.load()
+            assert_refusal(error, "unsafe_path")
+        assert record.read_bytes() == original
+    finally:
+        if record.stat().st_uid != os.geteuid():
+            os.chown(record, os.geteuid(), -1)
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+
+
+@pytest.mark.parametrize("target,policy", [(target, policy) for target in ("workspace", "events", "event")
+    for policy in ("foreign", "sticky_root") if target != "event" or policy != "sticky_root"])
+def test_coordination_policy_rechecks_held_objects_before_read(tmp_path, monkeypatch, target, policy):
+    root = make_store(tmp_path)
+    path = {"workspace": root, "events": root / "events", "event": root / "events" / "00000001.json"}[target]
+    info = path.stat()
+    owned_os = workspace.os
+    with workspace.WorkspaceStore(root) as store:
+        assert store.load().seq == 1
+        def foreign(info):
+            if (info.st_dev, info.st_ino) == (path.stat().st_dev, path.stat().st_ino):
+                return stat_observation(info, info.st_mode if policy == "foreign" else
+                                        stat.S_IFMT(info.st_mode) | 0o1777,
+                                        123456 if policy == "foreign" else 0)
+            return info
+        reads = []
+        def record_read(*args):
+            reads.append(args)
+            return owned_os.read(*args)
+        proxy = SimpleNamespace(**{**vars(owned_os), "fstat": lambda fd: foreign(owned_os.fstat(fd)),
+                                  "read": record_read,
+                                  "stat": lambda *a, **kw: foreign(owned_os.stat(*a, **kw))})
+        monkeypatch.setattr(workspace, "os", proxy)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.load()
+        assert_refusal(error, "unsafe_path")
+        assert reads == []
+        monkeypatch.setattr(workspace, "os", owned_os)
+        assert store.load().seq == 1
+
+
+def interpreter_command(root, body):
+    """Carry only the existing ancestry observation seam into a fresh process."""
+    observations = []
+    for parent in root.parents:
+        fd = os.open(parent, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
+        try:
+            real, seen = os.fstat(fd), workspace.os.fstat(fd)
+            if (real.st_uid, real.st_mode) != (seen.st_uid, seen.st_mode):
+                observations.append([real.st_dev, real.st_ino, seen.st_uid, seen.st_mode])
+        finally:
+            os.close(fd)
+    setup = '''
+import json, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from aegis_core import team_workspace_store as w
+root = Path(sys.argv[1])
+observations = {(dev, ino): (uid, mode) for dev, ino, uid, mode in json.loads(sys.argv[2])}
+real_fstat = os.fstat
+def fixture_info(fd):
+    info = real_fstat(fd)
+    if (info.st_dev, info.st_ino) in observations:
+        uid, mode = observations[(info.st_dev, info.st_ino)]
+        return SimpleNamespace(**{**{k: getattr(info, k) for k in dir(info) if k.startswith('st_')},
+                                  'st_uid': uid, 'st_mode': mode})
+    return info
+w.os = SimpleNamespace(**{**vars(os), 'fstat': fixture_info})
+'''
+    return [sys.executable, "-c", setup + body, str(root), json.dumps(observations)]
+
+
+@pytest.mark.parametrize("marker_failure", [False, True])
+def test_committed_cleanup_is_recoverable_from_fresh_interpreter(tmp_path, marker_failure):
+    if sys.platform != "linux":
+        pytest.skip("kernel pid/start-time identity requires Linux proc")
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    writer = "fail_marker = " + repr(marker_failure) + "\n" + '''
+def fail_marker_seek(*args):
+    raise OSError('marker write failed')
+def fail_release(name, **kw):
+    if name == '.write.lock':
+        if fail_marker:
+            w.os.lseek = fail_marker_seek
+        raise OSError('password=hunter2')
+    return os.unlink(name, **kw)
+w.os.unlink = fail_release
+with w.WorkspaceStore(root) as store:
+    print(json.dumps(w.grant_next(store, 'writer')))
+'''
+    result = subprocess.run(interpreter_command(root, writer), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    code, answer = json.loads(result.stdout)
+    assert code == 0 and answer["granted"]["state"] == "granted"
+    assert answer["warnings"][0]["reason"] == "lock_release"
+    assert json.loads((root / ".write.lock").read_bytes())["released"] == (0 if marker_failure else 1)
+    reader = '''
+with w.WorkspaceStore(root) as store:
+    with store.lock():
+        assert store.load().seq == 4
+        store.append(store.load(), 'set_limits', {'source': 'retry', 'writer_limit': 4})
+    print(store.load().seq)
+'''
+    result = subprocess.run(interpreter_command(root, reader), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "5"
+    assert not (root / ".write.lock").exists()
+
+
+def test_fresh_interpreter_excludes_live_writer_before_and_after_cleanup_failure(tmp_path, monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("kernel pid/start-time identity requires Linux proc")
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    def fail_release(name, **kw):
+        if name == ".write.lock":
+            raise OSError("cleanup failed")
+        return os.unlink(name, **kw)
+    contender = '''
+with w.WorkspaceStore(root) as store:
+    try:
+        with store.lock():
+            raise AssertionError('live writer was removed')
+    except w.WorkspaceRefusal as error:
+        print(error.reason)
+'''
+    def assert_busy():
+        result = subprocess.run(interpreter_command(root, contender), capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "busy"
+    with workspace.WorkspaceStore(root) as store:
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+            assert_busy()
+            before = json.loads((root / ".write.lock").read_bytes())
+            assert before["released"] == 0 and before["identity"]["pid"] == os.getpid()
+            monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_release}))
+        monkeypatch.setattr(workspace, "os", owned_os)
+        after = json.loads((root / ".write.lock").read_bytes())
+        assert after == {**before, "released": 1}
+        assert_busy()
+        with store.lock():
+            assert store.load().seq == 2
+    assert not (root / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("field,value", [("dev", -1), ("ino", -1), ("grant_id", "bad"),
+                                       ("released", 2), ("pid", []), ("identity", None)])
+def test_durable_recovery_refuses_invalid_identity_then_retries(tmp_path, monkeypatch, field, value):
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    def fail_release(name, **kw):
+        if name == ".write.lock":
+            raise OSError("cleanup failed")
+        return os.unlink(name, **kw)
+    with workspace.WorkspaceStore(root) as store:
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+            monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_release}))
+        monkeypatch.setattr(workspace, "os", owned_os)
+        path = root / ".write.lock"
+        good = path.read_bytes()
+        record = json.loads(good)
+        # Exercise cross-process recovery validation without needing a live foreign PID.
+        record["pid"] = 2147483647
+        if type(record["identity"]) is dict:
+            record["identity"]["pid"] = record["pid"]
+        record[field] = value
+        raw = workspace.encoded(record)
+        path.write_bytes(raw)
+        with pytest.raises(WorkspaceRefusal) as error:
+            with store.lock():
+                pytest.fail("invalid recovery witness was accepted")
+        assert_refusal(error, "busy")
+        assert path.read_bytes() == raw and store.load().seq == 2
+        path.write_bytes(good)
+        manual_recovery_if_identity_unavailable(root)
+        with store.lock():
+            assert store.load().seq == 2
+
+
+@pytest.mark.parametrize("phase", ["before_stat", "during_read", "before_recheck"])
+def test_changing_lock_record_is_busy_and_retry_succeeds(tmp_path, monkeypatch, phase):
+    root = make_store(tmp_path)
+    owned_os = workspace.os
+    def fail_release(name, **kw):
+        if name == ".write.lock":
+            raise OSError("cleanup failed")
+        return os.unlink(name, **kw)
+    with workspace.WorkspaceStore(root) as store:
+        with store.lock():
+            store.append(store.load(), "register", INITIATIVE)
+            monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_release}))
+        monkeypatch.setattr(workspace, "os", owned_os)
+        path, touched = root / ".write.lock", []
+        def changing_read(fd, size):
+            raw = owned_os.read(fd, size)
+            if phase == "during_read" and owned_os.fstat(fd).st_ino == path.stat().st_ino and not touched:
+                info = path.stat()
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+                touched.append(True)
+            return raw
+        stats = []
+        def disappearing_stat(name, **kw):
+            if name == ".write.lock":
+                stats.append(name)
+                if len(stats) == {"before_stat": 1, "during_read": 0, "before_recheck": 3}[phase]:
+                    path.unlink()
+            return owned_os.stat(name, **kw)
+        monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "read": changing_read,
+                                                              "stat": disappearing_stat}))
+        with pytest.raises(WorkspaceRefusal) as error:
+            with store.lock():
+                pytest.fail("changing lock identity was accepted")
+        assert_refusal(error, "busy")
+        monkeypatch.setattr(workspace, "os", owned_os)
+        manual_recovery_if_identity_unavailable(root)
+        with store.lock():
+            assert store.load().seq == 2
+
+
+def test_concurrent_fresh_interpreters_recover_without_duplicate_publication(tmp_path):
+    if sys.platform != "linux":
+        pytest.skip("kernel pid/start-time identity requires Linux proc")
+    root = make_store(tmp_path)
+    writer = '''
+def fail_release(name, **kw):
+    if name == '.write.lock':
+        raise OSError('cleanup failed')
+    return os.unlink(name, **kw)
+w.os.unlink = fail_release
+with w.WorkspaceStore(root) as store:
+    with store.lock():
+        store.append(store.load(), 'set_limits', {'source': 'writer', 'writer_limit': 4})
+'''
+    result = subprocess.run(interpreter_command(root, writer), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    contender = '''
+with w.WorkspaceStore(root) as store:
+    try:
+        with store.lock():
+            store.append(store.load(), 'set_limits', {'source': 'contender', 'writer_limit': 3})
+        print('committed')
+    except w.WorkspaceRefusal as error:
+        assert error.reason == 'busy'
+        print('busy')
+'''
+    command = interpreter_command(root, contender)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(subprocess.run, command, capture_output=True, text=True, timeout=15) for _ in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+    assert all(result.returncode == 0 for result in results), [result.stderr for result in results]
+    committed = sum(result.stdout.strip() == "committed" for result in results)
+    assert committed >= 1
+    with workspace.WorkspaceStore(root) as store, store.lock():
+        assert store.load().seq == 2 + committed
+        store.append(store.load(), "set_limits", {"source": "retry", "writer_limit": 2})
+        assert store.load().seq == 3 + committed
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o711, 0o1777])
+def test_evidence_directly_under_trusted_root_parent_keeps_legacy_success(tmp_path, monkeypatch, mode):
+    root = make_store(tmp_path)
+    parent = root / "shared-evidence"
+    parent.mkdir(mode=0o700)
+    proof = parent / "proof"
+    proof.write_bytes(b"proof")
+    reference = {"path": str(proof), "sha256": hashlib.sha256(b"proof").hexdigest()}
+    parent.chmod(mode)
+    target = parent.stat()
+    owned_os = workspace.os
+    def trusted_parent(fd):
+        info = owned_os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+            return stat_observation(info, info.st_mode, 0)
+        return info
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "fstat": trusted_parent}))
+    assert legacy.verify_evidence(reference) is None
+    assert workspace.verify_evidence(reference) is None
+    # A traversal-only evidence parent does not acquire coordination authority.
+    if os.geteuid() != 0 or mode == 0o1777:
+        with pytest.raises(WorkspaceRefusal) as error:
+            workspace.WorkspaceStore(parent)
+        assert_refusal(error, "unsafe_path")
+
+
+@pytest.mark.parametrize("identity_mode", ["observation_failure", "unsupported", "absent"])
+def test_unknown_identity_keeps_fresh_process_legacy_manual_recovery(tmp_path, identity_mode):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    writer = "identity_mode = " + repr(identity_mode) + "\n" + '''
+from aegis_core import kernel_identity as kernel
+def unavailable(pid):
+    if identity_mode == 'absent':
+        return None
+    raise kernel.IdentityError('unavailable' if identity_mode == 'observation_failure' else 'unsupported')
+def fail_release(name, **kw):
+    if name == '.write.lock':
+        raise OSError('password=hunter2')
+    return os.unlink(name, **kw)
+w._kernel = SimpleNamespace(**{**vars(kernel), 'process_identity': unavailable,
+    'descriptor_supported': (lambda: False) if identity_mode == 'unsupported' else kernel.descriptor_supported})
+w.os.unlink = fail_release
+with w.WorkspaceStore(root) as store:
+    code, result = w.grant_next(store, 'writer')
+    assert code == 0 and result['granted']['state'] == 'granted'
+    assert result['warnings'][0]['reason'] == 'lock_release'
+    assert 'hunter2' not in repr(result)
+    raw = (root / '.write.lock').read_bytes()
+    assert json.loads(raw)['identity'] == 'unavailable'
+    try:
+        with store.lock():
+            raise AssertionError('unknown same-PID identity was automatically recovered')
+    except w.WorkspaceRefusal as error:
+        assert error.reason == 'busy'
+    assert (root / '.write.lock').read_bytes() == raw
+    print(json.dumps(result))
+'''
+    result = subprocess.run(interpreter_command(root, writer), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["granted"]["state"] == "granted"
+    before = (root / ".write.lock").read_bytes()
+    reader = '''
+from tools import hierarchy_workspace as old
+raw = (root / '.write.lock').read_bytes()
+assert json.loads(raw)['identity'] == 'unavailable'
+with w.WorkspaceStore(root) as store:
+    for attempt in range(2):
+        try:
+            with store.lock():
+                raise AssertionError('unknown identity was automatically recovered')
+        except w.WorkspaceRefusal as error:
+            assert error.reason == 'busy' and error.code == 1
+            assert 'inspect an abandoned lock' in error.next_action
+        assert (root / '.write.lock').read_bytes() == raw
+    try:
+        with old.Store(root).lock():
+            raise AssertionError('legacy accepted the abandoned lock')
+    except ValueError as error:
+        assert str(error) == 'workspace store is busy; inspect an abandoned lock before retrying'
+    assert store.load().seq == 4
+    # The trusted owner has inspected the exited writer and performs legacy manual recovery.
+    (root / '.write.lock').unlink()
+    with store.lock():
+        store.append(store.load(), 'set_limits', {'source': 'manual-retry', 'writer_limit': 4})
+    assert store.load().seq == 5
+print('manual recovery succeeded')
+'''
+    result = subprocess.run(interpreter_command(root, reader), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "manual recovery succeeded"
+    assert json.loads(before)["identity"] == "unavailable"
+    assert not (root / ".write.lock").exists()
+
+
+def test_grant_cleanup_warning_belongs_only_to_its_call(tmp_path, monkeypatch):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    owned_os, failures = workspace.os, []
+    def fail_first_release(name, **kw):
+        if name == ".write.lock" and not failures:
+            failures.append(True)
+            raise OSError("password=hunter2")
+        return owned_os.unlink(name, **kw)
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_first_release}))
+    with workspace.WorkspaceStore(root) as store:
+        first_code, first = workspace.grant_next(store, "writer")
+        assert first_code == 0 and first["granted"]["state"] == "granted"
+        validate_warnings(first["warnings"])
+        assert first["warnings"][0]["reason"] == "lock_release"
+        assert "hunter2" not in repr(first)
+        manual_recovery_if_identity_unavailable(root)
+        clean = workspace.grant_next(store, "writer")
+        expected = legacy.grant_next(legacy.Store(root), "writer")
+        assert clean == expected
+        assert clean[0] == 3 and clean[1]["reason"] == "queue_empty"
+        assert "warnings" not in clean[1]
+        assert clean[1].get("next_action") == expected[1].get("next_action")
+        assert first["warnings"][0]["reason"] == "lock_release"
+        assert store.load().seq == 4
+    assert not (root / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("operation", ["append", "publish", "uncommitted"])
+def test_raw_lock_cleanup_warning_does_not_leak_to_later_grant(tmp_path, monkeypatch, operation):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    owned_os, failures = workspace.os, []
+    def fail_first_release(name, **kw):
+        if name == ".write.lock" and not failures:
+            failures.append(True)
+            raise OSError("password=hunter2")
+        return owned_os.unlink(name, **kw)
+    monkeypatch.setattr(workspace, "os", SimpleNamespace(**{**vars(owned_os), "unlink": fail_first_release}))
+    with workspace.WorkspaceStore(root) as store:
+        def call():
+            with store.lock():
+                data = {"source": "call-a", "writer_limit": 4}
+                if operation == "append":
+                    store.append(store.load(), "set_limits", data)
+                elif operation == "publish":
+                    store.publish("00000004.json", workspace.encoded(event(4, "set_limits", data)))
+        if operation == "uncommitted":
+            with pytest.raises(WorkspaceRefusal) as error:
+                call()
+            assert_refusal(error, "io")
+        else:
+            call()
+        manual_recovery_if_identity_unavailable(root)
+        code, result = workspace.grant_next(store, "writer")
+        assert code == 0 and result["granted"]["state"] == "granted"
+        assert "warnings" not in result
+        assert "hunter2" not in repr(result)
+        assert store.load().seq == (4 if operation == "uncommitted" else 5)
+        clean = workspace.grant_next(store, "writer")
+        assert clean == legacy.grant_next(legacy.Store(root), "writer")
+        assert "warnings" not in clean[1]
+    assert not (root / ".write.lock").exists()
+
+
+def test_two_threads_on_one_store_own_their_cleanup_warning(tmp_path, monkeypatch):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                               event(3, "request", _request_data())])
+    owned_os, roles = workspace.os, local()
+    failed_identity = []
+    failed_release, resume = Event(), Event()
+    def fail_one_thread(name, **kw):
+        if name == ".write.lock" and getattr(roles, "name", None) == "failing" and not failed_identity:
+            info = owned_os.stat(name, follow_symlinks=False, **kw)
+            failed_identity.append((info.st_dev, info.st_ino))
+            raise OSError("password=hunter2")
+        return owned_os.unlink(name, **kw)
+    def pause_after_close(fd):
+        info = owned_os.fstat(fd)
+        owned_os.close(fd)
+        if (getattr(roles, "name", None) == "failing" and
+                (info.st_dev, info.st_ino) in failed_identity and not failed_release.is_set()):
+            failed_release.set()
+            assert resume.wait(10)
+    proxy = SimpleNamespace(**{**vars(owned_os), "unlink": fail_one_thread, "close": pause_after_close})
+    monkeypatch.setattr(workspace, "os", proxy)
+    with workspace.WorkspaceStore(root) as store:
+        def grant(role):
+            roles.name = role
+            return workspace.grant_next(store, "writer")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            failing = pool.submit(grant, "failing")
+            try:
+                assert failed_release.wait(10)
+                manual_recovery_if_identity_unavailable(root)
+                clean = pool.submit(grant, "clean").result(timeout=10)
+                assert clean == legacy.grant_next(legacy.Store(root), "writer")
+                assert "warnings" not in clean[1]
+            finally:
+                resume.set()
+            code, result = failing.result(timeout=10)
+        assert code == 0 and result["granted"]["state"] == "granted"
+        validate_warnings(result["warnings"])
+        assert result["warnings"][0]["reason"] == "lock_release"
+        assert "hunter2" not in repr(result)
+        assert store.load().seq == 4
+    assert not (root / ".write.lock").exists()
+
+
+def _declared_initiative():
+    """Caller-owned nested lists. Admission must not keep these objects."""
+    return {"id": "alpha", "project": "project", "repository": "repo", "priority": 1,
+            "target_branch": "main", "touched_paths": ["src/alpha.py"], "blocked_by": ["later"],
+            "checkouts": [Path.cwd().as_posix()], "lanes": ["lane-alpha"]}
+
+
+def _spoil_lists(data, marker):
+    data["lanes"].append(marker)
+    data["touched_paths"].append(marker)
+    data["checkouts"].append(marker)
+    data["blocked_by"].append(marker)
+
+
+def test_direct_apply_owns_register_update_and_release_data():
+    """Register, update and release copy nested caller data before retaining it.
+
+    A typed refusal leaves the live row and the caller's objects untouched. After
+    admission, mutating the caller's containers leaves the same row objects holding
+    the admitted lanes, paths and evidence.
+    """
+    ledger = workspace.Ledger()
+    ledger.apply(event(1, "init", dict(LIMITS)))
+    indexes = _mapping_ids(ledger)
+    declared = _declared_initiative()
+    lanes = declared["lanes"]
+    paths = declared["touched_paths"]
+    bad = _declared_initiative()
+    bad["lanes"] = "not-a-list"
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(2, "register", bad))
+    assert_refusal(error, "invalid_record")
+    assert "not-a-list" not in str(error.value)
+    assert bad["lanes"] == "not-a-list"
+    assert ledger.seq == 1 and ledger.initiatives == {}
+    _same_mappings(ledger, indexes)
+    cyclic = {"id": "alpha"}
+    cyclic["lanes"] = [cyclic]
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.apply_register(ledger, cyclic, event(2, "register", cyclic))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq == 1 and ledger.initiatives == {}
+    assert cyclic["lanes"][0] is cyclic
+
+    registered = event(2, "register", declared)
+    ledger.apply(registered)
+    row = ledger.initiative("alpha")
+    assert ledger.initiative("alpha") is row
+    assert row["lanes"] == ["lane-alpha"] and row["lanes"] is not lanes
+    assert row["touched_paths"] is not paths
+    assert row["checkouts"] is not declared["checkouts"]
+    assert row["blocked_by"] is not declared["blocked_by"]
+    assert declared["lanes"] is lanes
+
+    def spoil_register():
+        _spoil_lists(declared, "from-caller")
+        _spoil_lists(registered["data"], "from-event")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(spoil_register).result(timeout=5)
+    assert ledger.initiative("alpha") is row
+    assert row["lanes"] == ["lane-alpha"]
+    assert row["touched_paths"] == ["src/alpha.py"]
+    assert row["checkouts"] == [Path.cwd().as_posix()]
+    assert row["blocked_by"] == ["later"]
+    _same_mappings(ledger, indexes)
+
+    bad_update = {"initiative": "alpha", "source": "owner", "state": "nope",
+                  "lanes": ["lane-alpha", "lane-beta"]}
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(3, "update", bad_update))
+    assert_refusal(error, "invalid_record")
+    assert "nope" not in str(error.value)
+    assert ledger.seq == 2 and ledger.initiative("alpha") is row
+    assert row["state"] == "active" and row["lanes"] == ["lane-alpha"]
+    update = {"initiative": "alpha", "source": "owner", "priority": 2,
+              "lanes": ["lane-alpha", "lane-beta"],
+              "touched_paths": ["src/alpha.py", "src/beta.py"],
+              "checkouts": [Path.cwd().as_posix()], "blocked_by": []}
+    update_lanes = update["lanes"]
+    updated = event(3, "update", update)
+    ledger.apply(updated)
+    assert ledger.initiative("alpha") is row
+    assert row["priority"] == 2
+    assert row["lanes"] == ["lane-alpha", "lane-beta"] and row["lanes"] is not update_lanes
+    assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+    assert row["touched_paths"] is not update["touched_paths"]
+    assert row["blocked_by"] is not update["blocked_by"]
+    update["lanes"].append("from-caller")
+    updated["data"]["touched_paths"].append("from-event")
+    assert row["lanes"] == ["lane-alpha", "lane-beta"]
+    assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+
+    request_data = {"initiative": "alpha", "request_id": "req-00000004", "kind": "writer", "holder": "one"}
+    ledger.apply(event(4, "request", request_data))
+    request = ledger.request("req-00000004")
+    assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+    assert request["reserved_paths"] is not row["touched_paths"]
+    row["touched_paths"].append("live-only")
+    assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+    ledger.apply(event(5, "grant", {"request_id": request["request_id"]}))
+    assert ledger.request("req-00000004") is request and request["state"] == "granted"
+
+    evidence = _evidence()
+    original_evidence = dict(evidence)
+    bad_release = {"request_id": request["request_id"], "evidence": {**evidence, "sha256": "zz"}}
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(6, "release", bad_release))
+    assert_refusal(error, "invalid_record")
+    assert "zz" not in str(error.value)
+    assert ledger.seq == 5 and ledger.request("req-00000004") is request
+    assert request["state"] == "granted" and "evidence" not in request
+    release = {"request_id": request["request_id"], "evidence": evidence}
+    released = event(6, "release", release)
+    ledger.apply(released)
+    assert ledger.request("req-00000004") is request
+    assert request["state"] == "released"
+    assert request["evidence"] == original_evidence
+    assert request["evidence"] is not evidence
+    assert request["evidence"] is not released["data"]["evidence"]
+    evidence["path"] = evidence["path"] + "/caller"
+    evidence["note"] = "from-caller"
+    released["data"]["evidence"]["sha256"] = "f" * 64
+    assert request["evidence"] == original_evidence
+    assert set(request["evidence"]) == {"path", "sha256"}
+    _same_mappings(ledger, indexes)
+
+
+def _contended_append(store, other, ledger, root, kind, data):
+    """A second writer is refused; the retry then publishes one owned event."""
+    history = _event_bytes(root)
+    seq = ledger.seq
+    with ThreadPoolExecutor(max_workers=1) as pool, other.lock():
+        attempt = pool.submit(store.append, ledger, kind, data)
+        with pytest.raises(WorkspaceRefusal) as error:
+            attempt.result(timeout=5)
+    assert_refusal(error, "busy")
+    assert "secret" not in str(error.value)
+    assert ledger.seq == seq
+    assert _event_bytes(root) == history
+    appended = store.append(ledger, kind, data)
+    assert appended["seq"] == seq + 1
+    assert appended["kind"] == kind
+    assert appended["data"] is not data
+    return appended
+
+
+def test_append_owns_register_update_and_release_data(tmp_path):
+    """Durable register, update and release keep admitted bytes after caller mutation.
+
+    Contention refuses before publication. The retry writes one event. Mutating the
+    original input and the returned event on another thread leaves a fresh replay,
+    the live rows and the published lanes and evidence in agreement.
+    """
+    root = make_store(tmp_path)
+    declared = _declared_initiative()
+    with workspace.WorkspaceStore(root) as store, workspace.WorkspaceStore(root) as other:
+        ledger = store.load()
+        indexes = _mapping_ids(ledger)
+        bad = _declared_initiative()
+        bad["lanes"] = "not-a-list"
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", bad)
+        assert_refusal(error, "invalid_record")
+        assert "not-a-list" not in str(error.value)
+        assert ledger.seq == 1 and ledger.initiatives == {}
+        assert bad["lanes"] == "not-a-list"
+        assert _event_bytes(root) == history
+        cyclic = _declared_initiative()
+        cyclic["blocked_by"].append(cyclic)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", cyclic)
+        assert_refusal(error, "invalid_record")
+        assert ledger.seq == 1 and _event_bytes(root) == history
+
+        appended = _contended_append(store, other, ledger, root, "register", declared)
+        row = ledger.initiative("alpha")
+        saved = (root / "events" / "00000002.json").read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert row["lanes"] is not declared["lanes"]
+        assert row["lanes"] is not appended["data"]["lanes"]
+        assert row["touched_paths"] is not appended["data"]["touched_paths"]
+        assert appended["data"]["lanes"] is not declared["lanes"]
+
+        def spoil_register():
+            _spoil_lists(declared, "from-caller")
+            _spoil_lists(appended["data"], "from-result")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(spoil_register).result(timeout=5)
+        assert (root / "events" / "00000002.json").read_bytes() == saved
+        assert b"from-caller" not in saved and b"from-result" not in saved
+        assert row is ledger.initiative("alpha")
+        assert row["lanes"] == ["lane-alpha"]
+        assert row["touched_paths"] == ["src/alpha.py"]
+        published = json.loads(saved.decode())
+        assert row["lanes"] == published["data"]["lanes"]
+        assert row["checkouts"] == published["data"]["checkouts"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == appended["seq"] == 2
+        assert ledger_state(fresh) == ledger_state(ledger)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", _declared_initiative())
+        assert_refusal(error, "invalid_record")
+        assert ledger.initiative("alpha") is row and ledger.seq == 2
+        _same_mappings(ledger, indexes)
+
+        bad_update = {"initiative": "alpha", "source": "owner", "state": "nope",
+                      "lanes": ["lane-alpha", "lane-beta"]}
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "update", bad_update)
+        assert_refusal(error, "invalid_record")
+        assert "nope" not in str(error.value)
+        assert ledger.seq == 2 and ledger.initiative("alpha") is row
+        assert row["lanes"] == ["lane-alpha"] and _event_bytes(root) == history
+        update = {"initiative": "alpha", "source": "owner", "priority": 2,
+                  "lanes": ["lane-alpha", "lane-beta"],
+                  "touched_paths": ["src/alpha.py", "src/beta.py"],
+                  "checkouts": [Path.cwd().as_posix()], "blocked_by": []}
+        appended = _contended_append(store, other, ledger, root, "update", update)
+        saved = (root / "events" / "00000003.json").read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert row is ledger.initiative("alpha")
+        assert row["lanes"] is not update["lanes"]
+        assert row["lanes"] is not appended["data"]["lanes"]
+        assert row["touched_paths"] is not appended["data"]["touched_paths"]
+        update["lanes"].append("from-caller")
+        appended["data"]["touched_paths"].append("from-result")
+        appended["data"]["lanes"].append("from-result")
+        assert (root / "events" / "00000003.json").read_bytes() == saved
+        assert row["priority"] == 2
+        assert row["lanes"] == ["lane-alpha", "lane-beta"]
+        assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+        assert json.loads(saved.decode())["data"]["lanes"] == row["lanes"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == 3
+        assert ledger_state(fresh) == ledger_state(ledger)
+        assert fresh.initiative("alpha")["lanes"] == row["lanes"]
+
+        request_data = {"initiative": "alpha", "request_id": "req-00000004", "kind": "writer", "holder": "one"}
+        store.append(ledger, "request", request_data)
+        request = ledger.request("req-00000004")
+        assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+        assert request["reserved_paths"] is not row["touched_paths"]
+        store.append(ledger, "grant", {"request_id": request["request_id"]})
+        assert ledger.request("req-00000004") is request and request["state"] == "granted"
+        evidence = _evidence()
+        original_evidence = dict(evidence)
+        bad_release = {"request_id": request["request_id"], "evidence": {**evidence, "sha256": "zz"}}
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "release", bad_release)
+        assert_refusal(error, "invalid_record")
+        assert "zz" not in str(error.value)
+        assert ledger.request("req-00000004") is request
+        assert request["state"] == "granted" and "evidence" not in request
+        assert _event_bytes(root) == history
+        release = {"request_id": request["request_id"], "evidence": evidence}
+        appended = _contended_append(store, other, ledger, root, "release", release)
+        saved = (root / "events" / ("%08d.json" % appended["seq"])).read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert ledger.request("req-00000004") is request
+        assert request["evidence"] == original_evidence
+        assert request["evidence"] is not evidence
+        assert request["evidence"] is not appended["data"]["evidence"]
+        assert appended["data"]["evidence"] is not evidence
+
+        def spoil_release():
+            evidence["path"] = evidence["path"] + "/caller"
+            evidence["note"] = "from-caller"
+            appended["data"]["evidence"]["sha256"] = "f" * 64
+            appended["data"]["evidence"]["note"] = "from-result"
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(spoil_release).result(timeout=5)
+        assert (root / "events" / ("%08d.json" % appended["seq"])).read_bytes() == saved
+        assert b"from-caller" not in saved and b"from-result" not in saved
+        assert request["evidence"] == original_evidence
+        assert json.loads(saved.decode())["data"]["evidence"] == request["evidence"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == appended["seq"]
+        assert ledger_state(fresh) == ledger_state(ledger)
+        assert fresh.request("req-00000004")["evidence"] == original_evidence
+        assert fresh.initiative("alpha")["lanes"] == ["lane-alpha", "lane-beta"]
+        _same_mappings(ledger, indexes)

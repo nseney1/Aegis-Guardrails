@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from tests import helpers_adjudication as ha
-from tests.helpers_rule import make_cell, write_evidence
+from tests.helpers_rule import make_rule, write_evidence
 
 from aegis_core.fitness import MIN_N
 from aegis_core.lifecycle.promotion import evaluate_demotions, evaluate_promotions
@@ -27,13 +27,13 @@ def _ws(tmp_path):
 
 
 def _trap(tmp_path, name, tp=0, fp=0, triggers=None, age=45):
-    make_cell(str(tmp_path / ".aegis" / "rules"), name, cell_type="trap", created_days_ago=age)
+    make_rule(str(tmp_path / ".aegis" / "rules"), name, rule_type="trap", created_days_ago=age)
     if tp or fp or triggers:
         write_evidence(tmp_path, name, triggers=triggers or tp + fp, tp=tp, fp=fp)
 
 
 def _invariant(tmp_path, name, tp=0, fp=0, age=45):
-    make_cell(str(tmp_path / ".aegis" / "rules"), name, cell_type="invariant", created_days_ago=age)
+    make_rule(str(tmp_path / ".aegis" / "rules"), name, rule_type="invariant", created_days_ago=age)
     if tp or fp:
         write_evidence(tmp_path, name, triggers=tp + fp, tp=tp, fp=fp)
 
@@ -42,9 +42,9 @@ def _ids(candidates):
     return [c["rule_id"] for c in candidates]
 
 
-def _labelled(tmp_path, name, tp=0, fp=0, age=45, cell_type="trap"):
+def _labelled(tmp_path, name, tp=0, fp=0, age=45, rule_type="trap"):
     """A rule and its labels in the working tree; ha.merge_to_base makes them the reviewed BASE."""
-    make_cell(str(tmp_path / ".aegis" / "rules"), name, cell_type=cell_type, created_days_ago=age)
+    make_rule(str(tmp_path / ".aegis" / "rules"), name, rule_type=rule_type, created_days_ago=age)
     ha.write_labels(tmp_path, name, ha.labels(name, "tp", tp) + ha.labels(name, "fp", fp))
 
 
@@ -61,7 +61,7 @@ class TestPromotion:
         assert candidate["tp"] == MIN_N and candidate["fitness"] > 0.85
 
     def test_an_invariant_promotes_to_gate(self, tmp_path):
-        _labelled(_ws(tmp_path), "inv", tp=30, cell_type="invariant")
+        _labelled(_ws(tmp_path), "inv", tp=30, rule_type="invariant")
         ha.merge_to_base(tmp_path)
         assert [(c["from_type"], c["to_type"]) for c in evaluate_promotions(tmp_path)] == [("invariant", "gate")]
 

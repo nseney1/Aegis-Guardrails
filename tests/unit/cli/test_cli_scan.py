@@ -7,14 +7,364 @@ workspaces; nothing in the JIT engine is patched.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import aegis_core.config as core_config
+import aegis_core.scan as core_scan
 from aegis_cli.cli import _build_parser, main
+from aegis_core.workspace.layout import UserLayout
+from tests.conftest import symlink_or_skip
+
+
+_ROWLESS_REPAIR = ("Run `aegis status` to list unloadable and ignored files; once the rules load, "
+                   "fix field types or shorten fields and run `aegis rule lint <path>`, then retry `aegis scan`.")
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("first_reason", ["invalid_field", "limit"])
+def test_mixed_projection_refusal_prints_each_represented_repair_once(ws, capsys, first_reason, json_mode):
+    original = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    source = original.read_text(encoding="utf-8")
+    second_reason = "limit" if first_reason == "invalid_field" else "invalid_field"
+    values = {"invalid_field": 3, "limit": ["x"] * 257}
+    for name, reason in zip(("a-first", "b-repeat", "c-other"), (first_reason, first_reason, second_reason)):
+        path = original.with_name(name + ".md")
+        path.write_text(source.replace("id: trap-src-python", "id: " + name).replace(
+            "hypothesis: Source modules must not read the clock directly", "hypothesis: " + json.dumps(values[reason])),
+            encoding="utf-8")
+    payload = core_scan.scan(ws, ["src/app.py"])
+    assert payload["error"] == "guidance_projection_" + first_reason
+    assert [row["error"] for row in payload["rule_errors"]] == [
+        "hypothesis: " + reason for reason in (first_reason, first_reason, second_reason)]
+    repairs = {
+        "invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
+        "limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
+    }
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in payload["rule_errors"])
+            assert captured.err == ("Error: " + payload["error"] + "\n" + rows
+                                    + repairs[first_reason] + "\n" + repairs[second_reason] + "\n")
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("error,repair", [
+    ("guidance_projection_invalid_field", _ROWLESS_REPAIR),
+    ("guidance_projection_limit", _ROWLESS_REPAIR),
+    ("guidance_projection_budget", "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`."),
+    ("the rules directory cannot be read safely: unsafe entry",
+     "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."),
+    ("the user rules directory cannot be read safely: unsafe entry",
+     "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."),
+    ("the reviewed (base) version of the rules cannot be read, so none is served: missing object",
+     "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`."),
+    ("unknown refusal", "Run `aegis status` to diagnose the refusal, then retry `aegis scan`."),
+])
+@pytest.mark.parametrize("empty_rows", [False, True], ids=["no_rows", "empty_rows"])
+def test_every_rowless_scan_refusal_prints_fixed_repair(ws, monkeypatch, capsys,
+                                                       error, repair, json_mode, empty_rows):
+    payload = {"status": "FAIL", "error": error}
+    if empty_rows:
+        payload["rule_errors"] = []
+    before = json.dumps(payload)
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + error + "\n" + repair + "\n"
+        assert json.dumps(payload) == before
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+def _rowless_failure_files(ws, kind):
+    rules = ws / ".aegis" / "rules"
+    if kind == "load_cap":
+        for index in range(682):
+            (rules / "traps" / f"b{index}.md").write_text("---\nid: [x\n---\n", encoding="utf-8")
+    else:
+        (rules / "bad\x1bname.md").write_text("Notes without frontmatter.\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind,code", [
+    ("load_cap", "guidance_projection_limit"),
+    pytest.param("ignored_control_name", "guidance_projection_invalid_field",
+                 marks=pytest.mark.skipif(os.name == "nt", reason="Windows filename controls")),
+])
+def test_real_rowless_producers_print_unattributed_status_repair(ws, capsys, kind, code, json_mode):
+    _rowless_failure_files(ws, kind)
+    expected = {"status": "FAIL", "error": code}
+    assert core_scan.scan(ws, ["src/app.py"]) == expected
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert captured.out == json.dumps(expected, indent=2) + "\n"
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + code + "\n" + _ROWLESS_REPAIR + "\n"
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("primary,reason,repair", [
+    ("invalid_field", "hypothesis: limit",
+     "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+    ("limit", "prediction: invalid_field", "Fix the field type and run `aegis rule lint <path>`."),
+    ("invalid_field", "unknown: limit", _ROWLESS_REPAIR),
+])
+def test_projection_repair_requires_confirmation_from_an_allowlisted_row(ws, monkeypatch, capsys,
+                                                                        primary, reason, repair, json_mode):
+    payload = {"status": "FAIL", "error": "guidance_projection_" + primary,
+               "rule_errors": [{"path": ".aegis/rules/traps/example.md", "error": reason}]}
+    before = json.dumps(payload)
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert captured.out == json.dumps(payload, indent=2) + "\n"
+        else:
+            assert captured.out == ""
+            assert captured.err == ("Error: " + payload["error"] + "\n"
+                                    "Error: .aegis/rules/traps/example.md: " + reason + "\n" + repair + "\n")
+        assert json.dumps(payload) == before
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind", ["inventory", "base", "load", "budget"])
+def test_real_scan_failures_keep_their_envelope_and_gain_repair(ws, monkeypatch, capsys, kind, json_mode):
+    if kind in {"inventory", "base"}:
+        message = "unavailable ghp_" + "S" * 36
+        error = (core_scan.RuleInventoryError("read", str(ws / ".aegis" / "rules"), message)
+                 if kind == "inventory" else core_scan.rule_integrity.IntegrityError(message))
+
+        def refuse(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(core_scan, "rule_integrity", SimpleNamespace(
+            effective=refuse, IntegrityError=core_scan.rule_integrity.IntegrityError))
+    elif kind == "load":
+        (ws / ".aegis" / "rules" / "traps" / "broken.md").write_text("---\nid: [x\n---\n", encoding="utf-8")
+    else:
+        monkeypatch.setattr(core_config, "env_max_jit_tokens", lambda: 1)
+    payload = core_scan.scan(ws, ["src/app.py"])
+    assert payload["status"] == "FAIL"
+    repair = {
+        "inventory": "Remove unsafe links and restore read access to the rules directory, then run `aegis status`.",
+        "base": "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`.",
+        "load": "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.",
+        "budget": "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`.",
+    }[kind]
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        assert "S" * 36 not in captured.out + captured.err
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + payload["error"] + "\n" + repair + "\n"
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("kind", ["load", "field", "budget", "mixed_field", "mixed_limit", "load_cap",
+                                  pytest.param("ignored_control_name", marks=pytest.mark.skipif(
+                                      os.name == "nt", reason="Windows filename controls"))])
+def test_concurrent_scan_refusals_print_the_same_repair_without_recording(ws, kind):
+    from concurrent.futures import ThreadPoolExecutor
+    import subprocess
+    import sys
+
+    path = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    if kind in {"load_cap", "ignored_control_name"}:
+        _rowless_failure_files(ws, kind)
+    elif kind == "load":
+        path.write_text("---\nid: [x\n---\n", encoding="utf-8")
+    elif kind == "field":
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "hypothesis: Source modules must not read the clock directly", "hypothesis: 3"), encoding="utf-8")
+    elif kind.startswith("mixed_"):
+        source = path.read_text(encoding="utf-8")
+        values = (3, ["x"] * 257) if kind == "mixed_field" else (["x"] * 257, 3)
+        for name, value in zip(("a-first", "b-other"), values):
+            path.with_name(name + ".md").write_text(source.replace("id: trap-src-python", "id: " + name).replace(
+                "hypothesis: Source modules must not read the clock directly", "hypothesis: " + json.dumps(value)),
+                encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[3]))
+    if kind == "budget":
+        env["AEGIS_MAX_JIT_TOKENS"] = "1"
+    repair = {
+        "load": "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.",
+        "field": "Fix the field type and run `aegis rule lint <path>`.",
+        "budget": "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`.",
+        "load_cap": _ROWLESS_REPAIR,
+        "ignored_control_name": _ROWLESS_REPAIR,
+        "mixed_field": ("Fix the field type and run `aegis rule lint <path>`.\n"
+                        "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+        "mixed_limit": ("Shorten the instruction or slot expansion and run `aegis rule lint <path>`.\n"
+                        "Fix the field type and run `aegis rule lint <path>`."),
+    }[kind]
+
+    def invoke(_):
+        result = subprocess.run([sys.executable, "-m", "aegis_cli", "scan", "src/app.py"],
+                                cwd=ws, env=env, capture_output=True, text=True, timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(invoke, range(3)))
+    assert results == [results[0]] * 3
+    code, out, err = results[0]
+    assert code == 1 and out == ""
+    assert err.endswith("\n" + repair + "\n")
+    assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("command", ["scan", "status"])
+@pytest.mark.parametrize("text", ["ordinary failure", "bad\x1btext\nretry"], ids=["plain", "controls"])
+def test_failure_envelope_golden_bytes(ws, monkeypatch, capsys, record_property, command, text):
+    def refuse(args):
+        raise OSError(text)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    monkeypatch.setattr("aegis_cli.status.run_status", refuse)
+    for attempt in range(2):
+        assert main([command] + (["src/app.py"] if command == "scan" else [])) == 1
+        captured = capsys.readouterr()
+        expected = "bad text retry" if command == "scan" and text != "ordinary failure" else text
+        assert captured.out == ""
+        assert captured.err.encode("utf-8") == ("Error: " + expected + "\n").encode("utf-8")
+        record_property("stdout_hex_" + str(attempt), captured.out.encode("utf-8").hex())
+        record_property("stderr_hex_" + str(attempt), captured.err.encode("utf-8").hex())
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("secret_path", [False, True], ids=["plain", "redacted"])
+def test_long_refusal_path_never_clips_the_field_or_reason(ws, monkeypatch, capsys, json_mode, secret_path):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    secret = "ghp_" + "S" * 36
+    name = "a" * 970 + "-" + secret if secret_path else "a" * 1010
+    original = load_rules(ws).served[0]
+    rule = replace(original, id=name, path=".aegis/rules/traps/" + name + ".md",
+                   meta=dict(original.meta, enforcement="gate", hypothesis=3))
+    assert rule.mandatory
+    payload = select_guidance(RuleSet((rule,)), ["src/app.py"], 3, 2000, [],
+                              lambda served: {item.id: compute({}) for item in served})
+    assert payload["rule_errors"][0]["error"] == "hypothesis: invalid_field"
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    if json_mode:
+        assert captured.err == ""
+        assert json.loads(captured.out) == payload
+    else:
+        assert captured.out == ""
+        code, location, repair = captured.err.splitlines()
+        assert code == "Error: guidance_projection_invalid_field"
+        assert location.startswith("Error: .aegis/rules/traps/")
+        assert location.endswith("...: hypothesis: invalid_field")
+        assert len(location) <= len("Error: ") + 1024
+        assert repair == "Fix the field type and run `aegis rule lint <path>`."
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", ["number", "boolean", "mapping", "mixed_list", "prediction", "source",
+                                  "expanded", "two", "minimal", "secret_path", pytest.param(
+                                      "control_path", marks=pytest.mark.skipif(
+                                          os.name == "nt", reason="Windows filename controls"))])
+def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, capsys, json_mode, case):
+    from aegis_core.packs import MAX_RULE_BYTES
+    from aegis_core.scan import scan
+    from aegis_core.skills.slots import SlotRegistry
+    if case == "minimal":
+        monkeypatch.setattr(core_config, "env_max_jit_tokens", lambda: 1)
+    home = ws.parent / "home"
+    config = home / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    slots = {"MODEL_FAST": "m" * 80}
+    if case == "expanded":
+        slots["X"] = "m" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    monkeypatch.setattr(UserLayout, "current", classmethod(lambda cls: UserLayout(home)))
+    path = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    secret = "ghp_" + "S" * 36
+    field, reason = "hypothesis", "invalid_field"
+    if case in {"source", "expanded"}:
+        body = "x" * (1024 * 1024 + 1) if case == "source" else "${X}" * 13108
+        path.write_text(path.read_text(encoding="utf-8") + body, encoding="utf-8")
+        assert (path.stat().st_size > MAX_RULE_BYTES) == (case == "source")
+        field, reason = "detail", "limit"
+    else:
+        if case == "prediction":
+            second = path.with_name("second.md")
+            second.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: second"), encoding="utf-8")
+            path = second
+            field = "prediction"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        values = {"number": 3, "boolean": False, "mapping": {"unsafe": secret}, "mixed_list": [secret, 3]}
+        path.write_text("\n".join(field + ": " + json.dumps(values.get(case, {"unsafe": secret}))
+                                  if line.startswith(field + ":") else line for line in lines) + "\n", encoding="utf-8")
+    if case == "two":
+        second = path.with_name("second.md")
+        second.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: second"), encoding="utf-8")
+    if case in {"secret_path", "control_path"}:
+        new_id = secret if case == "secret_path" else "bad\x1bname"
+        path.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: " + json.dumps(new_id)),
+                        encoding="utf-8")
+        path = path.rename(path.with_name(new_id + ".md"))
+    expected = scan(ws, ["src/app.py"], registry=SlotRegistry(slots))
+    assert expected["rule_errors"]
+    if case == "source":
+        assert expected["rule_errors"] == [{
+            "path": path.relative_to(ws).as_posix(),
+            "error": f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)",
+        }]
+    assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert "\x1b" not in captured.out + captured.err
+    if json_mode:
+        assert captured.err == ""
+        assert json.loads(captured.out) == expected
+    elif case == "source":
+        assert captured.out == ""
+        assert captured.err == ("Error: " + expected["error"] + "\n"
+                                "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.\n")
+    else:
+        assert captured.out == ""
+        rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in expected["rule_errors"])
+        repair = ("Fix the field type and run `aegis rule lint <path>`." if reason == "invalid_field" else
+                  "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.")
+        assert captured.err == "Error: guidance_projection_" + reason + "\n" + rows + repair + "\n"
+        assert field + ": " + reason in captured.err
 
 
 def _workspace(root: Path) -> Path:
@@ -249,7 +599,8 @@ def test_text_scan_prints_no_terminal_control_sequences_from_rule_files(slot_ws,
     out = capsys.readouterr().out
     assert rc == 0
     assert "\x1b" not in out and "\x07" not in out
-    assert "Still shown." in out and "\n" in out.strip()  # lines are kept
+    assert "   Detail: guidance withheld: control characters\n" in out
+    assert "Still shown." not in out and "\n" in out.strip()  # other lines are kept
 
 
 # Windows refuses control characters in file names; elsewhere a cloned repository can ship them.
@@ -265,13 +616,14 @@ def test_a_failed_scan_prints_no_terminal_control_sequences_from_rule_file_names
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\x07" not in err
     assert err.startswith("Error: 1 rule file(s) cannot be served") and err.endswith("\n")
-    assert "trap-bad" in err and "malformed YAML frontmatter" in err
+    assert "trap-bad" not in err and "malformed YAML frontmatter" in err
+    assert "guidance_projection_invalid_field" in err
 
-    # JSON keeps the name as it is on disk; json.dumps escapes it.
+    # JSON carries the same projected display name as text output.
     assert main(["scan", "src/app.py", "--json"]) == 1
     out = capsys.readouterr().out
     assert "\x1b" not in out
-    assert [e["path"] for e in json.loads(out)["rule_errors"]] == [f".aegis/rules/traps/trap-bad{_HOSTILE}.md"]
+    assert [e["path"] for e in json.loads(out)["rule_errors"]] == ["guidance_projection_invalid_field"]
 
 
 @posix_names
@@ -283,4 +635,757 @@ def test_a_workspace_error_prints_no_terminal_control_sequences_from_the_directo
     assert main(["scan", "app.py"]) == 2
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\x07" not in err
-    assert "not an Aegis workspace" in err and "clone" in err
+    assert err == ("Error: not an Aegis workspace (no .aegis/ in "
+                   "guidance withheld: control characters); run aegis init\n")
+    assert "clone" not in err
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", ["missing", "unreadable", "symlink", "controls", pytest.param(
+    "long", marks=pytest.mark.skipif(os.name == "nt", reason="the long paths exceed MAX_PATH"))])
+def test_dispatcher_workspace_refusals_project_paths(tmp_path, monkeypatch, capsys, case, json_mode):
+    from aegis_core.workspace import binding
+
+    secret = "ghp_" + "S" * 30
+    pin = tmp_path / (secret + ("\x1b[31m" if case == "controls" else ""))
+    if case == "long":
+        pin = tmp_path.joinpath(*(["x" * 100] * 16), secret)
+    elif case == "symlink":
+        link = tmp_path / ("link-" + secret)
+        symlink_or_skip(pin, link, target_is_directory=True)
+        pin = link
+    elif case == "unreadable":
+        pin.mkdir()
+        resolve = binding._resolve
+
+        def denied(path):
+            if str(path) == str(pin):
+                raise PermissionError("access denied: " + str(pin))
+            return resolve(path)
+
+        monkeypatch.setattr("aegis_core.workspace.binding._resolve", denied)
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: str(pin))
+    argv = ["scan", "app.py"] + (["--json"] if json_mode else [])
+    # A refusal is repeatable and never falls back to another workspace on retry.
+    for _ in range(2):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert secret not in captured.err and "\x1b" not in captured.err
+        assert captured.err.startswith("Error: AEGIS_WORKSPACE ")
+        assert len(captured.err.rstrip("\n")) <= len("Error: ") + 1024
+        if case == "controls":
+            assert "guidance_projection_invalid_field" in captured.err
+            assert "which is not a directory" in captured.err
+        elif case == "long":
+            assert captured.err.rstrip().endswith(", which is not a directory")
+            assert "... [display-only]" in captured.err
+        else:
+            assert "REDACTED" in captured.err
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("name", ["ghp_" + "H" * 30, "bad\nname", "bad\x1bname", "x" * 5000],
+                         ids=["token", "newline", "controls", "long"])
+def test_dispatcher_hold_projects_every_binding_field(tmp_path, monkeypatch, capsys, name, json_mode):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    path = str(tmp_path / name)
+    details = {key: path for key in ("pin", "target", "cwd", "cwd_root", "host_root", "registered_root")}
+    details.update(host_roots=[path], candidates=[path])
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
+                               message=f"--workspace {path} disagrees with the pin", details=tuple(details.items()))
+    before = binding.as_dict()
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        shown = captured.out if json_mode else captured.err
+        assert name not in shown and "\x1b" not in shown
+        if json_mode:
+            payload = json.loads(shown)
+            assert payload["reason"] == "pin_conflicts_with_target"
+            assert payload["status"] == "hold"
+            assert payload["message"].startswith("--workspace ")
+            for value in payload["details"].values():
+                assert all(len(item) <= 1024 for item in (value if isinstance(value, list) else [value]))
+        else:
+            assert shown.startswith("Hold (pin_conflicts_with_target): --workspace ")
+            assert len(shown.rstrip("\n")) <= len("Hold (pin_conflicts_with_target): ") + 1024
+    assert binding.as_dict() == before
+
+
+def test_workspace_os_error_is_a_fixed_refusal_with_documented_exit(monkeypatch, capsys):
+    def refuse(args):
+        raise PermissionError("denied ghp_" + "E" * 30)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"]) == 2
+    assert capsys.readouterr().err == "Error: workspace binding refused\n"
+
+
+def test_dispatcher_refuses_oversized_error_text(monkeypatch, capsys):
+    from aegis_core.errors import WorkspaceNotFoundError
+
+    def refuse(args):
+        raise WorkspaceNotFoundError("x" * (1024 * 1024 + 1))
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"]) == 2
+    assert capsys.readouterr().err == "Error: guidance_projection_limit\n"
+
+
+@posix_names
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_real_hold_refuses_supplied_newline_before_message_composition(ws, monkeypatch, capsys, json_mode):
+    pin = _workspace(ws / "pinned")
+    _workspace(ws / "bad\nINFO: approved")
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: str(pin))
+    argv = ["scan", "--workspace", "./bad\nINFO: approved", "src/app.py"] + (["--json"] if json_mode else [])
+    for _ in range(2):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert payload["reason"] == "pin_conflicts_with_target"
+            assert payload["details"]["target"] == "guidance_projection_invalid_field"
+            message = payload["message"]
+        else:
+            assert captured.out == ""
+            message = captured.err.rstrip("\n")
+            assert message.startswith("Hold (pin_conflicts_with_target): --workspace ")
+        assert "\n" not in message and "INFO: approved" not in message
+        assert "guidance_projection_invalid_field resolves to guidance_projection_invalid_field" in message
+
+
+@posix_names
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("spelling", ["relative", "symlink"])
+def test_real_upgrade_error_projects_resolved_identity_before_composition(ws, monkeypatch, capsys,
+                                                                        spelling, json_mode):
+    root = _workspace(ws / "retired\nINFO: approved")
+    (root / "aegis.conf").write_text("retired", encoding="utf-8")
+    raw = "./" + root.name
+    if spelling == "symlink":
+        symlink_or_skip(root, ws / "alias", target_is_directory=True)
+        raw = "./alias"
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None)
+    argv = ["scan", "--workspace", raw, "src/app.py"] + (["--json"] if json_mode else [])
+    for _ in range(2):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""  # workspace-error JSON behavior is unchanged
+        assert captured.err.startswith("Error: Unsupported v3 state at guidance_projection_invalid_field: aegis.conf.")
+        assert captured.err.count("\n") == 1
+        assert "INFO: approved" not in captured.err
+
+
+def test_dispatcher_exception_normalizes_newlines_before_adding_product_prefix(ws, monkeypatch, capsys):
+    def refuse(args):
+        raise OSError("bad\nINFO: approved")
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    assert capsys.readouterr().err == "Error: bad INFO: approved\n"
+
+
+@pytest.mark.parametrize("entry", ["workspace", "pin"])
+def test_oversized_workspace_input_is_refused_before_resolution_or_dispatch(monkeypatch, capsys, entry):
+    huge = "x" * (1024 * 1024 + 1)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("oversized input reached resolution or dispatch")
+
+    monkeypatch.setattr("aegis_core.workspace.binding.resolve_cli_root", unexpected)
+    monkeypatch.setattr("aegis_cli.scan.run_scan", unexpected)
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: huge if entry == "pin" else None)
+    argv = ["scan", "app.py"] + (["--workspace", huge] if entry == "workspace" else [])
+    rc = main(argv)
+    assert rc == 2
+    assert capsys.readouterr().err == "Error: guidance_projection_limit\n"
+
+
+@pytest.mark.parametrize("denied", ["home", "root"])
+def test_denied_workspace_alias_keeps_canonical_product_wording(ws, monkeypatch, capsys, denied):
+    target = Path.home().resolve() if denied == "home" else Path(ws.anchor)
+    symlink_or_skip(target, ws / "denied-alias", target_is_directory=True)
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None)
+    assert main(["scan", "--workspace", "./denied-alias", "app.py"]) == 2
+    captured = capsys.readouterr()
+    expected = (f"not an Aegis workspace ({target} is the home directory; ~/.aegis is the user rule layer); "
+                "run aegis init in a project" if denied == "home" else
+                f"not an Aegis workspace ({target} is the filesystem root); run aegis init in a project")
+    assert captured.err == "Error: " + expected + "\n"
+
+
+@pytest.mark.parametrize("text,shown", [
+    ("denied\n## Evidence\nmore", "denied ## Evidence more"),
+    ("denied\n  ## Evidence\nmore", "denied ## Evidence more"),
+    ("denied\x1b\nmore", "denied more"),
+    ("denied\n## Evidence\n" + "x" * (1024 * 1024), "guidance_projection_limit"),
+], ids=["evidence", "indented_evidence", "controls", "oversized_evidence"])
+def test_exception_diagnostics_preserve_text_without_markdown_cuts(ws, monkeypatch, capsys, text, shown):
+    def refuse(args):
+        raise OSError(text)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    assert capsys.readouterr().err == "Error: " + shown + "\n"
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_missing_workspace_evidence_name_is_a_diagnostic_not_guidance(ws, capsys, json_mode):
+    assert main(["scan", "--workspace", "## Evidence", "app.py"] + (["--json"] if json_mode else [])) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Error: workspace path does not exist: ")
+    assert captured.err.endswith("## Evidence\n") and captured.err.count("\n") == 1
+
+
+@pytest.mark.parametrize("value", ["ghp_" + "P" * 30, "bad\x1b\nflag", "x" * 5000,
+                                   "x" * (1024 * 1024 + 1)], ids=["token", "controls", "long", "oversized"])
+@pytest.mark.parametrize("entry", ["main", "leading_separator", "json_separator", "direct_parser"])
+def test_scan_parser_errors_use_single_line_bounded_diagnostics(ws, capsys, value, entry):
+    argv = ["scan", "app.py", "--" + value]
+    if entry == "leading_separator":
+        argv.insert(0, "--")
+    elif entry == "json_separator":
+        argv[:0] = ["--json", "--"]
+    parse = _build_parser().parse_args if entry == "direct_parser" else main
+    with pytest.raises(SystemExit) as error:
+        parse(argv)
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert value not in captured.err and "\x1b" not in captured.err
+    assert len(captured.err.splitlines()[-1]) <= len("aegis: error: ") + 1024
+    if len(value) > 1024 * 1024:
+        last = captured.err.splitlines()[-1]
+        assert last.endswith("guidance_projection_limit") or (
+            entry in {"leading_separator", "json_separator"} and "argument command: invalid choice: '--'" in last)
+
+
+@pytest.mark.parametrize("entry", ["parse_args", "parse_known_args", "main"])
+def test_scan_parser_projection_resets_between_invocations(ws, capsys, entry):
+    parser = _build_parser()
+    parse = {"main": main, "parse_args": parser.parse_args,
+             "parse_known_args": parser.parse_known_args}[entry]
+    token = "S" * 30
+    explicit = "Bearer\t" + token
+    for _ in range(2):
+        for command in (["scan", "app.py"], ["status"]):
+            with pytest.raises(SystemExit) as error:
+                parse(command + ["--json=" + explicit])
+            assert error.value.code == 2
+            diagnostic = capsys.readouterr().err
+            shown = "Bearer REDACTED" if command[0] == "scan" else "Bearer\\t" + token
+            assert diagnostic.endswith("ignored explicit argument '" + shown + "'\n")
+        # Root errors precede subparser entry. Scan's explicit --version refusal
+        # must be protected without changing a status invocation or leaking scope.
+        for command in ("scan", "status"):
+            with pytest.raises(SystemExit) as error:
+                parse(["--version=" + explicit, command, "app.py"])
+            assert error.value.code == 2
+            diagnostic = capsys.readouterr().err
+            shown = "Bearer REDACTED" if command == "scan" else "Bearer\\t" + token
+            assert diagnostic.endswith("ignored explicit argument '" + shown + "'\n")
+        if entry != "main":
+            result = parse(["scan", "app.py"])
+            namespace = result[0] if entry == "parse_known_args" else result
+            assert namespace.command == "scan"
+
+
+def test_explicit_tilde_workspace_reaches_the_existing_home_refusal(ws, monkeypatch, capsys):
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None)
+    assert main(["scan", "--workspace", "~", "app.py"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Error: not an Aegis workspace (")
+    assert captured.err.endswith(" is the home directory; ~/.aegis is the user rule layer); run aegis init in a project\n")
+
+
+@pytest.mark.parametrize("flag", ["--json", "--plain", "--help", "-h", "--version"])
+@pytest.mark.parametrize("separator", ["\t", "\ud800", "\udc80", "\udfff", "\ue000", "\uffff", "\U0010ffff", "\u0378"],
+                         ids=["tab", "high_surrogate", "filesystem_surrogate", "low_surrogate",
+                              "private_use", "noncharacter_bmp", "noncharacter_plane", "unassigned"])
+@pytest.mark.parametrize("scheme", ["bearer", "github"])
+def test_rejected_explicit_flag_value_projects_repr_escaped_token(ws, capsys, flag, separator, scheme):
+    token = "S" * 30
+    value = ("Bearer" + separator if scheme == "bearer" else separator + "ghp_") + token
+    argument = flag + "=" + value
+    argv = [argument, "scan", "app.py"] if flag == "--version" else ["scan", "app.py", argument]
+    for _ in range(2):
+        with pytest.raises(SystemExit) as error:
+            main(argv)
+        assert error.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == "" and token not in captured.err
+        shown = "Bearer REDACTED" if scheme == "bearer" else " ghp_REDACTED"
+        assert captured.err.splitlines()[-1].endswith("ignored explicit argument '" + shown + "'")
+
+
+@pytest.mark.parametrize("separator", ["\t", "\udc80", "\ue000", "\uffff", "\U0010ffff", "\u0378"],
+                         ids=["tab", "filesystem_surrogate", "private_use", "noncharacter_bmp",
+                              "noncharacter_plane", "unassigned"])
+@pytest.mark.parametrize("scheme", ["bearer", "github"])
+def test_filename_exception_projects_repr_escaped_token(ws, monkeypatch, capsys, separator, scheme):
+    filename = ("Bearer" + separator if scheme == "bearer" else separator + "ghp_") + "E" * 30
+
+    def refuse(args):
+        raise OSError(13, "workspace denied", filename)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"]) == 1
+        shown = "Bearer REDACTED" if scheme == "bearer" else " ghp_REDACTED"
+        assert capsys.readouterr().err == "Error: [Errno 13] workspace denied: '" + shown + "'\n"
+
+
+@pytest.mark.parametrize("escape", [
+    r"\t", r"\n", r"\r", r"\v", r"\f", r"\x00", r"\x09", r"\x0a", r"\x0D", r"\x1f",
+    r"\x20", r"\x7f", r"\x85", r"\x9F", r"\u0009", r"\u001b", r"\u0085", r"\u00a0",
+    r"\u200b", r"\u2028", r"\u2029", r"\u2060", r"\u3000", r"\U00000009", r"\U00002028",
+    r"\U000e0001", r"\ud800", r"\udc80", r"\uDFFF", r"\U0000DC80",
+    r"\N{CHARACTER TABULATION}", r"\N{LINE FEED}", r"\N{NEXT LINE}",
+    r"\N{ZERO WIDTH SPACE}", r"\N{LINE SEPARATOR}", r"\N{PARAGRAPH SEPARATOR}", r"\N{TAB}",
+    "\\" * 2 + "t", "\\" * 4 + "u200b",
+], ids=lambda value: value.encode("unicode_escape").decode("ascii"))
+def test_exception_diagnostics_canonicalize_escaped_separators(ws, monkeypatch, capsys, escape):
+    def refuse(args):
+        raise OSError("Bearer" + escape + "S" * 30)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    shown = "Bearer" + escape + "S" * 30 if escape in ("\\" * 2 + "t", "\\" * 4 + "u200b") else "Bearer REDACTED"
+    assert capsys.readouterr().err == "Error: " + shown + "\n"
+
+
+@pytest.mark.parametrize("text", [
+    r"ordinary path C:\src\code.py", r"literal \x41 \u0041 \U00000041 \N{LATIN CAPITAL LETTER A}",
+    r"invalid \x0 \u000 \U00110000",
+    r"named sequence \N{KEYCAP NUMBER SIGN}", "trailing\\", r"quotes \' \" and \\path",
+    "café 中文", r"printable \u00e9 \u4e2d",
+])
+def test_exception_diagnostics_preserve_other_literal_escapes(ws, monkeypatch, capsys, text):
+    def refuse(args):
+        raise OSError(text)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    assert capsys.readouterr().err == "Error: " + text + "\n"
+
+
+@pytest.mark.parametrize("tail", ["\\" * 200000 + "q", r"\N{" * 20000, "\\N{" + "unknown" * 30000 + "}"],
+                         ids=["slashes", "open_names", "long_name"])
+def test_escaped_diagnostics_bound_adversarial_scan(ws, monkeypatch, capsys, tail):
+    def refuse(args):
+        raise OSError("Bearer\\t" + "S" * 30 + " " + tail)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    shown = capsys.readouterr().err
+    if "\\N{" in tail:
+        assert shown == "Error: guidance_projection_invalid_field\n"
+    else:
+        assert shown.startswith("Error: Bearer REDACTED ") and shown.endswith("...\n")
+    assert len(shown.rstrip("\n")) <= len("Error: ") + 1024
+
+
+def test_escaped_diagnostics_check_full_size_before_canonicalization(ws, monkeypatch, capsys):
+    def refuse(args):
+        raise OSError(r"\t" * (512 * 1024) + "x")
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    assert capsys.readouterr().err == "Error: guidance_projection_limit\n"
+
+
+@pytest.mark.parametrize("name", ["é", "\ud800", "\udfff", "\x00", "bad\nname"],
+                         ids=["unicode", "high_surrogate", "low_surrogate", "nul", "newline"])
+def test_malformed_unicode_escape_name_remains_a_documented_refusal(ws, monkeypatch, capsys, name):
+    def refuse(args):
+        raise OSError("\\N{" + name + "}")
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    try:
+        result = main(["scan", "app.py"])
+    except UnicodeEncodeError:
+        # Keep a failing report UTF-8 encodable for xdist, without hiding the failure.
+        result = "unexpected UnicodeEncodeError"
+    assert result == 1
+    assert capsys.readouterr().err == "Error: guidance_projection_invalid_field\n"
+
+
+@pytest.mark.parametrize("number", [errno.EACCES, errno.ENAMETOOLONG, errno.ELOOP, errno.ENOTDIR])
+def test_workspace_marker_os_errors_are_binding_refusals(ws, monkeypatch, capsys, number):
+    from aegis_core.workspace import binding
+
+    pin = ws
+    marker = binding.is_aegis_workspace
+
+    def denied(root):
+        if root == pin:
+            raise OSError(number, "marker denied", "Bearer\t" + "S" * 30)
+        return marker(root)
+
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: str(pin))
+    monkeypatch.setattr("aegis_core.workspace.binding.is_aegis_workspace", denied)
+    for _ in range(2):
+        assert main(["scan", "app.py"]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Error: AEGIS_WORKSPACE ")
+        assert captured.err.endswith(" cannot be resolved\n")
+        assert "marker denied" not in captured.err and "S" * 30 not in captured.err
+    monkeypatch.setattr("aegis_core.workspace.binding.is_aegis_workspace", marker)
+    assert main(["scan", "app.py", "--json"]) == 0
+    assert isinstance(json.loads(capsys.readouterr().out)["relevant_rules"], list)
+
+
+@posix_names
+@pytest.mark.parametrize("heading", [False, True], ids=["newline", "evidence"])
+def test_ungoverned_workspace_name_uses_single_line_diagnostics(tmp_path, monkeypatch, capsys, heading):
+    name = "bare\n" + ("## Evidence\n" if heading else "") + "ghp_" + "N" * 30
+    bare = tmp_path / name
+    bare.mkdir()
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None)
+    for _ in range(2):
+        assert main(["scan", "--workspace", str(bare), "app.py"]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err.count("\n") == 1
+        assert "N" * 30 not in captured.err
+        assert "ghp_REDACTED" in captured.err
+        assert ("## Evidence" in captured.err) == heading
+
+
+def test_hold_clips_each_bounded_component_once(monkeypatch, capsys):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    path = "x" * 600000
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target", message=path,
+                               details=(("pin", path), ("target", path)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py", "--json"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "hold" and payload["reason"] == "pin_conflicts_with_target"
+    assert "guidance_projection_limit" not in json.dumps(payload)
+    assert all(len(value) == 1024 and value.endswith("...") for value in payload["details"].values())
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("identity", ["p" * 5000, "Bearer\t" + "S" * 30 + "\n" + "p" * 5000,
+                                      "ghp_" + "S" * 30 + "/" + "p" * 5000],
+                         ids=["long", "controls", "secret"])
+@pytest.mark.parametrize("reason", ["pin_conflicts_with_target", "pin_conflicts_with_cwd"])
+def test_hold_keeps_recovery_after_long_identities(monkeypatch, capsys, json_mode, identity, reason):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason=reason,
+                               details=(("pin", identity), ("target", identity),
+                                        ("cwd", identity), ("cwd_root", identity)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert captured.err == "" and payload["reason"] == reason
+            message = payload["message"]
+        else:
+            assert captured.out == ""
+            message = captured.err.removeprefix(f"Hold ({reason}): ").rstrip("\n")
+        assert "unset the pin" in message and len(message) <= 1024
+        assert "S" * 30 not in captured.out + captured.err
+        assert "\n" not in message and "\t" not in message
+
+
+@pytest.mark.parametrize("number", [errno.EACCES, errno.ENAMETOOLONG, errno.ELOOP, errno.ENOTDIR])
+def test_post_binding_scan_marker_error_retains_workspace_exit(ws, monkeypatch, capsys, number):
+    from aegis_cli import scan
+
+    marker = scan.is_aegis_workspace
+
+    def denied(root):
+        raise OSError(number, "marker denied", "Bearer\t" + "S" * 30)
+
+    monkeypatch.setattr("aegis_cli.scan.is_aegis_workspace", denied)
+    for _ in range(2):
+        assert main(["scan", "app.py"]) == 2
+        assert capsys.readouterr().err == "Error: workspace validation could not be completed\n"
+    monkeypatch.setattr("aegis_cli.scan.is_aegis_workspace", marker)
+    assert main(["scan", "app.py", "--json"]) == 0
+    assert isinstance(json.loads(capsys.readouterr().out)["relevant_rules"], list)
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_hold_preserves_literal_windows_path_components(monkeypatch, capsys, json_mode):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    pin, target = r"C:\tmp\repo", r"C:\new\repo"
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
+                               details=(("pin", pin), ("target", target)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+    captured = capsys.readouterr()
+    message = json.loads(captured.out)["message"] if json_mode else captured.err
+    assert pin in message and target in message
+    if json_mode:
+        assert json.loads(captured.out)["details"] == {"pin": pin, "target": target}
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("details", [None, (("candidates", "not a list"),), (("pin", 3),)])
+def test_hold_malformed_details_return_fixed_refusal(monkeypatch, capsys, details, json_mode):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target", details=details)
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert payload["message"] == "guidance_projection_invalid_field"
+            assert payload["details"] == {}
+            assert list(payload) == ["status", "root", "source", "confidence", "reason", "message", "details",
+                                     "aegis_version", "checked_at", "scope"]
+        else:
+            assert captured.out == ""
+            assert captured.err == "Hold (pin_conflicts_with_target): guidance_projection_invalid_field\n"
+
+
+def test_text_hold_bounds_large_component_collection(monkeypatch, capsys):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    paths = ["x" * 1100 for _ in range(240)]
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
+                               details=(("pin", "pin"), ("target", "target"), ("candidates", paths)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("Hold (pin_conflicts_with_target): --workspace target resolves to target, "
+                            "but AEGIS_WORKSPACE pins pin; unset the pin or drop --workspace\n")
+
+
+@posix_names
+def test_ungoverned_workspace_preserves_literal_backslashes(tmp_path, capsys):
+    bare = tmp_path / r"C:\tmp\repo"
+    bare.mkdir()
+    assert main(["scan", "--workspace", str(bare), "app.py"]) == 2
+    assert capsys.readouterr().err == (
+        f"Error: not an Aegis workspace (no .aegis/ in {bare}); run aegis init\n")
+
+
+def test_scan_warning_checks_full_size_before_control_refusal(ws, monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise OSError("\x1b" + "x" * (1024 * 1024))
+
+    monkeypatch.setattr("aegis_core.scan_compliance.record", fail)
+    assert main(["scan", "src/app.py"]) == 0
+    assert capsys.readouterr().err == "Warning: scan event not recorded: guidance_projection_limit\n"
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("disk\nfull", "disk full"),
+    ("disk\x1bfull", "guidance withheld: control characters"),
+    ("disk\0full", "guidance withheld: control characters"),
+    ("x" * (1024 * 1024 + 1), "guidance_projection_limit"),
+    ("ghp_" + "a" * 30, "ghp_REDACTED"),
+    ("x" * 1100, "x" * 1021 + "..."),
+], ids=["newline", "esc", "nul", "oversized", "secret", "clipped"])
+def test_scan_telemetry_warning_retries_then_recovers(ws, monkeypatch, capsys, message, expected):
+    from aegis_core import scan_compliance
+
+    record = scan_compliance.record
+    attempts = []
+
+    def fail_twice(*args, **kwargs):
+        attempts.append(None)
+        if len(attempts) <= 2:
+            raise OSError(message)
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.scan_compliance.record", fail_twice)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"]) == 0
+        assert capsys.readouterr().err == "Warning: scan event not recorded: " + expected + "\n"
+    assert main(["scan", "src/app.py"]) == 0
+    assert capsys.readouterr().err == ""
+    assert len(attempts) == 3
+
+
+@pytest.mark.parametrize("entry", ["file", "workspace_value"])
+@pytest.mark.parametrize("wrapped", [False, True], ids=["message_policy", "queue_wrapped"])
+@pytest.mark.parametrize("source", ["pin", "target"])
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_scan_workspace_os_error_uses_default_refusal_across_policies(ws, monkeypatch, capsys,
+                                                                   entry, wrapped, source, json_mode):
+    _workspace(ws / "msg")
+    canonical = "CANONICAL-PRIVATE-FILENAME"
+
+    def denied(root):
+        raise OSError(errno.EACCES, "marker denied", canonical)
+
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: str(ws) if source == "pin" else None)
+    if source == "pin":
+        monkeypatch.setattr("aegis_core.workspace.binding.is_aegis_workspace", denied)
+    else:
+        monkeypatch.setattr("aegis_cli.cli.is_aegis_workspace", denied)
+    argv = ["scan", "msg"] if entry == "file" else ["--workspace", "msg", "scan", "app.py"]
+    if wrapped:
+        argv += ["team", "queue"]
+    if json_mode:
+        argv += ["--json"]
+    prefix = "AEGIS_WORKSPACE " if source == "pin" else "--workspace "
+    supplied = str(ws) if source == "pin" or entry == "file" else "msg"
+    for _ in range(2):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "Error: " + prefix + supplied + " cannot be resolved\n"
+        assert canonical not in captured.err and "marker denied" not in captured.err
+
+
+@pytest.mark.parametrize("length", [1048561, 1024 * 1024], ids=["reported", "limit"])
+@pytest.mark.parametrize("kind", ["plain", "missing", "root", "pin_resolution", "target_resolution"])
+def test_workspace_refusals_bound_original_components_before_composition(ws, monkeypatch, capsys, length, kind):
+    from aegis_core.workspace import binding
+
+    plain = ws / "plain"
+    plain.mkdir()
+    prefix = ws.anchor if kind == "root" else str(ws / "missing") if kind == "missing" else str(plain)
+    raw = prefix.ljust(length, "/")
+    assert len(raw) == length
+    if kind.endswith("resolution"):
+        resolve = binding._resolve
+
+        def denied(path):
+            if path == plain:
+                raise OSError(errno.EACCES, "resolution denied", "CANONICAL-PRIVATE-FILENAME")
+            return resolve(path)
+
+        monkeypatch.setattr("aegis_core.workspace.binding._resolve", denied)
+    target = kind == "target_resolution"
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None if target else raw)
+    argv = ["scan", "app.py"] + (["--workspace", raw] if target else [])
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Error: --workspace " if target else "Error: AEGIS_WORKSPACE ")
+    assert "guidance_projection_limit" not in captured.err
+    assert "CANONICAL-PRIVATE-FILENAME" not in captured.err and "resolution denied" not in captured.err
+    assert len(captured.err.rstrip("\n")) == len("Error: ") + 1024
+    suffix = {"plain": ", which has no .aegis/ (run aegis init there)",
+              "missing": ", which is not a directory", "root": ", which is the filesystem root",
+              "pin_resolution": " cannot be resolved", "target_resolution": " cannot be resolved"}[kind]
+    assert captured.err.endswith(suffix + "\n")
+    assert "... [display-only]" in captured.err
+
+
+@pytest.mark.parametrize("kind,target", [("nested", "~/../.."), ("root", "~")])
+def test_tilde_root_refusal_displays_expanded_filesystem_root(ws, monkeypatch, capsys, kind, target):
+    anchor = str(Path(ws.anchor))
+    home = str(Path(anchor) / "home" / "alice") if kind == "nested" else anchor
+    expanduser = os.path.expanduser
+
+    def expand(path):
+        if path == "~" or path.startswith("~/"):
+            return home + path[1:]
+        return expanduser(path)
+
+    # Model the OS home lookup at the two consumers; the actual environment and
+    # cwd stay under the existing workspace fixture and no global module changes.
+    path_view = SimpleNamespace(**{**vars(os.path), "expanduser": expand})
+    os_view = SimpleNamespace(**{**vars(os), "path": path_view})
+    monkeypatch.setattr("aegis_cli.cli.os", os_view)
+    monkeypatch.setattr("aegis_core.workspace.binding.os", os_view)
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: None)
+    assert main(["scan", "--workspace", target, "app.py"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (f"Error: not an Aegis workspace ({anchor} is the filesystem root); "
+                            "run aegis init in a project\n")
+
+
+@pytest.mark.parametrize("filename", [r"C:\tmp\new\folder\repo", r"C:\folder\file"])
+@pytest.mark.parametrize("entry", ["operation", "workspace", "file"])
+def test_filename_exception_preserves_repr_literal_backslash_pairs(ws, monkeypatch, capsys, filename, entry):
+    error = OSError(13, "workspace denied", filename)
+
+    def refuse(*args, **kwargs):
+        raise error
+
+    if entry == "operation":
+        monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    elif entry == "workspace":
+        monkeypatch.setattr("aegis_core.workspace.base.Workspace.resolve", refuse)
+    else:
+        monkeypatch.setattr("aegis_cli.scan._workspace_relative", refuse)
+    assert main(["scan", "app.py"]) == (1 if entry == "operation" else 2)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Error: " + str(error) + "\n"
+
+
+@pytest.mark.parametrize("escape,shown", [
+    (r"\t", "path tail"),
+    (r"\\t", r"path\\t tail"),
+    (r"\\\t", r"path\\ tail"),
+    (r"\\\\t", r"path\\\\t tail"),
+    (r"\\x09", r"path\\x09 tail"),
+    (r"\\\x09", r"path\\ tail"),
+    (r"\\u200b", r"path\\u200b tail"),
+    (r"\\\u200b", r"path\\ tail"),
+    (r"\\U00002028", r"path\\U00002028 tail"),
+    (r"\\\U00002028", r"path\\ tail"),
+    (r"\\N{TAB}", r"path\\N{TAB} tail"),
+    (r"\\\N{TAB}", r"path\\ tail"),
+    (r"\\N{unknown}", r"path\\N{unknown} tail"),
+])
+def test_exception_diagnostics_read_backslash_parity(ws, monkeypatch, capsys, escape, shown):
+    def refuse(args):
+        raise OSError("path" + escape + " tail Bearer\\t" + "S" * 30)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    assert capsys.readouterr().err == "Error: " + shown + " Bearer REDACTED\n"
+
+
+@pytest.mark.parametrize("closed", [False, True], ids=["open", "closed"])
+def test_literal_named_filename_cannot_shield_a_repr_credential(ws, monkeypatch, capsys, closed):
+    tail = "}" if closed else ""
+    filename = r"\N{literal Bearer" + "\t" + "S" * 30 + tail
+    shown = r"\N{literal Bearer REDACTED" + tail
+
+    def refuse(args):
+        raise OSError(13, "workspace denied", filename)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    assert main(["scan", "app.py"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Error: " + str(OSError(13, "workspace denied", shown)) + "\n"

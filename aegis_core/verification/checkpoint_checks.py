@@ -9,12 +9,12 @@ from typing import List
 
 from aegis_core.match import is_test_path
 from aegis_core.taxonomy import RULE_TYPES
-from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME
+from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME as _RETIRED_DIRNAME
 
 
 HARDCODED_PATH_RE = re.compile(r'''(?:"|')(/home/|/Users/|/tmp/)''')
 SKIP_DIRS = {
-    "__pycache__", ".git", LEGACY_SOMA_DIRNAME, AEGIS_DIRNAME, "node_modules", ".venv", "venv",
+    "__pycache__", ".git", AEGIS_DIRNAME, _RETIRED_DIRNAME, "node_modules", ".venv", "venv",
     ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", "egg-info",
 }
 _JS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
@@ -155,8 +155,6 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
         top_pkg = parts[0]
         if top_pkg.startswith("aegis_"):
             clean_pkg = top_pkg[6:]
-        elif top_pkg.startswith("soma_"):
-            clean_pkg = top_pkg[5:]
         else:
             clean_pkg = top_pkg
         subparts = parts[1:-1]
@@ -173,7 +171,7 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
         candidates.append(test_dir / f"test_{parent_name}.py")
         candidates.append(test_dir / f"test_{parent_name}_{stem}.py")
         if len(parts) >= 2:
-            clean_pkg = parts[0][6:] if parts[0].startswith("aegis_") else (parts[0][5:] if parts[0].startswith("soma_") else parts[0])
+            clean_pkg = parts[0][6:] if parts[0].startswith("aegis_") else parts[0]
             candidates.append(test_dir / f"test_{clean_pkg}_{parent_name}.py")
             candidates.append(test_dir / f"test_{parent_name}_adapters.py")
             candidates.append(test_dir / f"test_{clean_pkg}_{parent_name}_adapters.py")
@@ -210,20 +208,20 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
 
 
 def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_name: str) -> List[Path]:
-    """Aegis's own suite files for a source file of the Aegis packages (aegis_*, or the legacy
-    soma_* brand). The map names this repository's layout, so it is valid only inside those
+    """Aegis's own suite files for a source file of the Aegis packages (aegis_*).
+    The map names this repository's layout, so it is valid only inside those
     packages: anywhere else a suite it names says nothing about the file."""
     candidates: List[Path] = []
     top_dir = parts[0] if parts else ""
-    if top_dir in ("aegis_cli", "soma_cli"):
+    if top_dir == "aegis_cli":
         candidates.append(test_dir / f"test_cli_{stem}.py")
         candidates.append(test_dir / "test_platforms.py")
         candidates.append(test_dir / "test_platform_adapters.py")
-    elif top_dir in ("aegis_core", "soma_core"):
+    elif top_dir == "aegis_core":
         candidates.append(test_dir / f"test_core_{stem}.py")
-    elif top_dir in ("aegis_mcp", "soma_mcp"):
+    elif top_dir == "aegis_mcp":
         candidates.append(test_dir / f"test_mcp_{stem}.py")
-    elif top_dir in ("aegis_sdk", "soma_sdk"):
+    elif top_dir == "aegis_sdk":
         candidates.append(test_dir / f"test_sdk_{stem}.py")
     else:
         return candidates
@@ -511,8 +509,7 @@ def check_assertion_density(root: Path) -> list[dict]:
     Judged per function by AST (#1): text such as "assert " in a comment, a
     docstring or a neighbouring test no longer passes a file.
     """
-    from aegis_core.verification.quality_gate import check_assertion_density as density
-    from aegis_core.verification.quality_gate import check_no_bare_pass as bare_pass
+    from aegis_core.verification.quality_gate import check_test_quality
 
     issues = []  # type: List[dict]
     try:
@@ -526,7 +523,7 @@ def check_assertion_density(root: Path) -> list[dict]:
         if not _is_regular_file("assertion_density", root, test_file, issues):
             continue
         try:
-            found = [density(str(test_file)), bare_pass(str(test_file))]
+            found = check_test_quality(str(test_file))
         except (OSError, SyntaxError, UnicodeError, ValueError) as exc:
             issues.append(_failure("assertion_density", root, test_file, "parse", exc))
             continue
@@ -677,4 +674,3 @@ def run_all_checks(root: Path, *, pairing_info: list[dict] | None = None) -> lis
             check_name = check_fn.__name__.replace("check_", "", 1)
             issues.append(_failure(check_name, root, root, "check", exc))
     return issues
-

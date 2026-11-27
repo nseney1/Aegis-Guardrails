@@ -273,7 +273,7 @@ def test_replacement_before_native_open_is_never_modified(tmp_path, junction_ker
 def test_handle_identity_failure_preserves_entry_without_writing(tmp_path, monkeypatch, junction_kernel, version, problem):
     from aegis_core.verification import windows_junction
 
-    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version), raising=False)
+    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version))
     junction_kernel.stat_version = version
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
@@ -307,7 +307,7 @@ def test_handle_identity_failure_preserves_entry_without_writing(tmp_path, monke
 def test_legacy_ambiguous_filesystem_never_authorizes_write_or_rollback(tmp_path, monkeypatch, junction_kernel, filesystem):
     from aegis_core.verification import windows_junction
 
-    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=(3, 9)), raising=False)
+    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=(3, 9)))
     junction_kernel.stat_version = (3, 9)
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
@@ -325,7 +325,7 @@ def test_legacy_ambiguous_filesystem_never_authorizes_write_or_rollback(tmp_path
 def test_matching_native_identity_is_verified_before_the_write(tmp_path, monkeypatch, junction_kernel, version):
     from aegis_core.verification import windows_junction
 
-    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version), raising=False)
+    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version))
     junction_kernel.stat_version = version
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()

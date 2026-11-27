@@ -2,7 +2,7 @@
 
 Given a source tree and a tests/ tree under tmp_path, When check_test_coverage runs, Then a
 source file counts as covered only by a test named after it (or its package path) or, for
-aegis_*/soma_* sources, by a suite the Aegis map names.
+aegis_*/aegis_* sources, by a suite the Aegis map names.
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def test_another_repository_is_not_covered_by_an_aegis_suite(tmp_path, source, s
     ("aegis_cli/formatters/report.py", "tests/unit/cli/test_cli.py"),
     ("aegis_mcp/server.py", "tests/unit/mcp/test_mcp_dispatch.py"),
     ("aegis_core/verification/runner.py", "tests/unit/verification/test_layer1.py"),
-    ("soma_core/credit.py", "tests/test_f_b2_credit_model_acceptance.py"),
+    ("aegis_core/credit.py", "tests/test_f_b2_credit_model_acceptance.py"),
 ], ids=["cli-report", "mcp-server", "runner", "legacy-brand"])
 def test_the_aegis_layout_is_still_covered_by_its_mapped_suites(tmp_path, source, suite):
     _tree(tmp_path, [source, suite])

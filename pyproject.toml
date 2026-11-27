@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aegis-guardrails"
 dynamic = ["version"]
-description = "Project rules for AI coding agents (Claude Code, Codex CLI, Antigravity): MCP server, AGENTS.md bootstrap, AST checks, pre-commit hook and CI gate"
+description = "Project rules and team lanes for AI coding agents (Claude Code, Codex CLI, Antigravity): MCP server, AGENTS.md bootstrap, AST checks, pre-commit hook and CI gate"
 
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -17,7 +17,8 @@ keywords = [
     "ai-coding-agents", "ai-guardrails", "coding-agents", "guardrails", "mcp", "mcp-server",
     "model-context-protocol", "agents-md", "claude-md", "claude-code", "claude-code-hooks",
     "codex-cli", "antigravity", "pre-commit", "git-hooks", "code-review", "static-analysis", "ast",
-    "secret-scanning", "llm-guardrails", "agentic-coding"
+    "secret-scanning", "llm-guardrails", "agentic-coding", "agent-teams", "team-lanes",
+    "work-queue"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -80,7 +81,9 @@ packages = [
     "aegis_core.insights",
     "aegis_core.lifecycle",
     "aegis_core.outcomes",
+    "aegis_core.proposals",
     "aegis_core.skills",
+    "aegis_core.team_templates",
     "aegis_core.telemetry_engine",
     "aegis_core.verification",
     "aegis_core.workspace",
@@ -105,9 +108,14 @@ aegis_core = [
     "ast/drivers/templates/go.mod",
     "benchmark_corpus/corpus.json",
     "benchmark_corpus/ast.json",
+    "manager_starter.json",
 ]
 "aegis_core._data.rules" = ["*.md", ".oracles/*.md"]
 "aegis_core._data.skills" = ["*/SKILL.md"]
+"aegis_core.team_templates" = ["*", "**/*"]
+
+[tool.setuptools.exclude-package-data]
+"aegis_core.team_templates" = ["__pycache__/*", "**/__pycache__/*", "*.py[cod]", "**/*.py[cod]"]
 
 
 [tool.pytest.ini_options]

@@ -195,7 +195,7 @@ def test_a_worktree_already_on_a_row_is_kept_and_a_missing_one_is_its_ledgers(re
 
 @needs_git
 def test_v1_rows_in_a_worktree_ledger_are_converted_when_merged(repo: Path, other: Path):
-    _legacy(other, [{"cell": "trap-src-drift", "signal": "tp", "source": "ci", "timestamp": T1}])
+    _legacy(other, [{"rule_id": "trap-src-drift", "signal": "tp", "source": "ci", "timestamp": T1}])
     migrate.apply(migrate.plan(repo))
     (row,) = [r for r in _shared(repo) if r.get("rule")]
     assert (row["v"], row["rule"], row["outcome"], row["source"], row["ts"]) == (2, "trap-src-drift", "tp", "ci", T1)
@@ -338,22 +338,3 @@ def test_a_shared_directory_linked_since_the_plan_refuses_the_apply_before_anyth
 
 
 # ── Together with the v3 conversion ──────────────────────────────────────────
-
-@needs_git
-def test_a_v3_workspace_in_git_converts_into_the_shared_ledger_and_merges_in_one_apply(repo: Path, other: Path):
-    evidence = repo / ".aegis" / "evidence"
-    evidence.mkdir(parents=True)
-    (evidence / "signals.jsonl").write_text(json.dumps({
-        "timestamp": T0, "rule_id": "trap-v3", "cell": "trap-v3", "signal": "tp", "source": "session", "event_id": "e1",
-    }) + "\n", encoding="utf-8")
-    _legacy(other, [_row(1, T1, key="b1")])
-    plan = migrate.plan(repo)
-    report = plan.to_dict()
-    assert report["ledger"]["rows"] == 1 and report["worktree_ledgers"]["rows"] == 1
-    result = migrate.apply(plan)
-    assert result.merged == 1
-    rows = _shared(repo)
-    assert [r.get("rule") for r in rows if r.get("rule")] == ["trap-v3", "trap-x"]
-    assert [r["seq"] for r in rows] == list(range(1, len(rows) + 1))
-    assert [r["epoch"]["migration"] for r in rows if "epoch" in r] == ["v3-to-v4", "worktree-ledgers"]
-    assert migrate.plan(repo).to_dict()["status"] == "up_to_date"

@@ -1,8 +1,9 @@
 """Rule fitness, computed at read time from the outcome ledger (ADR 0005 H6, AD-1; v4.3 T4)."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+from itertools import chain
 import json
 import math
 from pathlib import Path
@@ -324,7 +325,7 @@ def _finish_t4_bucket(
 
 def _collect_t4_events_for_rules(
     workspace: Any, rules: Sequence[Any], now: Optional[datetime] = None, *, proj_credits: Any = None,
-    adjudications: Any = None, raw_rows: Optional[Sequence[Any]] = None,
+    adjudications: Any = None, ledger_view: Any = None,
 ) -> Dict[str, Dict[str, Any]]:
     from aegis_core import credit
     from aegis_core.errors import PathTraversalError
@@ -332,30 +333,49 @@ def _collect_t4_events_for_rules(
     from aegis_core.telemetry_engine import ledger
     rule_map = {r.id: r for r in rules}
     info = {r.id: _t4_bucket() for r in rules}
+    raw_rows = getattr(ledger_view, "raw_rows", None)
     if raw_rows is None:
         try:
             raw_rows = read_jsonl(ledger.ledger_path(workspace)).rows
         except (PathTraversalError, OSError):
             return info
     proj = proj_credits if proj_credits is not None else credit.project_credits(workspace)
-    confirmed_checks = {(c.check, c.rule) for c in proj.credits if c.counts and c.result == "tp"}
+    confirmed_reports = {
+        (c.check, c.rule, c.rule_revision, c.rule_type, c.ts): c for c in proj.credits if c.counts
+    }
     active_detections: Dict[Tuple[str, str, str, str], str] = {}
-    for raw in raw_rows:
-        if not isinstance(raw, dict):
+    for raw in ledger.ordered_history(raw_rows, ledger_view):
+        ev = raw.get("event")
+        rid = raw.get("rule") or raw.get("for_rule")
+        if not isinstance(rid, str) or rid not in info:
             continue
-        rid = str(raw.get("rule") or "")
-        if rid not in info:
-            continue
-        b = info[rid]
         ts = raw.get("ts")
+        report = None
+        if ev == "report":
+            identity = ledger.report_identity(raw)
+            if identity is None:
+                continue
+            key = (*identity, raw.get("rule_revision"), raw.get("rule_type"), str(ts or ""))
+            report = confirmed_reports.get(key)
+            if report is None or raw.get("tree") not in (None, report.tree):
+                continue
+            del confirmed_reports[key]
+        elif ev == "detection":
+            if raw.get("disposition") not in ("caught", "leaked"):
+                continue
+        elif ev == "exposure":
+            if not isinstance(raw.get("session"), str) or not raw["session"]:
+                continue
+        elif ev not in (None, "override"):
+            continue  # Reviewed labels enter through the adjudications snapshot below.
+        b = info[rid]
         seen_at = parse_utc(ts, lenient=True)
         if seen_at is not None and (b["first_seen"] is None or seen_at < b["first_seen"]):
             b["first_seen"] = seen_at
-        ev = raw.get("event")
         if ev is None:
-            if (raw.get("outcome") or raw.get("signal")) in ("tp", "success", "pass") and not ledger.is_ambient_session_row(raw):
+            if ledger.positive_tp(raw):
                 _reinforce(b, seen_at)
-        elif ev == "report" and (str(raw.get("check")), rid) in confirmed_checks:
+        elif report is not None and report.result == "tp":
             _reinforce(b, seen_at)
             if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
                 b["last_ts"] = ts
@@ -363,11 +383,9 @@ def _collect_t4_events_for_rules(
             _fold_detection(b, raw, rid, active_detections, seen_at)
         elif ev == "override":
             b["contested"] += 1
-        elif ev == "exposure" and raw.get("session"):
+        elif ev == "exposure":
             hb_ok = raw.get("heartbeat") is not False and raw.get("heartbeat_alive") is not False
-            b["post_reinforce_exposures"].setdefault(str(raw["session"]), []).append((hb_ok, raw.get("scope_basis"), seen_at))
-        # A ledger "adjudication" row is read and never counted: any writer can append one. Labels
-        # count only as git content at the reviewed BASE (aegis_core.adjudication, R-evidence-3).
+            b["post_reinforce_exposures"].setdefault(raw["session"], []).append((hb_ok, raw.get("scope_basis"), seen_at))
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
@@ -378,32 +396,91 @@ def _collect_t4_events_for_rules(
     return info
 
 
-def combined_totals(view: Any, proj: Any) -> Dict[str, Any]:
-    """Per-rule ledger totals of ``view``'s outcome rows plus the credit projection's confirmed rows,
-    each (key, rule) once."""
+def _effective_evidence(workspace: Any, rules: Sequence[Any], credits: Iterable[Any],
+                        effective_view: Any) -> Tuple[Tuple[Any, ...], Dict[str, str]]:
+    from aegis_core import gitsafe, rule_integrity as integrity
+    from aegis_core.rule_inventory import RuleInventoryError
+    from aegis_core.rules import Rule
+
+    scored = {rule.id: rule for rule in rules}
+    confirmed = [c for c in credits if c.counts and c.rule in scored]
+    required = {c.rule for c in confirmed if isinstance(scored[c.rule], Rule)}
+    if effective_view is None and required:
+        try:
+            effective_view = integrity.effective(workspace)
+        except (RuleInventoryError, integrity.IntegrityError, gitsafe.GitError, OSError):
+            pass
+    unavailable = "effective policy proof unavailable"
+    if effective_view is None or effective_view.ruleset.errors:
+        missing = dict.fromkeys(required, unavailable)
+        effective = {}
+    else:
+        missing = {}
+        effective = {r.id: r for r in effective_view.ruleset.served if r.id in required}
+    proven: Dict[str, Tuple[str, str]] = {}
+    for rule_id in required:
+        rule = scored[rule_id]
+        captured = effective.get(rule_id)
+        if captured is None or rule.expired:
+            continue
+        checked = integrity.policy_provenance(captured)
+        candidate = checked if rule is captured else integrity.policy_provenance(rule)
+        if checked.synthetic or candidate.synthetic:
+            continue
+        if checked.identity is None or candidate.identity is None:
+            missing[rule_id] = unavailable
+        elif checked.identity == candidate.identity and (
+                rule is captured or integrity.policy_view(rule) == integrity.policy_view(captured)):
+            proven[rule_id] = checked.identity
+    accepted = []
+    historical = {}
+    for evidence in confirmed:
+        current = proven.get(evidence.rule)
+        if evidence.rule_revision is None:
+            if current is not None or not isinstance(scored[evidence.rule], Rule):
+                accepted.append(evidence)  # Pre-receipt witnessed reports.
+        elif current is not None and evidence.rule_revision == current[0]:
+            kind = evidence.rule_type
+            if kind is None:
+                key = (evidence.tree, evidence.rule, evidence.rule_revision)
+                if key not in historical:
+                    try:
+                        historical[key] = integrity.historical_policy_type(workspace, *key)
+                    except integrity.IntegrityError:
+                        historical[key] = None
+                        missing[evidence.rule] = "historical policy proof unavailable"
+                kind = historical[key]
+            if kind == current[1]:
+                accepted.append(evidence)
+    return tuple(accepted), missing
+
+
+def _matches_revision(rule_id: str, revision: Optional[str], current: Mapping[str, Optional[str]]) -> bool:
+    if rule_id not in current:
+        return revision is None
+    proven = current[rule_id]
+    return proven is not None and (revision is None or revision == proven)
+
+
+def combined_totals(view: Any, proj: Any, *, revisions: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Any]:
+    """Per-rule totals, with separate identities for ordinary and confirmed outcomes."""
     from aegis_core.telemetry_engine import ledger
 
-    combined_rows: List[Dict[str, Any]] = []
-    seen_keys: Set[Tuple[str, str]] = set()
-    for r in list(view.rows) + list(proj.outcome_rows):
-        k, rid = r.get("key"), r.get("rule")
-        if isinstance(k, str) and k and isinstance(rid, str):
-            if (k, rid) in seen_keys:
-                continue
-            seen_keys.add((k, rid))
-        combined_rows.append(r)
-    return ledger.aggregate_rows(combined_rows)
+    confirmed = (r for r in proj.outcome_rows
+                 if revisions is None or _matches_revision(r["rule"], r.get("rule_revision"), revisions))
+    return ledger.aggregate_rows(chain(view.rows, confirmed))
 
 
 def for_rules(
     workspace: Any, rules: Iterable[Any], now: Optional[datetime] = None, view: Any = None, *, verify_ci: bool = False,
-    adjudications: Any = None,
+    adjudications: Any = None, effective_view: Any = None,
 ) -> Dict[str, Fitness]:
     """Fitness per rule from the ledger, CI-confirmed credit and the labels merged at the reviewed
     BASE (``adjudications``: read with ``adjudication.read_adjudications`` unless given; scan
     passes an empty set so it spawns no git for them)."""
     from aegis_core import adjudication, credit
     from aegis_core.config import ConfigError, RepoConfig
+    from aegis_core.guidance_projection import project_diagnostic
     from aegis_core.telemetry_engine import ledger
     rule_list = list(rules)
     try:
@@ -414,10 +491,13 @@ def for_rules(
     epsilon = float(config.epsilon)
     view_obj = view if view is not None else ledger.read(workspace)
     proj_credits = credit.project_credits(workspace, view=view_obj, verify_ci=verify_ci)
-    totals = combined_totals(view_obj, proj_credits)
+    confirmed, proof_errors = _effective_evidence(workspace, rule_list, proj_credits.credits, effective_view)
+    health_detail = project_diagnostic(proj_credits.error, max_len=256) if proof_errors and proj_credits.error else None
+    projection = replace(proj_credits, credits=confirmed, outcome_rows=tuple(credit.confirmed_outcome_rows(confirmed)))
+    totals = combined_totals(view_obj, projection)
     labels = adjudications if adjudications is not None else adjudication.read_adjudications(workspace)
-    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits,
-                                              adjudications=labels, raw_rows=getattr(view_obj, "raw_rows", None))
+    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=projection,
+                                              adjudications=labels, ledger_view=view_obj)
     out: Dict[str, Fitness] = {}
     for rule in rule_list:
         rid = rule.id
@@ -427,6 +507,9 @@ def for_rules(
         t4 = t4_by_rule.get(rid, {})
         if not rule_totals.get("last_ts") and t4.get("last_ts"):
             rule_totals["last_ts"] = t4["last_ts"]
+        proof_error = proof_errors.get(rid)
+        evidence_error = proj_credits.error if proof_error is None else ", ".join(
+            detail for detail in (proof_error, health_detail) if detail)
         out[rid] = compute(
             rule_totals, now, rid, observed_days=t4.get("observed_days"),
             eligible_sessions=int(t4.get("eligible_sessions", 0)),
@@ -435,7 +518,7 @@ def for_rules(
             caught=int(t4.get("caught", 0)), leaked=int(t4.get("leaked", 0)), adjudicated_tp=int(t4.get("adjudicated_tp", 0)),
             adjudicated_fp=int(t4.get("adjudicated_fp", 0)), sessions_count=len(t4.get("sessions", ())),
             repos_count=len(t4.get("repos", ())), days_span=float(t4.get("days_span", 0.0)),
-            evidence_available=proj_credits.available, evidence_error=proj_credits.error,
+            evidence_available=proj_credits.available and proof_error is None, evidence_error=evidence_error,
             age_days=rule_age_days(rule, now),
         )
     return out
@@ -573,7 +656,7 @@ def _utc_stamp(iso: str) -> Optional[str]:
 
 # Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with
 # replay.tip, so a tip recorded by another evaluator is never resumed from and history is walked again.
-REPLAY_FORMAT = 2
+REPLAY_FORMAT = 3
 
 
 def _rules_digest(rules: Sequence[Any]) -> str:

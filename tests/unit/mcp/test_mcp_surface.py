@@ -1,22 +1,18 @@
-"""The v4 MCP surface: four tools, no receipts, no session token, no execution tier.
+"""The MCP surface: registered tools, no receipts, no session token, no execution tier.
 
 These drive ``handle_request`` end to end, the way a host does over stdio.
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 import aegis_mcp.server as server
 
-SURVIVING_TOOLS = {
-    "aegis_scan",
-    "aegis_report_outcome",
-    "aegis_create_rule",
-    "aegis_list_rules",
-    "aegis_capture_insight",
-}
+SURVIVING_TOOLS = {tool["name"] for tool in json.loads(
+    (Path(__file__).resolve().parents[2] / "contract" / "mcp_tools.json").read_text(encoding="utf-8"))["tools"]}
 
 REMOVED_TOOLS = [
     "aegis_request_receipt",
@@ -39,7 +35,7 @@ def initialized(tmp_path, monkeypatch):
     (tmp_path / ".aegis" / "rules").mkdir(parents=True)
     monkeypatch.setattr(server, "_canonical_workspace", str(tmp_path))
     monkeypatch.setattr(server, "_workspace_error", None)
-    monkeypatch.setattr(server, "_session_id", None, raising=False)
+    monkeypatch.setattr(server, "_session_id", None)
     response = server.handle_request({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"clientInfo": {"name": "pytest"}},
@@ -77,7 +73,7 @@ def test_initialize_hands_out_no_session_token(initialized):
 
 def test_tools_call_before_initialize_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_canonical_workspace", str(tmp_path))
-    monkeypatch.setattr(server, "_session_id", None, raising=False)
+    monkeypatch.setattr(server, "_session_id", None)
     response = _call("aegis_list_rules", {})
     assert response["error"] == {"code": -32002, "message": "Server not initialized"}
 

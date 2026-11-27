@@ -1,19 +1,23 @@
 """Rule integrity: git is the witness (v4.3 spec T3)."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
-import hashlib
+from dataclasses import dataclass, field
+from dataclasses import replace as replace  # Compatibility re-export for the 4.3.3 public-name pin.
 import os
+import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 from aegis_core import primitives
 from aegis_core import gitevidence, gitsafe, governance, rule_inventory
+from aegis_core.diagnostic_messages import GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, guidance_value
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
+from aegis_core.guidance_projection import ServedRule
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
-from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
+from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, lf_digest, load_rules, workspace_root
+from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPE_DIRS, RULE_TYPES
 from aegis_core.workspace.layout import RULES_RELDIR
 
 __all__ = [
@@ -28,6 +32,7 @@ __all__ = [
     "check_ci",
     "effective",
     "effective_ruleset",
+    "exact_revision",
     "policy_view",
     "resolve_base",
     "weakenings",
@@ -43,6 +48,11 @@ _GIT_TIMEOUT, _MD, _MISSING = 60.0, ".md", object()
 
 class IntegrityError(AegisError):
     """The base cannot be read, or a blob does not hash to its object id."""
+
+    def __init__(self, message: str, *, code: Optional[str] = None, next_action: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.next_action = next_action
 
 
 @dataclass(frozen=True)
@@ -89,7 +99,7 @@ def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
             # after the branch forked is not an edit of this branch.
             fork = gitevidence.merge_base_with(facts, tip) if shared else gitsafe.merge_base(root, tip, "HEAD")
             note = "" if fork else "; no common history with HEAD, using its tip"
-            return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {ref} (user config{note})")
+            return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {guidance_value(ref, prose=True)} (user config{note})")
     reviewed = gitevidence.merge_base_with(facts) if shared else _origin_merge_base(root)
     if reviewed:
         return BaseAnchor("origin/HEAD", reviewed, "origin-head", True, "merge-base of HEAD and origin/HEAD")
@@ -110,7 +120,7 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
     # Without --full-tree, ls-tree takes and names paths relative to its cwd, the workspace root:
     # a nested workspace needs no prefix lookup. Symlinks and gitlinks are not rules.
     if not commit or commit.startswith("-"):
-        raise IntegrityError(f"invalid revision {commit!r}")
+        raise IntegrityError(f"invalid revision '{guidance_value(str(commit), prose=True)}'")
     found: Dict[str, str] = {}
     listing = gitsafe.run_checked(["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR], cwd, error=IntegrityError,
                                   timeout=_GIT_TIMEOUT).stdout
@@ -150,7 +160,7 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
     missing: List[Tuple[str, str]] = []
     for path, oid in sorted(blobs.items()):
         local = present.get(path)
-        if local is not None and _same_blob(local.content, oid):
+        if local is not None and local.size <= rule_inventory.MAX_RULE_BYTES and _same_blob(local.content, oid):
             entries.append(local)
         else:
             missing.append((path, oid))
@@ -158,12 +168,10 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
     for path, oid in missing:
         data = contents[oid]
         entries.append(
-            RuleInventoryEntry(
+            rule_inventory.captured_entry(
                 path,
                 os.path.join(root, *path.split("/")),
                 data,
-                hashlib.sha256(data).hexdigest(),
-                len(data),
             )
         )
     entries.sort(key=lambda e: e.relative_path)
@@ -178,6 +186,118 @@ def _tree_files(root: str, commit: str) -> List[str]:
 
 def policy_view(rule: Rule) -> Tuple[Any, Any, Any]:
     return (rule.type, dict(rule.meta), rule.body.replace("\r\n", "\n"))
+
+
+@dataclass(frozen=True)
+class _ComposedRule(Rule):
+    """Effective instructions assembled from a reviewed rule and working policy."""
+
+
+def exact_revision(rule: Rule) -> Optional[str]:
+    """Return the captured revision of a servable source rule."""
+    identity = exact_policy(rule)
+    return identity[0] if identity is not None else None
+
+
+@dataclass(frozen=True)
+class ServedPolicy(ServedRule):
+    """A delivered rule with the type captured by the rule loader."""
+
+    rule_type: str
+
+
+class PolicyProvenance(NamedTuple):
+    identity: Optional[Tuple[str, str]] = None
+    synthetic: bool = False
+
+
+def policy_provenance(rule: Rule) -> PolicyProvenance:
+    """Classify a served rule using its source, composition marker, and bounded captured bytes."""
+    if type(rule) not in (Rule, _ComposedRule) or not rule.served:
+        return PolicyProvenance()
+    kind, raw, revision = rule.type, rule.raw, rule.digest
+    if (not isinstance(kind, str) or kind not in RULE_TYPES
+            or type(raw) is not bytes or not 0 < len(raw) <= rule_inventory.MAX_RULE_BYTES
+            or not isinstance(revision, str) or len(revision) != 64 or lf_digest(raw) != revision):
+        return PolicyProvenance()
+    if rule.path != f"{RULES_RELDIR}/{RULE_TYPE_DIRS[kind]}/{rule.id}.md":
+        return PolicyProvenance()
+    if type(rule) is _ComposedRule:
+        return PolicyProvenance(synthetic=True)
+    return PolicyProvenance((revision, kind))
+
+
+def exact_policy(rule: Rule) -> Optional[Tuple[str, str]]:
+    return policy_provenance(rule).identity
+
+
+@dataclass(frozen=True)
+class ReportAttribution:
+    scan_ref: Optional[str]
+    revisions: Mapping[str, str]
+    empty_join: bool = False
+    live: Optional[Callable[[], bool]] = None
+    rule_types: Mapping[str, str] = field(default_factory=dict)
+
+
+def valid_report_policy(row: Mapping[str, Any]) -> bool:
+    """Check typed and historical receipt evidence without consulting working files."""
+    from aegis_core.scan_exposure import valid_ref
+
+    revision, kind = row.get("rule_revision"), row.get("rule_type")
+    return bool(row.get("tree") and row.get("witness") == "aegis" and valid_ref(row.get("scan_ref"))
+                and isinstance(revision, str) and len(revision) == 64 and re.fullmatch(r"[0-9a-f]{64}", revision)
+                and ("rule_type" not in row or isinstance(kind, str) and kind in RULE_TYPES))
+
+
+def _historical_source(output: bytes, expected: Mapping[bytes, str], oid_size: int) -> Optional[Tuple[str, str]]:
+    if (type(output) is not bytes or len(output) > sum(len(name) + 80 for name in expected)
+            or (output and not output.endswith(b"\0"))):
+        raise IntegrityError("historical policy proof unavailable")
+    sources, seen = [], set()
+    modes = {b"100644": b"blob", b"100755": b"blob", b"120000": b"blob",
+             b"040000": b"tree", b"160000": b"commit"}
+    for record in output.split(b"\0")[:-1]:
+        header, tab, name = record.partition(b"\t")
+        fields = header.split()
+        if not tab or name not in expected or name in seen or len(fields) != 3:
+            raise IntegrityError("historical policy proof unavailable")
+        mode, kind, oid = fields
+        if (modes.get(mode) != kind or len(oid) != oid_size or not re.fullmatch(rb"[0-9a-f]+", oid)):
+            raise IntegrityError("historical policy proof unavailable")
+        seen.add(name)
+        if mode in (b"100644", b"100755"):
+            sources.append((expected[name], oid.decode("ascii")))
+    return sources[0] if len(sources) == 1 else None
+
+
+def historical_policy_type(workspace: Any, tree: str, rule_id: str, revision: str) -> Optional[str]:
+    """Recover a unique source type. A completed negative proof returns None."""
+    if (len(tree) not in (40, 64) or any(ch not in "0123456789abcdef" for ch in tree)
+            or not rule_id or len(rule_id) > 255 or rule_id.startswith(".") or "/" in rule_id or "\0" in rule_id):
+        raise IntegrityError("historical policy proof unavailable")
+    root = workspace_root(workspace)
+    paths = [f"{RULES_RELDIR}/{directory}/{rule_id}.md" for directory in DIR_RULE_TYPES]
+    try:
+        expected = {os.fsencode(path): path for path in paths}
+        # Nonrecursive literal paths yield at most one record per requested file.
+        output = gitsafe.run_checked(["--literal-pathspecs", "ls-tree", "-z", tree, "--", *paths], root).stdout
+        source = _historical_source(output, expected, len(tree))
+        if source is None:
+            return None
+        path, oid = source
+        size = gitsafe.blob_sizes(root, [oid])[oid]
+        if size > rule_inventory.MAX_RULE_BYTES:
+            return None
+        data = gitsafe.read_blobs(root, [oid])[oid]
+        if len(data) != size:
+            raise IntegrityError("historical policy proof unavailable")
+    except (gitsafe.GitError, OSError, ValueError, KeyError):
+        raise IntegrityError("historical policy proof unavailable") from None
+    entries = (rule_inventory.captured_entry(path, os.path.join(root, *path.split("/")), data),)
+    rule = load_rules(root, inventory=RuleInventory(entries, rule_inventory.fingerprint(entries))).get(rule_id)
+    identity = exact_policy(rule) if rule is not None else None
+    return identity[1] if identity is not None and identity[0] == revision else None
 
 
 def title_of(rule: Rule) -> str:
@@ -196,12 +316,27 @@ def _one_line(text: str) -> str:
     return cleaned[:77] + "..." if len(cleaned) > 80 else cleaned
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Weakening:
     code: str
     rule: str
     path: str
-    message: str
+    detail: GuidanceMessage
+
+    def __init__(self, code: str, rule: str, path: str, message: Any):
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "rule", rule)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "detail", message if isinstance(message, GuidanceMessage)
+                           else GuidanceMessage(code, MESSAGE_TEMPLATES["legacy_value"], {"detail": message}))
+
+    @property
+    def message(self) -> str:
+        """Compatibility display; the stored finding always retains its data."""
+        return self.detail.render()
+
+    def as_dict(self) -> Dict[str, Any]:
+        return MessageRow(code=self.code, rule=self.rule, path=self.path, message=self.message)
 
 
 def _dotted_covers(kind: str, broad: str, narrow: str) -> bool:
@@ -293,26 +428,29 @@ def _is_superset(before: Any, after: Any) -> bool:
     return before == after
 
 
-def _forbid_findings(base: Rule, head: Rule) -> List[str]:
+def _forbid_findings(base: Rule, head: Rule) -> List[GuidanceMessage]:
     before, after = base.meta.get("forbid_ast"), head.meta.get("forbid_ast")
     if before is None:
         return []
     if not isinstance(after, dict):
-        return ["forbid_ast was removed"]
-    lost: List[str] = []
+        return [GuidanceMessage("forbid_ast", MESSAGE_TEMPLATES["forbid_ast"], {})]
+    lost: List[GuidanceMessage] = []
     for kind in _FORBID_KINDS:
         if kind == "calls":
             heads = _call_entries(after)
             for entry in _call_entries(before):
                 if not any(_call_covers(other, entry) for other in heads):
                     named = any(_dotted_covers(kind, other.name, entry.name) for other in heads)
-                    lost.append(f"call {entry.name!r} is no longer forbidden" + (
-                        " everywhere it was (its where or builtin was narrowed)" if named else ""))
+                    if named:
+                        lost.append(GuidanceMessage("forbid_ast", MESSAGE_TEMPLATES["forbid_ast_3"], {"name": entry.name}))
+                    else:
+                        lost.append(GuidanceMessage("forbid_ast", MESSAGE_TEMPLATES["forbid_ast_4"], {"name": entry.name}))
             continue
         kept = _forbid_patterns(after, kind)
         for pattern in _forbid_patterns(before, kind):
             if not any(_dotted_covers(kind, other, pattern) for other in kept):
-                lost.append(f"{kind[:-1]} {pattern!r} is no longer forbidden")
+                lost.append(GuidanceMessage("forbid_ast", MESSAGE_TEMPLATES["forbid_ast_2"],
+                                            {"kind": kind[:-1], "pattern": pattern}))
     return lost
 
 
@@ -331,17 +469,18 @@ def _reach_dropped(base: Rule, head: Rule) -> List[str]:
     return dropped + ([_TEST_FILES] if head.skips_tests and not base.skips_tests else [])
 
 
-def _coverage_lost(base: Rule, head: Rule, renames: Mapping[str, str]) -> List[str]:
+def _coverage_lost(base: Rule, head: Rule, renames: Mapping[str, str]) -> List[GuidanceMessage]:
     dropped = _reach_dropped(base, head)
     if dropped:
         return [
-            "it no longer applies to test files, which the reviewed version covered" if p == _TEST_FILES
-            else f"target pattern {p!r} is no longer kept; files it covered, including files this branch adds, "
-            "may lose the rule"
+            GuidanceMessage("coverage", MESSAGE_TEMPLATES["coverage_2"], {})
+            if p == _TEST_FILES else GuidanceMessage("coverage",
+                MESSAGE_TEMPLATES["coverage_3"], {"pattern": p})
             for p in dropped
         ]
     lost = {new for old, new in renames.items() if base.applies_to(old) and not head.applies_to(new)}
-    return [f"no longer applies to {path}, which the reviewed version covered" for path in sorted(lost)]
+    return [GuidanceMessage("coverage", MESSAGE_TEMPLATES["coverage"], {"path": path})
+            for path in sorted(lost)]
 
 
 def _key_changes(base: Rule, head: Rule) -> List[str]:
@@ -352,17 +491,29 @@ def _key_changes(base: Rule, head: Rule) -> List[str]:
     )
 
 
+def _oversized(rule: Optional[Rule]) -> bool:
+    return rule is not None and rule.size is not None and rule.size > rule_inventory.MAX_RULE_BYTES
+
+
 def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, str]] = None) -> List[Weakening]:
     """How ``head`` binds less than the reviewed ``base``, in a fixed order. An ``applies_to`` change is
     not among them: check_ci reports it for a rule of any rank (``_applies_to_changed``)."""
+    if _oversized(base):
+        # Empty content on a refused record is not an empty policy. Its bounded
+        # fingerprint and actual size are the only available comparison evidence.
+        if head is not None and (base.size, base.digest) == (head.size, head.digest):
+            return []
+        return [Weakening("deleted", base.id, base.path,
+                          GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted_2"], {"error": "too_large"}))]
     if head is None or not head.ok:
-        why = "the rule is gone from the branch" if head is None else f"the rule no longer loads: {head.error}"
+        detail = GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted"], {}) if head is None else \
+            GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted_2"], {"error": str(head.error)})
         return [
             Weakening(
                 "deleted",
                 base.id,
                 base.path,
-                f"{why} (a deletion or an archive, with no same-id rule in its place)",
+                detail,
             )
         ]
     found: List[Weakening] = []
@@ -372,7 +523,8 @@ def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, 
                 "rank",
                 base.id,
                 head.path,
-                f"binds less: rank {base.rank} ({base.enforcement}) became rank {head.rank} ({head.enforcement})",
+                GuidanceMessage("rank", MESSAGE_TEMPLATES["rank"],
+                                {"prior_rank": base.rank, "prior": base.enforcement, "rank": head.rank, "mode": head.enforcement}),
             )
         )
     for key in _key_changes(base, head):
@@ -381,7 +533,7 @@ def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, 
                 "unknown_key",
                 base.id,
                 head.path,
-                f"new or changed key {key!r} is not one Aegis knows, so it is treated as a weakening",
+                GuidanceMessage("unknown_key", MESSAGE_TEMPLATES["unknown_key"], {"key": key}),
             )
         )
     for message in _forbid_findings(base, head):
@@ -390,7 +542,8 @@ def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, 
         base.meta.get("detect"), head.meta.get("detect")
     ):
         found.append(
-            Weakening("detect", base.id, head.path, "detect is not an exact superset of the reviewed version")
+            Weakening("detect", base.id, head.path,
+                      GuidanceMessage("detect", MESSAGE_TEMPLATES["detect"], {}))
         )
     for message in _coverage_lost(base, head, renames or {}):
         found.append(Weakening("coverage", base.id, head.path, message))
@@ -427,13 +580,17 @@ class Effective:
 
 
 def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Effective:
+    refused = tuple(r for r in base.rules if _oversized(r))
+    refused_ids = {r.id for r in refused}
     base_all = {r.id: r for r in base.rules if r.ok}
     binding = {rule_id: r for rule_id, r in base_all.items() if r.rank >= 2}
-    served: List[Rule] = []
+    served: List[Rule] = list(refused)
     unreviewed: List[Unreviewed] = []
     widened: List[Tuple[int, Rule, Tuple[str, ...]]] = []
     seen_ok, seen_any = set(), set()
     for rule in head.rules:
+        if rule.id in refused_ids:
+            continue  # A working replacement cannot remove a reviewed refusal.
         seen_any.add(rule.id)
         if not rule.ok:
             served.append(rule)
@@ -452,14 +609,19 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
         if policy_view(reviewed) == policy_view(rule):
             served.append(rule)
         elif _stricter(reviewed, rule):
-            merged = replace(
-                reviewed,
+            merged = _ComposedRule(
+                id=reviewed.id,
                 type=rule.type,
                 path=rule.path,
                 meta={
                     **reviewed.meta,
                     **{k: rule.meta[k] for k in ("target_paths", "forbid_ast", "enforcement") if k in rule.meta},
                 },
+                body=reviewed.body,
+                digest=reviewed.digest,
+                legacy_keys=reviewed.legacy_keys,
+                raw=reviewed.raw,
+                size=reviewed.size,
             )
             kept = {normalize_path(p) for p in reviewed.target_paths}
             added = tuple(p for p in merged.target_paths if normalize_path(p) not in kept)
@@ -528,14 +690,20 @@ class CiReport:
     governance_categories: Tuple[str, ...] = ()
     governance_paths: Tuple[Tuple[str, str], ...] = ()
     signers_at_base: int = 0
+    approval_policy: Optional[Any] = None
+    owner_review_required: Tuple[Weakening, ...] = ()
+    comparison_ref: Optional[str] = None
 
     @property
     def governance_gated(self) -> bool:
         """A governance change needs the approval only when the base lists a key to sign it with."""
-        return bool(self.governance_categories) and self.signers_at_base > 0
+        mode = self.approval_policy.mode if self.approval_policy is not None else None
+        return bool(self.governance_categories) and (mode == "signature" or (mode is None and self.signers_at_base > 0))
 
     @property
     def passed(self) -> bool:
+        if self.approval_policy is not None and self.approval_policy.permits_unsigned:
+            return True
         if not self.weakenings and not self.governance_gated:
             return True
         return self.approval is not None and self.approval.valid
@@ -551,10 +719,13 @@ class CiReport:
                 "merge_base": self.merge_base,
             }),
             "schema": SCHEMA,
+            **(self.approval_policy.as_dict() if self.approval_policy is not None else {}),
             "status": "pass" if self.passed else "fail",
             "rules_checked": self.rules_checked,
-            "weakenings": [asdict(w) for w in self.weakenings],
+            "weakenings": [w.as_dict() for w in self.weakenings],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
+            **({"owner_review_findings": [w.as_dict() for w in self.owner_review_required]}
+               if self.owner_review_required else {}),
             "governance": {
                 "categories": list(self.governance_categories),
                 "paths": [{"path": path, "category": category} for path, category in self.governance_paths],
@@ -600,8 +771,8 @@ def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) 
                         "mandatory_cap",
                         rule.id,
                         rule.path,
-                        f"a mandatory rule added where {len(crowd)} already apply (to {path}); a scan gives mandatory rules "
-                        f"at most {MANDATORY_SLOT_CAP} slots, so this one crowds out the others",
+                        GuidanceMessage("mandatory_cap", MESSAGE_TEMPLATES["mandatory_cap"],
+                                        {"count": len(crowd), "path": path, "cap": MANDATORY_SLOT_CAP}),
                     )
                 )
                 break
@@ -655,42 +826,56 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
 
 
 @gitsafe.scrubbed()
-def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
+@gitsafe.memo()
+def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None,
+             target: Optional[str] = None, resolution: Any = None, policy: Any = None,
+             head_commit: Optional[str] = None) -> CiReport:
     """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
     review of that pull request's head may approve instead, and only when the head under check is it."""
-    from aegis_core import human_gate
+    from aegis_core import approval_policy, human_gate
 
     root = workspace_root(workspace)
-    base_commit = gitsafe.resolve_commit(root, base)
-    head_commit = gitsafe.resolve_commit(root, head)
+    resolved = resolution if resolution is not None else approval_policy.resolve_comparison(root, base)
+    base_commit = resolved.commit
+    head_commit = head_commit or gitsafe.resolve_commit(root, head)
     if not base_commit:
         raise IntegrityError(
-            f"cannot resolve the base {base!r} to a commit (fetch it, or with a shallow clone fetch the full history)"
+            "base_unavailable: cannot resolve the base to a commit; fetch it or pass the full commit id",
+            code="base_unavailable", next_action="fetch it or pass the full commit id"
         )
     if not head_commit:
-        raise IntegrityError(f"cannot resolve the head {head!r} to a commit")
+        raise IntegrityError(f"cannot resolve the head '{guidance_value(str(head), prose=True)}' to a commit")
+    # Review identity does not establish a target; only the caller or a verified branch can.
+    branch = target if target is not None else resolved.target
+    policy = policy if policy is not None else approval_policy.resolve_policy(root, base_commit, head_commit, branch)
     merge = gitsafe.merge_base(root, base_commit, head_commit)
     if not merge:
-        raise IntegrityError(f"{base!r} and {head!r} share no history (a shallow clone needs fetch-depth: 0)")
+        raise IntegrityError("comparison_unavailable: the resolved base and head share no history; pass a base from the head's history",
+                             code="comparison_unavailable", next_action="pass --base from the head's history")
     prefix = _prefix(root)
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
+    refused_base = {r.id: r for r in base_rules.rules if _oversized(r)}
+    head_records = {r.path: r for r in head_rules.rules}
     renames = _renames(root, merge, head_commit, prefix)
 
     found: List[Weakening] = []
     checked = 0
     # A binding rule's applies_to finding comes last among its own; then each other rule's, any rank.
     for rule in base_rules.rules:
-        if rule.ok and rule.rank >= 2:
+        if (rule.ok and rule.rank >= 2) or _oversized(rule):
             checked += 1
-            branch = head_rules.get(rule.id)
+            branch = head_records.get(rule.path) if _oversized(rule) else head_rules.get(rule.id)
             found += weakenings(rule, branch, renames)
-            if branch is not None and _applies_to_changed(rule, branch):
-                found.append(Weakening("applies_to", rule.id, branch.path, "applies_to changed"))
+            if rule.ok and branch is not None and _applies_to_changed(rule, branch):
+                found.append(Weakening("applies_to", rule.id, branch.path,
+                                       GuidanceMessage("applies_to", MESSAGE_TEMPLATES["applies_to"], {})))
     for rule in head_rules.rules:
-        reviewed = base_rules.get(rule.id)
-        if rule.ok and not (reviewed is not None and reviewed.rank >= 2) and _applies_to_changed(reviewed, rule):
-            found.append(Weakening("applies_to", rule.id, rule.path, "applies_to changed"))
+        reviewed = refused_base.get(rule.id) or base_rules.get(rule.id)
+        if (rule.ok and not _oversized(reviewed) and not (reviewed is not None and reviewed.rank >= 2)
+                and _applies_to_changed(reviewed, rule)):
+            found.append(Weakening("applies_to", rule.id, rule.path,
+                                   GuidanceMessage("applies_to", MESSAGE_TEMPLATES["applies_to"], {})))
     head_files: List[str] = []
 
     def files() -> List[str]:
@@ -703,16 +888,19 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any
     order = [name for name, _patterns in governance.CATEGORIES] + [governance.DELETED_TESTS]
     categories = tuple(c for c in order if c in {category for _path, category in paths})
     signers = human_gate.signing_keys_at(root, base_commit) if categories else 0
+    owner_review = tuple(Weakening(**row) for row in approval_policy.owner_review_changes(root, base_commit, head_commit)) \
+        if categories and not signers else ()
     approval = None
-    if found or (categories and signers):
+    if not policy.permits_unsigned and (found or (categories and (signers or policy.mode == "signature"))):
         try:
             approval = human_gate.find_approval(root, head_commit, base_commit)
         except (human_gate.HumanGateError, gitsafe.GitError):
             approval = None
         if approval is None and pull_request is not None and pull_request.head.lower() == head_commit.lower():
-            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers else [])
+            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers or policy.mode else [])
             try:
                 approval = human_gate.find_review_approval(root, pull_request, base_commit, flagged)
             except (human_gate.HumanGateError, gitsafe.GitError):
                 approval = None
-    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers)
+    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers, policy,
+                    owner_review, resolved.ref)

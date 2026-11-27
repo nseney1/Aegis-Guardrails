@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from aegis_core.verification import quality_gate
 from aegis_core.verification.checkpoint_checks import check_assertion_density
 
 
@@ -154,6 +158,83 @@ def test_legacy_encoded_test_file_is_parsed(tmp_path):
         "# -*- coding: latin-1 -*-\ndef test_cafe():\n    assert 'café'\n".encode("latin-1")
     )
     assert _messages(tmp_path) == []
+
+
+def _quality_fixture(root):
+    paths = [
+        _test_file(root, "test_missing.py", "def test_missing():\n    value = 1\n"),
+        _test_file(root, "test_stub.py", "def test_stub():\n    pass\n"),
+        _test_file(root, "test_environment.py", """\
+            if HAVE_ENV:
+                def test_environment():
+                    assert True
+            else:
+                def test_environment():
+                    pytest.skip("environment unavailable")
+        """),
+        _test_file(root, "test_syntax.py", "def test_broken(:\n    pass\n"),
+    ]
+    _test_file(root, "helpers.py", "def ignored(:\n")
+    return sorted(str(path) for path in paths)
+
+
+def test_quality_checks_read_and_parse_once_per_file_per_run(tmp_path, monkeypatch):
+    expected = _quality_fixture(tmp_path)
+    reads, parses = [], []
+    read_source, parse = quality_gate.read_python_source, quality_gate.ast.parse
+
+    def counted_read(path):
+        reads.append(path)
+        return read_source(path)
+
+    def counted_parse(source, filename):
+        parses.append(filename)
+        return parse(source, filename=filename)
+
+    monkeypatch.setattr(quality_gate, "read_python_source", counted_read)
+    # Replace this module's reference, leaving the process-wide ast module alone.
+    monkeypatch.setattr(quality_gate, "ast", SimpleNamespace(
+        **dict(vars(quality_gate.ast), parse=counted_parse)
+    ))
+    first = check_assertion_density(tmp_path)
+    assert (reads, parses) == (expected, expected)
+    reads.clear()
+    parses.clear()
+    assert check_assertion_density(tmp_path) == first
+    assert (reads, parses) == (expected, expected)
+
+
+def test_quality_check_issues_preserve_order_messages_and_parse_failure(tmp_path):
+    _quality_fixture(tmp_path)
+    broken = tmp_path / "tests" / "test_syntax.py"
+    with pytest.raises(SyntaxError) as error:
+        quality_gate.ast.parse("def test_broken(:\n    pass\n", filename=str(broken))
+    assert check_assertion_density(tmp_path) == [
+        {"check": "assertion_density", "file": "tests/test_missing.py", "lines": [1],
+         "message": "Low assertion density in test_missing.py: tests lacking assertions: test_missing"},
+        {"check": "assertion_density", "file": "tests/test_stub.py", "lines": [1],
+         "message": "Low assertion density in test_stub.py: tests lacking assertions: test_stub"},
+        {"check": "assertion_density", "file": "tests/test_stub.py", "lines": [1],
+         "message": "Placeholder tests in test_stub.py: bare pass/ellipsis stubs: test_stub"},
+        {"check": "assertion_density", "file": "tests/test_syntax.py",
+         "message": f"tests/test_syntax.py: parse failed: {error.value}"},
+    ]
+
+
+def test_quality_check_read_failure_is_one_parse_issue(tmp_path, monkeypatch):
+    path = _test_file(tmp_path, "test_unreadable.py", "def test_ok():\n    assert True\n")
+    reads = []
+
+    def refuse_read(filename):
+        reads.append(filename)
+        raise PermissionError("fixture read refused")
+
+    monkeypatch.setattr(quality_gate, "read_python_source", refuse_read)
+    assert check_assertion_density(tmp_path) == [
+        {"check": "assertion_density", "file": "tests/test_unreadable.py",
+         "message": "tests/test_unreadable.py: parse failed: fixture read refused"},
+    ]
+    assert reads == [str(path)]
 
 
 def _rule(root: Path, rule_dir: str, rule_id: str, fields: str) -> None:

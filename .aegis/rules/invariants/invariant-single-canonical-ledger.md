@@ -14,6 +14,8 @@ tags: ["debrief", "citadel", "ledger", "locking"]
 target_paths:
   - "aegis_core/telemetry_engine/ledger.py"
   - "aegis_core/storage.py"
+  - "aegis_core/storage_shared.py"
+  - "tests/unit/core/test_storage_shared.py"
   - "tests/unit/core/test_ledger*.py"
   - "tests/unit/core/test_shared_ledger.py"
   - "tests/helpers_ledgerrace.py"
@@ -27,6 +29,8 @@ lineage:
 Resolve one shared ledger through ledger_site and mutate it under ledger_locked; preserve append-only rows, ordered lock ownership and stable idempotency identity for each logical report.
 
 Worktrees share the repository ledger while retaining attribution. Replays of one report must not add credit, and conflicting payloads under one key must fail. Decode legacy/malformed rows according to the canonical reader without rewriting history; use one coherent view for a calculation.
+
+Preserve ledger-directory confinement in storage_shared.py, reached through storage.py's live hooks, so the canonical ledger stays inside the resolved Git common directory.
 
 Verify: Exercise interleaved worktree writers, replay/conflict keys, BOM/bad/torn rows, legacy versions and fresh versus retained snapshots through public ledger/storage calls.
 

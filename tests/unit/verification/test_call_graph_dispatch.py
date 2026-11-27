@@ -5,7 +5,7 @@ Tests prove:
 1. Functions referenced in dictionary values (e.g. COMMANDS = {"cmd": cmd_func}) are recognized.
 2. Functions referenced in lists/tuples (e.g. HANDLERS = [func_a, func_b]) are recognized.
 3. Functions passed as keyword arguments (e.g. parser.set_defaults(func=cmd_func)) are recognized.
-4. soma_cli/cli.py passes call_graph.check with verdict=True and 0 orphan functions.
+4. aegis_cli/cli.py passes call_graph.check with verdict=True and 0 orphan functions.
 """
 import os
 import sys
@@ -65,10 +65,10 @@ class TestCallGraphDispatchRecognition:
         assert result.verdict is True, f"Expected True but got: {result.detail}"
 
     def test_cli_py_has_zero_orphan_functions(self):
-        """soma_cli/cli.py must pass call_graph check with zero orphan functions."""
-        # Find soma_cli/cli.py relative to repo root
+        """aegis_cli/cli.py must pass call_graph check with zero orphan functions."""
+        # Find aegis_cli/cli.py relative to repo root
         repo_root = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
-        cli_file = os.path.join(repo_root, "aegis_cli", "cli.py") if os.path.exists(os.path.join(repo_root, "aegis_cli", "cli.py")) else os.path.join(repo_root, "soma_cli", "cli.py")
+        cli_file = os.path.join(repo_root, "aegis_cli", "cli.py") if os.path.exists(os.path.join(repo_root, "aegis_cli", "cli.py")) else os.path.join(repo_root, "aegis_cli", "cli.py")
         assert os.path.exists(cli_file), f"cli.py not found at {cli_file}"
 
         result = call_graph.check(
